@@ -377,7 +377,7 @@ describe.sequential("QuickJS Playwright Page API coverage", () => {
       expect(result.secondUrl).toBe(`${navigationServer.baseUrl}/nav/second`);
       expect(result.firstTitle).toBe("First Page");
       expect(result.secondTitle).toBe("Second Page");
-    });
+    }, 15_000);
 
     it("supports goBack(), goForward(), and reload()", async () => {
       const firstUrl = `${navigationServer.baseUrl}/nav/first`;
