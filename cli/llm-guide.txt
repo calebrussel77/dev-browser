@@ -60,6 +60,12 @@ LLM USAGE GUIDE:
     }, null, 2));
     EOF
 
+  Dev server navigation:
+    For local dev servers (Next.js, Vite, etc.), prefer:
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+    The default "load" wait can hang on HMR, streaming, or other long-lived dev-server connections.
+    Use "load" only when you specifically need every subresource to finish loading.
+
   Error recovery:
     If a script fails, the page usually stays where it stopped.
     Reconnect to the same page name, take a screenshot, and log the URL/title:
@@ -74,7 +80,8 @@ LLM USAGE GUIDE:
     EOF
 
   Common Playwright Page methods:
-    page.goto(url)                         Navigate to a URL
+    page.goto(url, { waitUntil: "domcontentloaded" })
+                                           Navigate to a URL; prefer this on dev servers
     page.title()                           Get the current page title
     page.url()                             Get the current URL
     page.snapshotForAI(options)            Get an AI-optimized snapshot; returns { full, incremental? }

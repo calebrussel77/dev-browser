@@ -26,7 +26,7 @@ dev-browser install    # installs Playwright + Chromium
 # Launch a headless browser and run a script
 dev-browser --headless <<'EOF'
 const page = await browser.getPage("main");
-await page.goto("https://example.com");
+await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
 console.log(await page.title());
 EOF
 
@@ -42,7 +42,7 @@ EOF
 ```powershell
 @"
 const page = await browser.getPage("main");
-await page.goto("https://example.com");
+await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
 console.log(await page.title());
 "@ | dev-browser
 ```
