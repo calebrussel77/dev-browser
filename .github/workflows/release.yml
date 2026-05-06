@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, for example v0.2.8"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   build-windows:
@@ -15,6 +25,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -75,6 +87,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: release/*
           generate_release_notes: true
 
@@ -85,6 +98,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: pnpm/action-setup@v4
         with:
