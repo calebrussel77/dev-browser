@@ -152,6 +152,7 @@ function createEnoentError(filePath: string): NodeJS.ErrnoException {
 function createManager(
   options: {
     connectOverCDP?: ReturnType<typeof vi.fn>;
+    env?: NodeJS.ProcessEnv;
     fetch?: typeof globalThis.fetch;
     homedir?: () => string;
     launchPersistentContext?: ReturnType<typeof vi.fn>;
@@ -175,6 +176,7 @@ function createManager(
 
   const manager = new BrowserManager(path.join("/tmp", "dev-browser-auto-connect-tests"), {
     connectOverCDP: connectOverCDP as never,
+    env: options.env ?? {},
     fetch,
     homedir: options.homedir ?? (() => "/Users/tester"),
     launchPersistentContext: launchPersistentContext as never,
@@ -495,6 +497,27 @@ describe("BrowserManager auto-connect", () => {
         type: "connected",
       },
     ]);
+  });
+
+  it("enables Playwright attachment to Chrome other targets before CDP connect", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const browser = new MockBrowser([new MockContext()]);
+    const connectOverCDP = vi.fn(async () => {
+      expect(env.PW_CHROMIUM_ATTACH_TO_OTHER).toBe("1");
+      return browser;
+    });
+    const { manager } = createManager({
+      connectOverCDP,
+      env,
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session"
+    );
+
+    expect(connectOverCDP).toHaveBeenCalledTimes(1);
+    expect(env.PW_CHROMIUM_ATTACH_TO_OTHER).toBe("1");
   });
 
   it("getBrowser returns connected entries without relaunching them", async () => {

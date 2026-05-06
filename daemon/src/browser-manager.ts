@@ -31,6 +31,7 @@ interface BrowserPageSummary {
 
 type BrowserManagerDependencies = {
   connectOverCDP: typeof chromium.connectOverCDP;
+  env: NodeJS.ProcessEnv;
   fetch: typeof globalThis.fetch;
   homedir: () => string;
   launchPersistentContext: typeof chromium.launchPersistentContext;
@@ -49,6 +50,7 @@ type DebuggerWebSocketLookupResult =
     };
 
 const DISCOVERY_PORTS = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229];
+const CHROMIUM_ATTACH_TO_OTHER_ENV = "PW_CHROMIUM_ATTACH_TO_OTHER";
 const PROBE_TIMEOUT_MS = 750;
 const MANUAL_CONNECT_TIMEOUT_MS = 5_000;
 const PAGE_TITLE_TIMEOUT_MS = 1_500;
@@ -75,6 +77,7 @@ export class BrowserManager {
     this.baseDir = baseDir;
     this.dependencies = {
       connectOverCDP: chromium.connectOverCDP.bind(chromium) as typeof chromium.connectOverCDP,
+      env: process.env,
       fetch: globalThis.fetch,
       homedir: os.homedir,
       launchPersistentContext: chromium.launchPersistentContext.bind(
@@ -386,6 +389,7 @@ export class BrowserManager {
   }
 
   private async openConnectedBrowser(name: string, endpoint: string): Promise<BrowserEntry> {
+    this.enableChromiumAttachToOtherTargets();
     const browser = await this.dependencies.connectOverCDP(endpoint);
     const contexts = browser.contexts();
 
@@ -411,6 +415,10 @@ export class BrowserManager {
     this.attachBrowserLifecycle(entry);
     this.browsers.set(name, entry);
     return entry;
+  }
+
+  private enableChromiumAttachToOtherTargets(): void {
+    this.dependencies.env[CHROMIUM_ATTACH_TO_OTHER_ENV] = "1";
   }
 
   private attachBrowserLifecycle(entry: BrowserEntry): void {
