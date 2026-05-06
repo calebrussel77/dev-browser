@@ -1,10 +1,13 @@
 {
-  "name": "dev-browser",
+  "name": "@calebrussel77/dev-browser",
   "version": "0.2.7",
   "description": "CLI for controlling browsers with sandboxed JavaScript scripts",
   "type": "module",
   "bin": {
     "dev-browser": "./bin/dev-browser.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
@@ -34,7 +37,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SawyerHood/dev-browser.git"
+    "url": "git+https://github.com/calebrussel77/dev-browser.git"
   },
   "author": "Sawyer Hood"
 }

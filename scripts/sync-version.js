@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -9,9 +9,42 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(__dirname, '..');
 const cliDir = join(projectRoot, 'cli');
 const marketplaceJsonPath = join(projectRoot, '.claude-plugin', 'marketplace.json');
-const packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
-const version = packageJson.version;
+const packageJsonPath = join(projectRoot, 'package.json');
+const packageLockPath = join(projectRoot, 'package-lock.json');
+const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+const requestedVersion = process.argv[2];
+const version = requestedVersion ?? packageJson.version;
 const cargoTomlPath = join(cliDir, 'Cargo.toml');
+
+if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+  console.error(`Invalid semver version: ${version}`);
+  process.exit(1);
+}
+
+if (packageJson.version !== version) {
+  packageJson.version = version;
+  writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+  console.log(`Updated package.json to version ${version}.`);
+} else {
+  console.log(`package.json already matches version ${version}.`);
+}
+
+if (existsSync(packageLockPath)) {
+  const packageLock = JSON.parse(readFileSync(packageLockPath, 'utf8'));
+  packageLock.version = version;
+
+  if (packageLock.name !== packageJson.name) {
+    packageLock.name = packageJson.name;
+  }
+
+  if (packageLock.packages?.['']) {
+    packageLock.packages[''].version = version;
+    packageLock.packages[''].name = packageJson.name;
+  }
+
+  writeFileSync(packageLockPath, `${JSON.stringify(packageLock, null, 2)}\n`);
+  console.log(`Updated package-lock.json to version ${version}.`);
+}
 
 let cargoToml = readFileSync(cargoTomlPath, 'utf8');
 const versionLine = `version = "${version}"`;

@@ -3,125 +3,121 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
-  build-daemon:
-    name: Build Daemon Bundles
-    runs-on: ubuntu-latest
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10.30.1
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: cd daemon && pnpm install
-      - run: cd daemon && pnpm run bundle
-      - run: cd daemon && pnpm run bundle:sandbox-client
-      - uses: actions/upload-artifact@v4
-        with:
-          name: daemon-bundles
-          path: |
-            daemon/dist/daemon.bundle.mjs
-            daemon/dist/sandbox-client.js
+          cache: pnpm
+          cache-dependency-path: daemon/pnpm-lock.yaml
 
-  build-binaries:
-    needs: build-daemon
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            binary: dev-browser-darwin-arm64
-            source_binary: dev-browser
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            binary: dev-browser-darwin-x64
-            source_binary: dev-browser
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            binary: dev-browser-linux-x64
-            source_binary: dev-browser
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            binary: dev-browser-linux-arm64
-            cross: true
-            source_binary: dev-browser
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            binary: dev-browser-linux-musl-x64
-            cross: true
-            source_binary: dev-browser
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            binary: dev-browser-windows-x64.exe
-            source_binary: dev-browser.exe
+      - name: Install daemon dependencies
+        working-directory: daemon
+        run: pnpm install --frozen-lockfile
 
-    runs-on: ${{ matrix.os }}
+      - name: Typecheck daemon
+        working-directory: daemon
+        run: pnpm exec tsc --noEmit
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: daemon-bundles
-          path: daemon/dist/
+      - name: Bundle daemon
+        working-directory: daemon
+        run: |
+          pnpm run bundle
+          pnpm run bundle:sandbox-client
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Install cross (if needed)
-        if: matrix.cross
-        run: cargo install cross
-      - name: Build
-        shell: bash
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build CLI
+        run: cargo build --release --target x86_64-pc-windows-msvc --manifest-path cli/Cargo.toml
+
+      - name: Assemble release assets
+        shell: pwsh
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --manifest-path cli/Cargo.toml
-          else
-            cargo build --release --target ${{ matrix.target }} --manifest-path cli/Cargo.toml
-          fi
-      - name: Rename binary
-        shell: bash
-        run: cp cli/target/${{ matrix.target }}/release/${{ matrix.source_binary }} ${{ matrix.binary }}
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item cli/target/x86_64-pc-windows-msvc/release/dev-browser.exe release/dev-browser-windows-x64.exe
+          Copy-Item scripts/install-windows.ps1 release/install-windows.ps1
+          Get-FileHash release/dev-browser-windows-x64.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  dev-browser-windows-x64.exe" } |
+            Set-Content release/dev-browser-windows-x64.exe.sha256
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}
-          path: ${{ matrix.binary }}
+          name: release-assets
+          path: release/*
 
-  publish:
-    needs: build-binaries
+  github-release:
+    name: Publish GitHub Release
+    needs: build-windows
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  npm-latest:
+    name: Publish npm latest
+    needs: github-release
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
+
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10.30.1
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
-      - run: cd daemon && pnpm install && pnpm run bundle && pnpm run bundle:sandbox-client
-      - run: |
-          mkdir -p dist/bin dist/scripts dist/daemon/dist
-          cp bin/dev-browser.js dist/bin/
-          cp scripts/postinstall.js dist/scripts/
-          cp scripts/sync-version.js dist/scripts/ 2>/dev/null || true
-          cp daemon/dist/daemon.bundle.mjs dist/daemon/dist/
-          cp daemon/dist/sandbox-client.js dist/daemon/dist/
-          cp package.json dist/
-          cp README.md dist/
-          cp LICENSE dist/ 2>/dev/null || true
-      - run: cd dist && npm publish
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+          cache-dependency-path: daemon/pnpm-lock.yaml
+
+      - name: Build daemon bundles
+        working-directory: daemon
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run bundle
+          pnpm run bundle:sandbox-client
+
+      - name: Assemble npm package
+        run: |
+          mkdir -p npm-dist/bin npm-dist/scripts npm-dist/daemon/dist
+          cp bin/dev-browser.js npm-dist/bin/
+          cp scripts/postinstall.js npm-dist/scripts/
+          cp scripts/sync-version.js npm-dist/scripts/
+          cp daemon/dist/daemon.bundle.mjs npm-dist/daemon/dist/
+          cp daemon/dist/sandbox-client.js npm-dist/daemon/dist/
+          cp package.json npm-dist/
+          cp README.md npm-dist/
+          cp LICENSE npm-dist/ 2>/dev/null || true
+
+      - name: Publish to npm
+        working-directory: npm-dist
+        run: npm publish --tag latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true

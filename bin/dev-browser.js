@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageJson = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
 const version = packageJson.version;
-const repoSlug = 'SawyerHood/dev-browser';
+const repoSlug = 'calebrussel77/dev-browser';
 const supportedTargets = Object.freeze({
   'darwin-arm64': 'dev-browser-darwin-arm64',
   'darwin-x64': 'dev-browser-darwin-x64',

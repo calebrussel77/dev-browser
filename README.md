@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/c6cf7fb9-b1dc-46ed-93b9-6e7240990c53
 ## CLI Installation
 
 ```bash
-npm install -g dev-browser
+npm install -g @calebrussel77/dev-browser
 dev-browser install    # installs Playwright + Chromium
 ```
 
@@ -65,7 +65,12 @@ console.log(await page.title());
 PowerShell install:
 
 ```powershell
-npm install -g dev-browser
+# GitHub latest installer, Windows x64
+irm https://github.com/calebrussel77/dev-browser/releases/latest/download/install-windows.ps1 | iex
+dev-browser install
+
+# Or npm latest, once the scoped package has been published
+npm install -g @calebrussel77/dev-browser
 dev-browser install
 ```
 
@@ -120,7 +125,7 @@ You can also allow related commands in the same list:
   "permissions": {
     "allow": [
       "Bash(dev-browser *)",
-      "Bash(npx dev-browser *)"
+      "Bash(npx @calebrussel77/dev-browser *)"
     ]
   }
 }
@@ -136,8 +141,8 @@ You can also allow related commands in the same list:
 ### Claude Code
 
 ```
-/plugin marketplace add sawyerhood/dev-browser
-/plugin install dev-browser@sawyerhood/dev-browser
+/plugin marketplace add calebrussel77/dev-browser
+/plugin install dev-browser@calebrussel77/dev-browser
 ```
 
 Restart Claude Code after installation.
@@ -151,7 +156,7 @@ Copy the skill to your skills directory:
 SKILLS_DIR=~/.claude/skills  # or ~/.codex/skills
 
 mkdir -p $SKILLS_DIR
-git clone https://github.com/sawyerhood/dev-browser /tmp/dev-browser-skill
+git clone https://github.com/calebrussel77/dev-browser /tmp/dev-browser-skill
 cp -r /tmp/dev-browser-skill/skills/dev-browser $SKILLS_DIR/dev-browser
 rm -rf /tmp/dev-browser-skill
 ```

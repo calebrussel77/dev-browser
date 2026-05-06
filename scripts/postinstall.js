@@ -24,8 +24,9 @@ const projectRoot = join(__dirname, '..');
 const binDir = join(projectRoot, 'bin');
 const packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
 const packageName = packageJson.name;
+const binCommand = Object.keys(packageJson.bin ?? {})[0] ?? packageName.replace(/^@[^/]+\//, '');
 const version = packageJson.version;
-const repoSlug = 'SawyerHood/dev-browser';
+const repoSlug = 'calebrussel77/dev-browser';
 const releasesBaseUrl = `https://github.com/${repoSlug}/releases/download`;
 const supportedTargets = Object.freeze({
   'darwin-arm64': 'dev-browser-darwin-arm64',
@@ -290,7 +291,7 @@ function fixUnixSymlink() {
     return;
   }
 
-  const symlinkPath = join(globalPaths.binDir, packageName);
+  const symlinkPath = join(globalPaths.binDir, binCommand);
 
   try {
     const stat = lstatSync(symlinkPath);
@@ -316,13 +317,14 @@ function fixWindowsShims() {
     return;
   }
 
-  const cmdShim = join(globalPaths.binDir, `${packageName}.cmd`);
-  const ps1Shim = join(globalPaths.binDir, `${packageName}.ps1`);
+  const cmdShim = join(globalPaths.binDir, `${binCommand}.cmd`);
+  const ps1Shim = join(globalPaths.binDir, `${binCommand}.ps1`);
   if (!existsSync(cmdShim)) {
     return;
   }
 
-  const relativeBinaryPath = `node_modules\\${packageName}\\bin\\${binaryName}`;
+  const packageInstallPath = packageName.replace(/\//g, '\\');
+  const relativeBinaryPath = `node_modules\\${packageInstallPath}\\bin\\${binaryName}`;
   const absoluteBinaryPath = join(globalPaths.binDir, relativeBinaryPath);
   if (!existsSync(absoluteBinaryPath)) {
     return;
