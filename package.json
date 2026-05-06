@@ -1,6 +1,6 @@
 {
   "name": "@calebrussel77/dev-browser",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "CLI for controlling browsers with sandboxed JavaScript scripts",
   "type": "module",
   "bin": {
