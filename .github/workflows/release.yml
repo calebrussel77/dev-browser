@@ -133,6 +133,12 @@ jobs:
 
       - name: Publish to npm
         working-directory: npm-dist
-        run: npm publish --tag latest
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN is not configured; skipping npm publish."
+            exit 0
+          fi
+
+          npm publish --tag latest
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
