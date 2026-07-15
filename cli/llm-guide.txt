@@ -3,12 +3,22 @@ LLM USAGE GUIDE:
   End each script by logging the state you need for the next decision.
   Use descriptive page names like "login", "checkout", or "results" instead of "page1".
   Named pages from browser.getPage("name") persist between script runs, so you usually do not need to re-navigate.
+  When reusing an existing Chrome tab, call browser.listPages() first and pass its target ID
+  to browser.getPage(targetId). An unknown name such as "main" creates a new named page.
   Inside page.evaluate(...), write plain JavaScript only - no TypeScript syntax in the browser context.
   On Windows/PowerShell, use here-strings to pipe multiline scripts:
     @"
     const page = await browser.getPage("main");
     console.log(await page.title());
     "@ | dev-browser --connect
+
+  Choose the browser mode from the task:
+    - Existing login, cookies, or user tabs matter: use `dev-browser --connect`.
+    - Clean persistent automation: use `dev-browser --browser <task-name>`.
+    - Disposable unattended automation: add `--headless` to a managed browser.
+    - A CDP URL was explicitly supplied: use `dev-browser --connect <http-or-ws-url>`.
+    `--headless` and `--ignore-https-errors` do not change an external browser
+    attached through `--connect`.
 
   Quick inspection:
     dev-browser --connect <<'EOF'
@@ -17,8 +27,12 @@ LLM USAGE GUIDE:
     EOF
 
     dev-browser --connect <<'EOF'
-    const page = await browser.getPage("TARGET_ID_HERE");
+    const tabs = await browser.listPages();
+    const target = tabs.find(tab => tab.url.includes("app.example.com"));
+    if (!target) throw new Error("No matching tab");
+    const page = await browser.getPage(target.id);
     console.log(JSON.stringify({
+      id: target.id,
       url: page.url(),
       title: await page.title(),
     }, null, 2));
@@ -40,6 +54,8 @@ LLM USAGE GUIDE:
   Choosing your approach:
     Unknown pages: use page.snapshotForAI() first to discover the page, then interact based on what you find.
     Known pages/selectors: skip the snapshot and use direct Playwright selectors like page.click(), page.fill(), or page.locator() for faster, more reliable automation.
+    Existing browser tabs: match with both URL and title, because either value can be duplicated or stale.
+    After navigation, submission, or another material state change, re-read the URL/title or snapshot instead of assuming success.
 
   Screenshots for visual state:
     dev-browser <<'EOF'
@@ -79,6 +95,14 @@ LLM USAGE GUIDE:
     }, null, 2));
     EOF
 
+    Diagnose before restarting the workflow:
+      dev-browser status
+      dev-browser browsers
+      dev-browser stop
+
+    After an upgrade, rebuild, or runtime change, run `dev-browser stop` once so
+    the next command starts the daemon with the current embedded code.
+
   Common Playwright Page methods:
     page.goto(url, { waitUntil: "domcontentloaded" })
                                            Navigate to a URL; prefer this on dev servers
@@ -104,14 +128,12 @@ LLM USAGE GUIDE:
   Connecting to a running Chrome instance:
     Auto-discover Chrome with debugging enabled:
       dev-browser --connect <<'EOF'
-        const page = await browser.getPage("main");
-        console.log(await page.title());
+        console.log(JSON.stringify(await browser.listPages(), null, 2));
       EOF
 
     Connect to a specific CDP endpoint:
       dev-browser --connect http://localhost:9222 <<'EOF'
-        const page = await browser.getPage("main");
-        console.log(await page.title());
+        console.log(JSON.stringify(await browser.listPages(), null, 2));
       EOF
 
     To launch Chrome with debugging enabled:
@@ -120,11 +142,37 @@ LLM USAGE GUIDE:
 
     Or visit chrome://inspect/#remote-debugging to configure.
 
+    Reliability checklist for agents:
+      1. Prefer `dev-browser --connect` with no URL. This lets dev-browser read
+         Chrome's DevToolsActivePort file and probe common CDP ports.
+      2. Call browser.listPages() before browser.getPage(targetId). Target listing
+         does not attach every renderer; only the selected page is attached.
+      3. If `http://localhost:9222/json/version` returns 404, do not assume CDP
+         is unusable. Retry with `dev-browser --connect` or pass the exact
+         ws://127.0.0.1:<port>/devtools/browser/... URL from DevToolsActivePort.
+      4. If listPages() succeeds but getPage(id) fails, the browser connection is
+         healthy and the selected renderer is the likely problem. Test one known-light
+         tab before treating the entire browser or CDP endpoint as broken.
+      5. A CDP-unresponsive selected renderer may be replaced by a fresh tab at the
+         same URL in the same authenticated browser context. Continue with the Page
+         returned by getPage(), but do not assume it is the original physical tab.
+         Cookies and login state survive; unsaved DOM-only form/editor state does not.
+         If exact tab identity or unsaved state matters, use desktop/browser control
+         or ask the user to recover the original tab instead of retrying indefinitely.
+      6. If Playwright logs `<ws connected>` and then times out, raw Chrome/CDP
+         may be reachable while Playwright failed during attach. Use a short
+         timeout such as `--timeout 10` and run `dev-browser stop` before retrying
+         after upgrades or environment changes.
+      7. `--timeout SECONDS` controls both the Playwright CDP attach timeout and
+         the script execution timeout.
+
   Tips:
     - Use console.log(JSON.stringify(...)) for structured output.
     - Prefer page.snapshotForAI() for structure; use screenshots when visual layout or styling matters.
     - Keep page names stable across scripts so you can resume work after failures.
+    - Close only pages the automation created or the user explicitly asked to close.
+      Never close pre-existing user tabs merely to clean up.
     - Each --browser name maps to a separate daemon-managed browser instance.
     - Use --connect to attach to an existing browser; omit the URL to auto-discover Chrome with debugging enabled.
-    - Use short timeouts (--timeout 10) so scripts fail fast instead of hanging on missing elements.
+    - Use short timeouts (--timeout 10) so scripts fail fast instead of hanging on missing elements or stuck CDP attach.
     - Add --headless for unattended automation; omit it when you want to watch the browser window.

@@ -60,6 +60,20 @@ Primary invocation styles:
     console.log(await page.title());
   EOF
 
+Connecting to a running Chrome:
+  Prefer `dev-browser --connect` without a URL for existing user Chrome sessions.
+  The daemon first reads Chrome's DevToolsActivePort file, then probes common CDP ports.
+  This matters because Chrome can expose a valid WebSocket while
+  http://localhost:9222/json/version returns 404.
+
+  If you pass a URL, HTTP endpoints such as http://localhost:9222 are resolved
+  to ws://... endpoints when possible. If that fails, read DevToolsActivePort and
+  pass the exact ws://127.0.0.1:<port>/devtools/browser/... URL.
+
+  `--timeout SECONDS` applies to both Playwright's CDP attach step and the script
+  execution step. If attach behavior changes after an upgrade or environment
+  change, run `dev-browser stop` so the daemon restarts with the latest runtime.
+
 Script API available inside every script:
   browser.getPage(nameOrId) Get a page by name (creates if new) or connect to an existing
                             tab by its targetId from listPages().
@@ -117,7 +131,7 @@ struct Cli {
         default_missing_value = "auto",
         value_name = "URL",
         help = "Connect to a running Chrome instance",
-        long_help = "Connect to a running Chrome instance.\n\nWithout a URL: auto-discovers Chrome with debugging enabled.\nWorks with Chrome's built-in remote debugging\n(chrome://inspect/#remote-debugging) and classic\n--remote-debugging-port mode.\n\nWith a URL: connects to the specified CDP endpoint.\nAccepts HTTP or WebSocket CDP endpoints such as `http://localhost:9222` or `ws://host:9222/devtools/browser/...`.\n\nTo launch Chrome with debugging, use a command such as:\n  chrome.exe --remote-debugging-port=9222\n  google-chrome --remote-debugging-port=9222\n\nOr visit chrome://inspect/#remote-debugging to configure."
+        long_help = "Connect to a running Chrome instance.\n\nRecommended for agents: use `dev-browser --connect` without a URL first. The daemon reads Chrome's DevToolsActivePort file and then probes common CDP ports, so it can still connect when `http://localhost:9222/json/version` returns 404.\n\nWith a URL: connects to the specified CDP endpoint. Accepts HTTP or WebSocket CDP endpoints such as `http://localhost:9222` or `ws://host:9222/devtools/browser/...`. If an HTTP endpoint returns 404, dev-browser tries the matching DevToolsActivePort entry before failing.\n\nIf Playwright reports `<ws connected>` and then times out, Chrome/CDP is reachable but Playwright did not finish attaching. Retry with a shorter `--timeout`, run `dev-browser stop` to restart the daemon, or pass the exact ws://... endpoint from DevToolsActivePort.\n\nTo launch Chrome with debugging, use a command such as:\n  chrome.exe --remote-debugging-port=9222\n  google-chrome --remote-debugging-port=9222\n\nOr visit chrome://inspect/#remote-debugging to configure."
     )]
     connect: Option<String>,
 
@@ -141,7 +155,7 @@ struct Cli {
         value_name = "SECONDS",
         value_parser = clap::value_parser!(u32).range(1..),
         help = "Maximum script execution time in seconds",
-        long_help = "Maximum script execution time in seconds.\n\nIf the script exceeds this limit, the daemon terminates it and returns an error.\n\nDefaults to 30 seconds."
+        long_help = "Maximum time in seconds for script execution.\n\nWhen `--connect` is used, the same value is also passed to Playwright's CDP attach step, so `--timeout 10` fails a stuck Chrome attach in about 10 seconds instead of Playwright's default 30 seconds.\n\nDefaults to 30 seconds."
     )]
     timeout: u32,
 
