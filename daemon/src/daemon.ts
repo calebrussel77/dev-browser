@@ -128,10 +128,16 @@ function createMessageQueue(socket: net.Socket) {
 
 async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promise<void> {
   await withBrowserLock(request.browser, async () => {
+    const timeoutMs = request.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
+
     if (request.connect === "auto") {
-      await manager.autoConnect(request.browser);
+      await manager.autoConnect(request.browser, {
+        connectTimeoutMs: timeoutMs,
+      });
     } else if (request.connect) {
-      await manager.connectBrowser(request.browser, request.connect);
+      await manager.connectBrowser(request.browser, request.connect, {
+        connectTimeoutMs: timeoutMs,
+      });
     } else {
       await manager.ensureBrowser(request.browser, {
         headless: request.headless,
@@ -140,7 +146,6 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
     }
 
     const output = createMessageQueue(socket);
-    const timeoutMs = request.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
 
     try {
       await runScript(
