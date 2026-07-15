@@ -48,17 +48,17 @@ The fork lets dev-browser keep the Playwright object model and protocol semantic
 
 ## Source version and provenance
 
-The provenance markers for this fork do not fully agree, so treat this directory as the source of truth.
+The fork is aligned with the Playwright `v1.61.1` protocol and host runtime. The migration used the exact upstream tag `v1.61.1`, with the sandbox-specific adaptations described below reapplied afterward.
 
 - `../../../package.json` declares:
 
 ```json
-"playwright": "^1.52.0",
-"playwright-core": "^1.52.0"
+"playwright": "1.61.1",
+"playwright-core": "1.61.1"
 ```
 
-- The research notes at `/Users/sawyerhood/.middleman/notes/dev-browser/research/playwright-fork-sandbox.md` record upstream commit `3912da7`.
-- In practice, the checked-in fork aligns most closely with that `3912da7` snapshot, with local edits layered on top.
+- Runtime protocol validation is vendored from `packages/playwright-core/src/protocol/validator.ts` at `v1.61.1`.
+- The QuickJS client keeps local compatibility helpers such as `snapshotForAI()`, implemented on top of Playwright 1.61's AI-mode ARIA snapshots.
 
 When updating, diff against the exact upstream tag or commit you choose. Do not trust the semver range in `../../../package.json` by itself.
 

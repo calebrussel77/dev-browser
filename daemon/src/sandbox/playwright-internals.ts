@@ -46,6 +46,12 @@ export interface HostBridgeDispatcherOptions {
 }
 
 function resolvePlaywrightInternal(modulePath: string): string {
+  const resolved = tryResolvePlaywrightInternal(modulePath);
+  if (resolved) return resolved;
+  throw new Error(`Could not locate Playwright internals at ${modulePath}`);
+}
+
+function tryResolvePlaywrightInternal(modulePath: string): string | null {
   const candidates = [
     path.resolve(currentDir, "../../node_modules/playwright-core", modulePath),
     path.resolve(currentDir, "node_modules/playwright-core", modulePath),
@@ -58,12 +64,10 @@ function resolvePlaywrightInternal(modulePath: string): string {
     }
   }
 
-  throw new Error(`Could not locate Playwright internals at ${modulePath}`);
+  return null;
 }
 
-const serverInternals = require(
-  resolvePlaywrightInternal(path.join("lib", "server", "index.js"))
-) as {
+type ServerInternals = {
   createPlaywright: (options: { sdkLanguage: string }) => unknown;
   DispatcherConnection: new (isLocal?: boolean) => DispatcherConnectionLike;
   RootDispatcher: new (
@@ -77,20 +81,46 @@ const serverInternals = require(
   ) => PlaywrightDispatcherLike;
 };
 
-const clientInternals = require(
-  resolvePlaywrightInternal(path.join("lib", "client", "connection.js"))
-) as {
+type ClientInternals = {
   Connection: new (platform: unknown) => ClientConnectionLike;
 };
 
-const nodePlatformInternals = require(
-  resolvePlaywrightInternal(path.join("lib", "server", "utils", "nodePlatform.js"))
-) as {
-  nodePlatform: unknown;
+type CoreBundleInternals = {
+  inprocess: {
+    playwright: {
+      _connection: { constructor: ClientInternals["Connection"] };
+      _platform: unknown;
+    };
+  };
+  server: ServerInternals;
 };
+
+const legacyServerPath = tryResolvePlaywrightInternal(path.join("lib", "server", "index.js"));
+let serverInternals: ServerInternals;
+let clientInternals: ClientInternals;
+let nodePlatform: unknown;
+
+if (legacyServerPath) {
+  serverInternals = require(legacyServerPath) as ServerInternals;
+  clientInternals = require(
+    resolvePlaywrightInternal(path.join("lib", "client", "connection.js"))
+  ) as ClientInternals;
+  nodePlatform = (
+    require(
+      resolvePlaywrightInternal(path.join("lib", "server", "utils", "nodePlatform.js"))
+    ) as { nodePlatform: unknown }
+  ).nodePlatform;
+} else {
+  const coreBundle = require(
+    resolvePlaywrightInternal(path.join("lib", "coreBundle.js"))
+  ) as CoreBundleInternals;
+  serverInternals = coreBundle.server;
+  clientInternals = { Connection: coreBundle.inprocess.playwright._connection.constructor };
+  nodePlatform = coreBundle.inprocess.playwright._platform;
+}
 
 export const { createPlaywright, DispatcherConnection, RootDispatcher, PlaywrightDispatcher } =
   serverInternals;
 
 export const { Connection } = clientInternals;
-export const { nodePlatform } = nodePlatformInternals;
+export { nodePlatform };
