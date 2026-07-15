@@ -40,3 +40,6 @@ Thumbs.db
 tmp/
 yarn-debug.log*
 yarn-error.log*
+
+# opensrc - source code for packages
+opensrc/
