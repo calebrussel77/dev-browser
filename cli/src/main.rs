@@ -395,11 +395,18 @@ fn main() {
         Ok(code) => code,
         Err(error) => {
             eprintln!("Error: {error}");
-            1
+            cli_error_exit_code(error.as_ref())
         }
     };
 
     process::exit(exit_code);
+}
+
+fn cli_error_exit_code(error: &(dyn Error + 'static)) -> i32 {
+    match error.downcast_ref::<io::Error>().map(io::Error::kind) {
+        Some(io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData) => 2,
+        _ => 6,
+    }
 }
 
 fn run() -> Result<i32, Box<dyn Error>> {
@@ -667,10 +674,60 @@ fn stream_responses<R: BufRead>(
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown daemon error");
                 eprintln!("{error_message}");
-                return Ok(1);
+                return Ok(daemon_error_exit_code(&message));
             }
             _ => {}
         }
+    }
+}
+
+/// Stable process statuses for daemon failures. Explicit daemon statuses win,
+/// followed by Agent Reliability v2 typed codes; legacy errors remain status 1.
+fn daemon_error_exit_code(message: &Value) -> i32 {
+    if let Some(exit_code) = message
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .filter(|code| (1..=255).contains(code))
+    {
+        return exit_code as i32;
+    }
+
+    let code = message
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .or_else(|| {
+            message
+                .get("data")
+                .and_then(|data| data.get("error"))
+                .and_then(|error| error.get("code"))
+        })
+        .and_then(Value::as_str);
+
+    match code {
+        Some(
+            "STALE_REF"
+            | "STALE_STATE"
+            | "AMBIGUOUS_TARGET"
+            | "TARGET_MISSING"
+            | "TARGET_HIDDEN"
+            | "TARGET_OBSCURED"
+            | "TARGET_DISABLED"
+            | "UNSUPPORTED_CONTEXT",
+        ) => 3,
+        Some("WAIT_TIMEOUT") => 4,
+        Some("LEASE_CONFLICT") => 5,
+        Some("DOWNLOAD_FAILED") => 7,
+        Some(
+            "PAGE_CLOSED"
+            | "FRAME_DETACHED"
+            | "POPUP_OPENED"
+            | "CDP_DISCOVERY_FAILED"
+            | "CDP_ATTACH_FAILED"
+            | "RENDERER_UNRESPONSIVE"
+            | "DAEMON_VERSION_MISMATCH"
+            | "PROTOCOL_VERSION_MISMATCH",
+        ) => 6,
+        _ => 1,
     }
 }
 
@@ -803,8 +860,55 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{cli_error_exit_code, stream_responses, Cli, Command, ResultMode};
     use clap::Parser;
+    use std::io::Cursor;
+
+    fn response_exit_code(response: &str) -> i32 {
+        stream_responses(&mut Cursor::new(response.as_bytes()), ResultMode::None).unwrap()
+    }
+
+    #[test]
+    fn maps_typed_agent_errors_to_stable_exit_codes() {
+        let cases = [
+            ("STALE_REF", 3),
+            ("AMBIGUOUS_TARGET", 3),
+            ("TARGET_DISABLED", 3),
+            ("WAIT_TIMEOUT", 4),
+            ("LEASE_CONFLICT", 5),
+            ("CDP_ATTACH_FAILED", 6),
+            ("PROTOCOL_VERSION_MISMATCH", 6),
+            ("DOWNLOAD_FAILED", 7),
+        ];
+
+        for (code, expected) in cases {
+            let response = format!(
+                "{{\"type\":\"error\",\"message\":\"failed\",\"error\":{{\"code\":\"{code}\",\"message\":\"failed\",\"recoverable\":false}}}}\n"
+            );
+            assert_eq!(response_exit_code(&response), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn prefers_explicit_exit_code_and_preserves_legacy_errors() {
+        assert_eq!(
+            response_exit_code("{\"type\":\"error\",\"message\":\"failed\",\"exitCode\":7}\n"),
+            7
+        );
+        assert_eq!(
+            response_exit_code("{\"type\":\"error\",\"message\":\"legacy failure\"}\n"),
+            1
+        );
+    }
+
+    #[test]
+    fn maps_local_validation_and_runtime_errors() {
+        let validation = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid target");
+        let runtime = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "offline");
+
+        assert_eq!(cli_error_exit_code(&validation), 2);
+        assert_eq!(cli_error_exit_code(&runtime), 6);
+    }
 
     #[test]
     fn parses_interactive_agent_commands() {

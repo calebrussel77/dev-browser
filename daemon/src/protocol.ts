@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+  AgentErrorSchema,
+  AgentProtocolError,
+  AgentProtocolVersionSchema,
+  type AgentError,
+} from "./agent-protocol.js";
 
 const RequestBaseSchema = z.object({
   id: z.string().min(1),
@@ -68,6 +74,7 @@ const InteractiveActionSchema = z.union([
 
 const InteractiveRequestSchema = RequestBaseSchema.extend({
   type: z.literal("interactive"),
+  protocolVersion: AgentProtocolVersionSchema.default(1),
   browser: z.string().min(1).default("default"),
   page: z.string().min(1).default("main"),
   action: InteractiveActionSchema,
@@ -131,6 +138,9 @@ const CompleteMessageSchema = ResponseBaseSchema.extend({
 const ErrorMessageSchema = ResponseBaseSchema.extend({
   type: z.literal("error"),
   message: z.string(),
+  exitCode: z.number().int().min(1).max(255).optional(),
+  error: AgentErrorSchema.optional(),
+  data: z.unknown().optional(),
 });
 
 const ResultMessageSchema = ResponseBaseSchema.extend({
@@ -148,11 +158,16 @@ const ResponseSchema = z.discriminatedUnion("type", [
 
 type Request = z.infer<typeof RequestSchema>;
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
-export type InteractiveRequest = z.infer<typeof InteractiveRequestSchema>;
+export type InteractiveRequest = Omit<
+  z.infer<typeof InteractiveRequestSchema>,
+  "protocolVersion"
+> & {
+  protocolVersion?: 1 | 2;
+};
 export type Response = z.infer<typeof ResponseSchema>;
 
 type ParseSuccess = { success: true; request: Request };
-type ParseFailure = { success: false; error: string; id?: string };
+type ParseFailure = { success: false; error: string; id?: string; agentError?: AgentError };
 
 function describeZodError(error: z.ZodError): string {
   return error.issues
@@ -181,6 +196,28 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
     return {
       success: false,
       error: error instanceof Error ? error.message : "Invalid JSON request",
+    };
+  }
+
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    (parsed as { type?: unknown }).type === "interactive" &&
+    "protocolVersion" in parsed &&
+    (parsed as { protocolVersion?: unknown }).protocolVersion !== 1 &&
+    (parsed as { protocolVersion?: unknown }).protocolVersion !== 2
+  ) {
+    const agentError = new AgentProtocolError(
+      "PROTOCOL_VERSION_MISMATCH",
+      "Unsupported agent protocol version; supported versions are 1 and 2",
+      false,
+      { nextCommands: ["dev-browser schema --json"] }
+    ).toAgentError();
+    return {
+      success: false,
+      error: agentError.message,
+      id: extractId(parsed),
+      agentError,
     };
   }
 

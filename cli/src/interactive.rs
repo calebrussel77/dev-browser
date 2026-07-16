@@ -55,6 +55,7 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     let mut request = json!({
         "id": options.id,
         "type": "interactive",
+        "protocolVersion": 2,
         "browser": options.browser,
         "page": options.page,
         "action": action,
@@ -110,6 +111,7 @@ mod tests {
         );
 
         assert_eq!(request["type"], "interactive");
+        assert_eq!(request["protocolVersion"], 2);
         assert_eq!(request["browser"], "daily");
         assert_eq!(request["page"], "TARGET");
         assert_eq!(request["connect"], "auto");

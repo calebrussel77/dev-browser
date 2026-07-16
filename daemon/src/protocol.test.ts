@@ -3,6 +3,68 @@ import { describe, expect, it } from "vitest";
 import { parseRequest } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("defaults omitted protocol versions to legacy v1 and accepts v2", () => {
+    for (const [protocolVersion, expected] of [
+      [undefined, 1],
+      [2, 2],
+    ] as const) {
+      const result = parseRequest(
+        JSON.stringify({
+          id: `interactive-v${expected}`,
+          type: "interactive",
+          ...(protocolVersion === undefined ? {} : { protocolVersion }),
+          action: { kind: "pages" },
+        })
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        request: { protocolVersion: expected },
+      });
+    }
+  });
+
+  it("returns a typed non-recoverable mismatch for unsupported versions", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-v3",
+        type: "interactive",
+        protocolVersion: 3,
+        action: { kind: "pages" },
+      })
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      id: "interactive-v3",
+      agentError: {
+        code: "PROTOCOL_VERSION_MISMATCH",
+        recoverable: false,
+        nextCommands: ["dev-browser schema --json"],
+      },
+    });
+  });
+
+  it("bounds mismatch errors for oversized invalid versions", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-oversized-version",
+        type: "interactive",
+        protocolVersion: "x".repeat(20_000),
+        action: { kind: "pages" },
+      })
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      id: "interactive-oversized-version",
+      agentError: {
+        code: "PROTOCOL_VERSION_MISMATCH",
+        recoverable: false,
+      },
+    });
+  });
+
   it("parses a read request with browser connection options", () => {
     const result = parseRequest(
       JSON.stringify({

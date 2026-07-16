@@ -2,6 +2,11 @@ import { spawn } from "node:child_process";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
+import {
+  agentErrorExitCode,
+  buildInteractiveFailure,
+  buildInteractiveSuccess,
+} from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
 import { createKeyedLock, createMutex } from "./lock.js";
@@ -211,14 +216,22 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
 
 async function handleInteractive(socket: net.Socket, request: InteractiveRequest): Promise<void> {
   await withBrowserLock(request.browser, async () => {
-    await prepareBrowser(request);
-
     try {
+      await prepareBrowser(request);
       const result = await executeInteractiveAction(manager, request);
       await writeMessage(socket, {
         id: request.id,
         type: "result",
-        data: result,
+        data:
+          request.protocolVersion === 2
+            ? buildInteractiveSuccess({
+                requestId: request.id,
+                browser: request.browser,
+                page: request.page,
+                action: request.action.kind,
+                result: { ...result },
+              })
+            : result,
       });
       await writeMessage(socket, {
         id: request.id,
@@ -226,6 +239,24 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
         success: true,
       });
     } catch (error) {
+      if (request.protocolVersion === 2) {
+        const failure = buildInteractiveFailure({
+          requestId: request.id,
+          browser: request.browser,
+          page: request.page,
+          action: request.action.kind,
+          error,
+        });
+        await writeMessage(socket, {
+          id: request.id,
+          type: "error",
+          message: failure.error.message,
+          exitCode: agentErrorExitCode(failure.error.code),
+          error: failure.error,
+          data: failure,
+        });
+        return;
+      }
       await writeMessage(socket, {
         id: request.id,
         type: "error",
@@ -325,6 +356,21 @@ async function runInstallCommand(
 async function handleRequest(socket: net.Socket, line: string): Promise<void> {
   const parsed = parseRequest(line);
   if (!parsed.success) {
+    if (parsed.agentError) {
+      const failure = buildInteractiveFailure({
+        requestId: parsed.id ?? "unknown",
+        error: parsed.agentError,
+      });
+      await writeMessage(socket, {
+        id: parsed.id ?? "unknown",
+        type: "error",
+        message: failure.error.message,
+        exitCode: agentErrorExitCode(failure.error.code),
+        error: failure.error,
+        data: failure,
+      });
+      return;
+    }
     await writeMessage(socket, {
       id: parsed.id ?? "unknown",
       type: "error",

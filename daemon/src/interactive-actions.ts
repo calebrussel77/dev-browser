@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 
+import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import type { InteractiveRequest } from "./protocol.js";
 import { writeDevBrowserTempFile } from "./temp-files.js";
@@ -69,6 +70,7 @@ const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
 const DEFAULT_READ_LIMIT = 100;
 const DEFAULT_FIND_LIMIT = 10;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
+const MAX_ERROR_CONTEXT_LENGTH = 500;
 const REF_PATTERN = /^R\d+$/;
 const CLICK_SETTLE_MS = 100;
 const STOP_WORDS = new Set([
@@ -85,6 +87,11 @@ const STOP_WORDS = new Set([
   "of",
   "the",
 ]);
+
+function summarizeErrorContext(value: string): string {
+  if (value.length <= MAX_ERROR_CONTEXT_LENGTH) return value;
+  return `${value.slice(0, MAX_ERROR_CONTEXT_LENGTH - 3)}...`;
+}
 
 function normalizeText(value: string): string {
   return value
@@ -296,7 +303,13 @@ async function resolveRef(page: Page, ref: string) {
 
   const original = page.locator(`[data-dev-browser-ref="${ref}"]`).first();
   if ((await original.count()) === 0) {
-    throw new Error(`Element ref "${ref}" is stale or missing; run read again`);
+    const boundedRef = summarizeErrorContext(ref);
+    throw new AgentProtocolError(
+      "STALE_REF",
+      `Element ref "${boundedRef}" is stale or missing; run read again`,
+      true,
+      { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
+    );
   }
 
   let locator = original;
@@ -327,7 +340,13 @@ async function resolveRef(page: Page, ref: string) {
       .first();
     const ancestorBox = (await ancestor.count()) > 0 ? await ancestor.boundingBox() : null;
     if (!ancestorBox || ancestorBox.width <= 0 || ancestorBox.height <= 0) {
-      throw new Error(`Element ref "${ref}" is not visible; run read again`);
+      const boundedRef = summarizeErrorContext(ref);
+      throw new AgentProtocolError(
+        "TARGET_HIDDEN",
+        `Element ref "${boundedRef}" is not visible; run read again`,
+        true,
+        { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
+      );
     }
     return { box: ancestorBox, locator: ancestor, resolvedBy: "ancestor" as const };
   }
@@ -581,8 +600,18 @@ export async function executeInteractiveAction(
       }
 
       if (action.waitForText && !waitSatisfied) {
-        throw new Error(
-          `--wait-for text "${action.waitForText}" was not observed after ${attempts} attempt${attempts === 1 ? "" : "s"}`
+        const boundedWaitForText = summarizeErrorContext(action.waitForText);
+        throw new AgentProtocolError(
+          "WAIT_TIMEOUT",
+          `--wait-for text "${boundedWaitForText}" was not observed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
+          true,
+          {
+            details: {
+              attempts,
+              waitForText: boundedWaitForText,
+              waitForTextLength: action.waitForText.length,
+            },
+          }
         );
       }
 

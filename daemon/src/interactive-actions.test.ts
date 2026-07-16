@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { agentErrorExitCode, toAgentError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
 import { removeDirectoryWithRetries } from "./test-cleanup.js";
@@ -295,6 +296,41 @@ describe.sequential("interactive Playwright actions", () => {
     await expect(
       page.evaluate(() => (window as unknown as { __changedClicks: number }).__changedClicks)
     ).resolves.toBe(1);
+  });
+
+  it("preserves typed wait timeout status for oversized expected text", async () => {
+    const read = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
+    const changed = elements(read).find((element) => element.name === "Changed action");
+    const page = await manager.getPage(browserName, "profile");
+    await page.evaluate(() => {
+      document.querySelector("#changed-button")?.setAttribute("aria-expanded", "false");
+    });
+
+    let caught: unknown;
+    try {
+      await executeInteractiveAction(
+        manager,
+        request(
+          {
+            kind: "click",
+            ref: changed!.ref,
+            method: "mouse",
+            waitForText: "Never appears ".repeat(2_000),
+          },
+          { timeoutMs: 50 }
+        )
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    const typed = toAgentError(caught);
+    expect(typed.code).toBe("WAIT_TIMEOUT");
+    expect(typed.message.length).toBeLessThanOrEqual(4_000);
+    expect(agentErrorExitCode(typed.code)).toBe(4);
   });
 
   it("resolves a link ref to its interactive button descendant", async () => {
