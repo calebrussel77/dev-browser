@@ -86,7 +86,14 @@ const InteractiveActionSchema = z.union([
     kind: z.literal("confirm"),
     expectText: z.string().min(1).optional(),
   }),
-  z.object({ kind: z.literal("shot") }),
+  z.object({
+    kind: z.literal("shot"),
+    ref: z
+      .string()
+      .regex(/^R\d+$/)
+      .optional(),
+    padding: z.number().int().nonnegative().max(1_000).default(32),
+  }),
 ]);
 
 const InteractiveRequestSchema = RequestBaseSchema.extend({
@@ -96,6 +103,8 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   page: z.string().min(1).default("main"),
   action: InteractiveActionSchema,
   shot: z.string().min(1).optional(),
+  annotate: z.boolean().default(false),
+  fullPage: z.boolean().default(false),
   headless: z.boolean().optional(),
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
@@ -175,11 +184,18 @@ const ResponseSchema = z.discriminatedUnion("type", [
 
 type Request = z.infer<typeof RequestSchema>;
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
+type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
+type ParsedShotAction = Extract<ParsedInteractiveAction, { kind: "shot" }>;
 export type InteractiveRequest = Omit<
   z.infer<typeof InteractiveRequestSchema>,
-  "protocolVersion"
+  "protocolVersion" | "annotate" | "fullPage" | "action"
 > & {
   protocolVersion?: 1 | 2;
+  annotate?: boolean;
+  fullPage?: boolean;
+  action:
+    | Exclude<ParsedInteractiveAction, ParsedShotAction>
+    | (Omit<ParsedShotAction, "padding"> & { padding?: number });
 };
 export type Response = z.infer<typeof ResponseSchema>;
 

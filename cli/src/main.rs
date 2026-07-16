@@ -193,6 +193,18 @@ struct PageActionArgs {
         help = "Save the resulting page screenshot and return its absolute path"
     )]
     shot: Option<String>,
+
+    #[arg(
+        long,
+        help = "Draw deterministic ref labels on the returned screenshot"
+    )]
+    annotate: bool,
+
+    #[arg(
+        long,
+        help = "Capture document CSS pixels instead of the current viewport"
+    )]
+    full_page: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -350,6 +362,14 @@ enum Command {
         target: PageTargetArgs,
         #[arg(value_name = "FILE", default_value = "auto")]
         file: String,
+        #[arg(long = "ref", value_name = "REF")]
+        ref_id: Option<String>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(0..=1000))]
+        padding: u16,
+        #[arg(long)]
+        full_page: bool,
+        #[arg(long)]
+        annotate: bool,
     },
     #[command(
         about = "Install Playwright browsers (Chromium)",
@@ -444,13 +464,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
             let script = fs::read_to_string(file)?;
             run_script(&cli, script)
         }
-        Some(Command::Pages) => run_interactive(&cli, "main", None, json!({ "kind": "pages" })),
-        Some(Command::Navigate { url, output }) => run_interactive(
-            &cli,
-            &output.target.page,
-            output.shot.as_deref(),
-            json!({ "kind": "navigate", "url": url }),
-        ),
+        Some(Command::Pages) => {
+            run_interactive(&cli, "main", None, false, false, json!({ "kind": "pages" }))
+        }
+        Some(Command::Navigate { url, output }) => {
+            run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
+        }
         Some(Command::Observe {
             output,
             full,
@@ -461,10 +480,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
             depth,
             breadth,
             continuation,
-        }) => run_interactive(
+        }) => run_page_action(
             &cli,
-            &output.target.page,
-            output.shot.as_deref(),
+            output,
             build_observe_action(ObserveActionOptions {
                 full: *full,
                 delta: *delta,
@@ -480,20 +498,18 @@ fn run() -> Result<i32, Box<dyn Error>> {
             output,
             limit,
             depth,
-        }) => run_interactive(
+        }) => run_page_action(
             &cli,
-            &output.target.page,
-            output.shot.as_deref(),
+            output,
             json!({ "kind": "read", "limit": limit, "depth": depth }),
         ),
         Some(Command::Find {
             query,
             output,
             limit,
-        }) => run_interactive(
+        }) => run_page_action(
             &cli,
-            &output.target.page,
-            output.shot.as_deref(),
+            output,
             json!({ "kind": "find", "query": query, "limit": limit }),
         ),
         Some(Command::Click {
@@ -528,7 +544,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(wait_for) = wait_for {
                 action["waitForText"] = Value::String(wait_for.clone());
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+            run_page_action(&cli, output, action)
         }
         Some(Command::Type {
             output,
@@ -546,17 +562,35 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+            run_page_action(&cli, output, action)
         }
         Some(Command::Confirm { output, expect }) => {
             let mut action = json!({ "kind": "confirm" });
             if let Some(expect) = expect {
                 action["expectText"] = Value::String(expect.clone());
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+            run_page_action(&cli, output, action)
         }
-        Some(Command::Shot { target, file }) => {
-            run_interactive(&cli, &target.page, Some(file), json!({ "kind": "shot" }))
+        Some(Command::Shot {
+            target,
+            file,
+            ref_id,
+            padding,
+            full_page,
+            annotate,
+        }) => {
+            let mut action = json!({ "kind": "shot", "padding": padding });
+            if let Some(ref_id) = ref_id {
+                action["ref"] = Value::String(ref_id.clone());
+            }
+            run_interactive(
+                &cli,
+                &target.page,
+                Some(file),
+                *annotate,
+                *full_page,
+                action,
+            )
         }
         Some(Command::Browsers) => {
             ensure_daemon()?;
@@ -653,10 +687,27 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
     send_request(request, ResultMode::Json)
 }
 
+fn run_page_action(
+    cli: &Cli,
+    output: &PageActionArgs,
+    action: Value,
+) -> Result<i32, Box<dyn Error>> {
+    run_interactive(
+        cli,
+        &output.target.page,
+        output.shot.as_deref(),
+        output.annotate,
+        output.full_page,
+        action,
+    )
+}
+
 fn run_interactive(
     cli: &Cli,
     page: &str,
     shot: Option<&str>,
+    annotate: bool,
+    full_page: bool,
     action: Value,
 ) -> Result<i32, Box<dyn Error>> {
     ensure_daemon()?;
@@ -670,6 +721,8 @@ fn run_interactive(
             browser: &cli.browser,
             page,
             shot,
+            annotate,
+            full_page,
             connect: cli.connect.as_deref(),
             headless: cli.headless,
             ignore_https_errors: cli.ignore_https_errors,
@@ -1046,6 +1099,8 @@ mod tests {
             "499",
             "--continuation",
             "eyJ2IjoxLCJvZmZzZXQiOjN9",
+            "--annotate",
+            "--full-page",
         ])
         .unwrap();
 
@@ -1060,8 +1115,45 @@ mod tests {
                 depth: 49,
                 breadth: 499,
                 continuation: Some(_),
+                ref output,
                 ..
-            }) if track == "checkout"
+            }) if track == "checkout" && output.annotate && output.full_page
+        ));
+    }
+
+    #[test]
+    fn parses_action_annotation_and_focused_shot_options() {
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--annotate",
+            "--full-page",
+        ])
+        .unwrap();
+        assert!(matches!(
+            click.command,
+            Some(Command::Click { ref output, .. }) if output.annotate && output.full_page
+        ));
+
+        let shot = Cli::try_parse_from([
+            "dev-browser",
+            "shot",
+            "focused.png",
+            "--page",
+            "TARGET",
+            "--ref",
+            "R7",
+            "--padding",
+            "32",
+            "--full-page",
+        ])
+        .unwrap();
+        assert!(matches!(
+            shot.command,
+            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, .. })
+                if ref_id.as_deref() == Some("R7")
         ));
     }
 

@@ -9,7 +9,7 @@ import {
   type PerceptionElement,
 } from "./perception/collector.js";
 import type { InteractiveRequest } from "./protocol.js";
-import { writeDevBrowserTempFile } from "./temp-files.js";
+import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -49,6 +49,7 @@ export interface InteractiveResult {
     text: string;
   };
   screenshotPath?: string;
+  artifacts?: VisualArtifacts;
   coordinateSpace?: {
     unit: "css-px";
     screenshotScale: "css";
@@ -263,20 +264,6 @@ function limitSnapshotDepth(snapshot: string, depth: number): string {
       return Math.floor(indentation / 2) < depth;
     })
     .join("\n");
-}
-
-async function savePageScreenshot(page: Page, requestedName: string): Promise<string> {
-  const viewport = await page.evaluate(() => ({
-    width: window.innerWidth,
-    height: window.innerHeight,
-  }));
-  return await writeDevBrowserTempFile(
-    requestedName,
-    await page.screenshot({
-      scale: "css",
-      clip: { x: 0, y: 0, width: viewport.width, height: viewport.height },
-    })
-  );
 }
 
 async function snapshot(page: Page, depth = 12): Promise<string> {
@@ -588,10 +575,48 @@ export async function executeInteractiveAction(
     );
   }
 
-  if (request.shot || action.kind === "shot") {
+  if (request.shot || request.annotate || action.kind === "shot") {
     const name =
       request.shot && request.shot !== "auto" ? request.shot : automaticScreenshotName(action.kind);
-    result.screenshotPath = await savePageScreenshot(page, name);
+    if (action.kind === "shot" && action.ref) {
+      const resolved = await resolveRef(page, action.ref);
+      try {
+        await resolved.locator.scrollIntoViewIfNeeded({
+          timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+        });
+      } finally {
+        await resolved.cleanup();
+      }
+    }
+    const visualPerception = await perceive(page, { full: request.fullPage }, false);
+    const focusElement =
+      action.kind === "shot" && action.ref
+        ? visualPerception.elements.find((element) => element.ref === action.ref)
+        : undefined;
+    if (action.kind === "shot" && action.ref && !focusElement) {
+      throw new AgentProtocolError(
+        "STALE_REF",
+        `Element ref "${action.ref}" is stale or missing; run read again`,
+        true,
+        { details: { ref: action.ref }, nextCommands: ["dev-browser read"] }
+      );
+    }
+    const matchRefs =
+      action.kind === "find" ? new Set((result.matches ?? []).map((match) => match.ref)) : null;
+    result.artifacts = await captureVisualArtifacts(page, visualPerception, {
+      screenshotName: request.annotate ? undefined : name,
+      annotatedName: request.annotate ? name : undefined,
+      annotate: request.annotate,
+      fullPage: request.fullPage,
+      annotationElements: matchRefs
+        ? visualPerception.elements.filter((element) => matchRefs.has(element.ref))
+        : undefined,
+      focus: focusElement
+        ? { box: focusElement.box, padding: action.kind === "shot" ? (action.padding ?? 32) : 32 }
+        : undefined,
+    });
+    result.screenshotPath =
+      result.artifacts.annotatedScreenshot?.path ?? result.artifacts.screenshot?.path;
   }
 
   return result;

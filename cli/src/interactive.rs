@@ -45,6 +45,8 @@ pub struct InteractiveRequestOptions<'a> {
     pub browser: &'a str,
     pub page: &'a str,
     pub shot: Option<&'a str>,
+    pub annotate: bool,
+    pub full_page: bool,
     pub connect: Option<&'a str>,
     pub headless: bool,
     pub ignore_https_errors: bool,
@@ -93,6 +95,12 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if let Some(shot) = options.shot {
         request["shot"] = Value::String(shot.to_string());
     }
+    if options.annotate {
+        request["annotate"] = Value::Bool(true);
+    }
+    if options.full_page {
+        request["fullPage"] = Value::Bool(true);
+    }
     if let Some(connect) = options.connect {
         request["connect"] = Value::String(connect.to_string());
     }
@@ -133,6 +141,8 @@ mod tests {
                 browser: "daily",
                 page: "TARGET",
                 shot: Some("state.png"),
+                annotate: true,
+                full_page: true,
                 connect: Some("auto"),
                 headless: false,
                 ignore_https_errors: false,
@@ -147,6 +157,8 @@ mod tests {
         assert_eq!(request["page"], "TARGET");
         assert_eq!(request["connect"], "auto");
         assert_eq!(request["shot"], "state.png");
+        assert_eq!(request["annotate"], true);
+        assert_eq!(request["fullPage"], true);
         assert_eq!(request["action"]["kind"], "read");
     }
 
@@ -187,6 +199,8 @@ mod tests {
                 browser: "default",
                 page: "main",
                 shot: None,
+                annotate: false,
+                full_page: false,
                 connect: None,
                 headless: false,
                 ignore_https_errors: false,

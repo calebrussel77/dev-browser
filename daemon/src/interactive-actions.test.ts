@@ -13,7 +13,7 @@ const browserName = "interactive-actions";
 
 function request(
   action: Parameters<typeof executeInteractiveAction>[1]["action"],
-  options: { shot?: string; timeoutMs?: number } = {}
+  options: { shot?: string; timeoutMs?: number; annotate?: boolean; fullPage?: boolean } = {}
 ): Parameters<typeof executeInteractiveAction>[1] {
   return {
     id: `test-${action.kind}`,
@@ -514,6 +514,48 @@ describe.sequential("interactive Playwright actions", () => {
     await rm(result.screenshotPath!, { force: true });
     await session.send("Emulation.clearDeviceMetricsOverride");
     await session.detach();
+  });
+
+  it("returns an annotated artifact for only the matches from find", async () => {
+    const shot = `interactive-tests/matches-${Date.now()}.png`;
+    const result = await executeInteractiveAction(
+      manager,
+      request({ kind: "find", query: "Connect", limit: 1 }, { shot, annotate: true })
+    );
+
+    expect(result.matches).toHaveLength(1);
+    expect(result.artifacts).toMatchObject({
+      screenshot: null,
+      annotatedScreenshot: {
+        path: expect.stringContaining("matches-"),
+        mediaType: "image/png",
+        mode: "viewport",
+        coordinateSpace: { kind: "viewport" },
+      },
+    });
+    expect(result.screenshotPath).toBe(result.artifacts!.annotatedScreenshot!.path);
+    await rm(result.screenshotPath!, { force: true });
+  });
+
+  it("returns a bounded focused crop for shot by ref", async () => {
+    const read = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
+    const connect = elements(read).find((element) => element.name === "Connect")!;
+    const result = await executeInteractiveAction(
+      manager,
+      request({ kind: "shot", ref: connect.ref, padding: 8 }, { shot: "auto" })
+    );
+
+    expect(result.artifacts?.screenshot).toMatchObject({
+      mode: "crop",
+      coordinateSpace: { kind: "viewport" },
+    });
+    expect(result.artifacts!.screenshot!.width).toBeLessThan(
+      result.artifacts!.screenshot!.coordinateSpace.viewport.width
+    );
+    await rm(result.screenshotPath!, { force: true });
   });
 
   it("reads confirmation text and blocks a mismatched recipient", async () => {

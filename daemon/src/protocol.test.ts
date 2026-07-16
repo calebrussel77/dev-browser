@@ -204,6 +204,42 @@ describe("interactive request protocol", () => {
     });
   });
 
+  it("parses annotation and full-page artifact options", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-annotated",
+        type: "interactive",
+        protocolVersion: 2,
+        page: "main",
+        annotate: true,
+        fullPage: true,
+        shot: "matches.png",
+        action: { kind: "find", query: "save", limit: 3 },
+      })
+    );
+    expect(result).toMatchObject({
+      success: true,
+      request: { annotate: true, fullPage: true, shot: "matches.png" },
+    });
+  });
+
+  it("parses focused shot options", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-focused-shot",
+        type: "interactive",
+        protocolVersion: 2,
+        page: "main",
+        fullPage: true,
+        action: { kind: "shot", ref: "R7", padding: 32 },
+      })
+    );
+    expect(result).toMatchObject({
+      success: true,
+      request: { fullPage: true, action: { kind: "shot", ref: "R7", padding: 32 } },
+    });
+  });
+
   it("rejects clicks without a ref or coordinates", () => {
     const result = parseRequest(
       JSON.stringify({
