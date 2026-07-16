@@ -37,12 +37,29 @@ const InteractiveClickByCoordinatesSchema = z.object({
   waitForText: z.string().min(1).optional(),
 });
 
+const ObserveOptionsSchema = z.object({
+  full: z.boolean().default(false),
+  delta: z.boolean().default(false),
+  track: z.string().min(1).max(200).default("default"),
+  maxNodes: z.number().int().positive().max(1_000).default(100),
+  maxChars: z.number().int().positive().max(100_000).default(12_000),
+  depth: z.number().int().positive().max(50).default(12),
+  breadth: z.number().int().positive().max(500).default(50),
+  continuation: z
+    .string()
+    .min(1)
+    .max(80)
+    .regex(/^[A-Za-z0-9_-]+$/)
+    .optional(),
+});
+
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
   z.object({
     kind: z.literal("navigate"),
     url: z.string().url(),
   }),
+  ObserveOptionsSchema.extend({ kind: z.literal("observe") }),
   z.object({
     kind: z.literal("read"),
     limit: z.number().int().positive().max(500).default(100),

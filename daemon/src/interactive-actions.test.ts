@@ -141,6 +141,31 @@ describe.sequential("interactive Playwright actions", () => {
     expect("snapshot" in first ? first.snapshot : "").toContain("Naminsita Bakayoko");
   });
 
+  it("uses one v2 state shape for observe and legacy read", async () => {
+    const observe = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "observe",
+        full: false,
+        delta: false,
+        track: "shared",
+        maxNodes: 100,
+        maxChars: 12_000,
+        depth: 12,
+        breadth: 50,
+      }),
+      protocolVersion: 2,
+    });
+    const read = await executeInteractiveAction(manager, {
+      ...request({ kind: "read", limit: 100, depth: 12 }),
+      protocolVersion: 2,
+    });
+
+    expect(observe.documentId).toBe(read.documentId);
+    expect(observe.tree).toBe(read.tree);
+    expect(observe.coordinateSpace).toEqual(read.coordinateSpace);
+    expect(observe.elements).toEqual(read.elements);
+  });
+
   it("find ranks the duplicate button in the requested landmark", async () => {
     const result = await executeInteractiveAction(
       manager,
@@ -175,6 +200,52 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.elements).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "Freshly inserted action" })])
     );
+  });
+
+  it("returns compact v2 find matches without the full element dump", async () => {
+    const result = await executeInteractiveAction(manager, {
+      ...request({ kind: "find", query: "connect main", limit: 5 }),
+      protocolVersion: 2,
+    });
+
+    expect(result.matches?.length).toBeGreaterThan(0);
+    expect(result.elements).toBeUndefined();
+    expect(result.documentId).toMatch(/^doc-\d+$/);
+    expect(result.tree).toEqual(expect.any(String));
+  });
+
+  it("returns unified post-action state after acting on a v2 registry ref", async () => {
+    const observed = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "observe",
+        full: false,
+        delta: false,
+        track: "post-action",
+        maxNodes: 100,
+        maxChars: 12_000,
+        depth: 12,
+        breadth: 50,
+      }),
+      protocolVersion: 2,
+    });
+    const ref = observed.elements?.find((element) => element.name === "Changed action")?.ref;
+    const page = await manager.getPage(browserName, "profile");
+    try {
+      const clicked = await executeInteractiveAction(manager, {
+        ...request({ kind: "click", ref: ref!, method: "mouse" }),
+        protocolVersion: 2,
+      });
+
+      expect(clicked.documentId).toBe(observed.documentId);
+      expect(clicked.stateId).not.toBe(observed.stateId);
+      expect(clicked.tree).toContain("Changed action");
+      expect(clicked.elements).toEqual(expect.any(Array));
+    } finally {
+      await page.evaluate(() => {
+        (window as unknown as { __changedClicks: number }).__changedClicks = 0;
+        document.querySelector("#changed-button")?.setAttribute("aria-expanded", "false");
+      });
+    }
   });
 
   it("clicks a ref with a trusted mouse event", async () => {

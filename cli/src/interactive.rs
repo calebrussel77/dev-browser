@@ -51,6 +51,34 @@ pub struct InteractiveRequestOptions<'a> {
     pub timeout_ms: u64,
 }
 
+pub struct ObserveActionOptions<'a> {
+    pub full: bool,
+    pub delta: bool,
+    pub track: &'a str,
+    pub max_nodes: u16,
+    pub max_chars: u32,
+    pub depth: u8,
+    pub breadth: u16,
+    pub continuation: Option<&'a str>,
+}
+
+pub fn build_observe_action(options: ObserveActionOptions<'_>) -> Value {
+    let mut action = json!({
+        "kind": "observe",
+        "full": options.full,
+        "delta": options.delta,
+        "track": options.track,
+        "maxNodes": options.max_nodes,
+        "maxChars": options.max_chars,
+        "depth": options.depth,
+        "breadth": options.breadth,
+    });
+    if let Some(continuation) = options.continuation {
+        action["continuation"] = Value::String(continuation.to_string());
+    }
+    action
+}
+
 pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action: Value) -> Value {
     let mut request = json!({
         "id": options.id,
@@ -80,7 +108,10 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
 
 #[cfg(test)]
 mod tests {
-    use super::{build_interactive_request, Coordinates, InteractiveRequestOptions};
+    use super::{
+        build_interactive_request, build_observe_action, Coordinates, InteractiveRequestOptions,
+        ObserveActionOptions,
+    };
     use serde_json::json;
 
     #[test]
@@ -116,6 +147,55 @@ mod tests {
         assert_eq!(request["page"], "TARGET");
         assert_eq!(request["connect"], "auto");
         assert_eq!(request["shot"], "state.png");
+        assert_eq!(request["action"]["kind"], "read");
+    }
+
+    #[test]
+    fn builds_observe_json_with_every_perception_flag() {
+        let action = build_observe_action(ObserveActionOptions {
+            full: true,
+            delta: true,
+            track: "checkout",
+            max_nodes: 999,
+            max_chars: 99_999,
+            depth: 49,
+            breadth: 499,
+            continuation: Some("eyJ2IjoxLCJvZmZzZXQiOjN9"),
+        });
+
+        assert_eq!(
+            action,
+            json!({
+                "kind": "observe",
+                "full": true,
+                "delta": true,
+                "track": "checkout",
+                "maxNodes": 999,
+                "maxChars": 99_999,
+                "depth": 49,
+                "breadth": 499,
+                "continuation": "eyJ2IjoxLCJvZmZzZXQiOjN9",
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_read_still_uses_the_v2_request_envelope() {
+        let request = build_interactive_request(
+            InteractiveRequestOptions {
+                id: "read-1".to_string(),
+                browser: "default",
+                page: "main",
+                shot: None,
+                connect: None,
+                headless: false,
+                ignore_https_errors: false,
+                timeout_ms: 10_000,
+            },
+            json!({ "kind": "read", "limit": 100, "depth": 12 }),
+        );
+
+        assert_eq!(request["protocolVersion"], 2);
         assert_eq!(request["action"]["kind"], "read");
     }
 }

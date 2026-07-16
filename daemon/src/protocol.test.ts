@@ -91,6 +91,57 @@ describe("interactive request protocol", () => {
     });
   });
 
+  it("parses observe modes, tracking, and every hard budget", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-observe",
+        type: "interactive",
+        protocolVersion: 2,
+        page: "TARGET123",
+        action: {
+          kind: "observe",
+          full: true,
+          delta: true,
+          track: "checkout",
+          maxNodes: 999,
+          maxChars: 99_999,
+          depth: 49,
+          breadth: 499,
+        },
+      })
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      request: {
+        protocolVersion: 2,
+        action: {
+          kind: "observe",
+          full: true,
+          delta: true,
+          track: "checkout",
+          maxNodes: 999,
+          maxChars: 99_999,
+          depth: 49,
+          breadth: 499,
+        },
+      },
+    });
+  });
+
+  it("rejects malformed continuation syntax at the protocol boundary", () => {
+    const result = parseRequest(
+      JSON.stringify({
+        id: "interactive-observe-invalid-cursor",
+        type: "interactive",
+        protocolVersion: 2,
+        action: { kind: "observe", continuation: "bad cursor!" },
+      })
+    );
+
+    expect(result).toMatchObject({ success: false });
+  });
+
   it("parses trusted mouse and locator clicks by ref", () => {
     for (const method of ["mouse", "locator"] as const) {
       const result = parseRequest(

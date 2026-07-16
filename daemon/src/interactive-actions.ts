@@ -2,22 +2,16 @@ import type { Page } from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
+import {
+  collectPageState,
+  type CollectPageStateOptions,
+  type PagePerception,
+  type PerceptionElement,
+} from "./perception/collector.js";
 import type { InteractiveRequest } from "./protocol.js";
 import { writeDevBrowserTempFile } from "./temp-files.js";
 
-export interface InteractiveElement {
-  ref: string;
-  role: string;
-  name: string;
-  landmark: string;
-  visible: boolean;
-  box: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-}
+export type InteractiveElement = PerceptionElement;
 
 export interface InteractiveMatch extends InteractiveElement {
   score: number;
@@ -32,6 +26,13 @@ export interface InteractiveResult {
   snapshot?: string;
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
+  documentId?: string;
+  stateId?: string;
+  tree?: string;
+  focusedRef?: string | null;
+  delta?: PagePerception["delta"];
+  warnings?: string[];
+  truncation?: PagePerception["truncation"];
   clicked?: {
     ref: string | null;
     method: "mouse" | "locator";
@@ -53,6 +54,7 @@ export interface InteractiveResult {
     screenshotScale: "css";
     viewport: { width: number; height: number };
     devicePixelRatio: number;
+    scroll?: { x: number; y: number };
   };
   change?: {
     any: boolean;
@@ -142,166 +144,34 @@ function scoreElement(element: InteractiveElement, query: string): number {
   return score;
 }
 
-async function inspectElements(page: Page): Promise<InteractiveElement[]> {
-  return await page.evaluate(() => {
-    const selector =
-      "a[href],button,input,textarea,select,[role],[contenteditable=true],[tabindex]:not([tabindex='-1'])";
-    const refPattern = /^R\d+$/;
-    const root = window as unknown as { __devBrowserRefCounter?: number };
-    const usedRefs = new Set(
-      Array.from(document.querySelectorAll<HTMLElement>("[data-dev-browser-ref]"))
-        .map((element) => element.getAttribute("data-dev-browser-ref") ?? "")
-        .filter((ref) => refPattern.test(ref))
-    );
-    let counter = Math.max(
-      root.__devBrowserRefCounter ?? 1,
-      ...Array.from(usedRefs, (ref) => Number.parseInt(ref.slice(1), 10) + 1),
-      1
-    );
-
-    const compact = (value: string | null | undefined, max = 180): string =>
-      (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
-
-    const describeNode = (element: HTMLElement): string => {
-      const tag = element.tagName.toLowerCase();
-      const role = element.getAttribute("role");
-      const id = element.id ? `#${compact(element.id, 50)}` : "";
-      const classes = Array.from(element.classList)
-        .filter((name) => /^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(name))
-        .slice(0, 2)
-        .map((name) => `.${name}`)
-        .join("");
-      const roleSuffix = role && role !== tag ? `[role=${role}]` : "";
-      return `${tag}${id}${classes}${roleSuffix}`;
-    };
-
-    const landmarkFor = (element: HTMLElement): string => {
-      const parts: string[] = [];
-      let current: HTMLElement | null = element.parentElement;
-      while (current && current !== document.body) {
-        const tag = current.tagName.toLowerCase();
-        const role = current.getAttribute("role") ?? "";
-        const semantic = ["main", "aside", "nav", "header", "footer", "dialog"].includes(tag);
-        const roleLandmark = [
-          "main",
-          "complementary",
-          "navigation",
-          "banner",
-          "contentinfo",
-          "dialog",
-          "alertdialog",
-        ].includes(role);
-        const structural =
-          ["article", "section"].includes(tag) &&
-          (current.id.length > 0 || current.classList.length > 0);
-        if (semantic || roleLandmark || structural) {
-          parts.push(describeNode(current));
-        }
-        current = current.parentElement;
-      }
-      return parts.reverse().join(" > ") || "body";
-    };
-
-    const roleFor = (element: HTMLElement): string => {
-      const explicit = element.getAttribute("role");
-      if (explicit) return explicit;
-      const tag = element.tagName.toLowerCase();
-      if (tag === "button") return "button";
-      if (tag === "a") return "link";
-      if (tag === "textarea") return "textbox";
-      if (tag === "select") return "combobox";
-      if (tag === "input") {
-        const type = (element.getAttribute("type") ?? "text").toLowerCase();
-        if (["button", "submit", "reset"].includes(type)) return "button";
-        if (type === "checkbox") return "checkbox";
-        if (type === "radio") return "radio";
-        return "textbox";
-      }
-      if (element.isContentEditable) return "textbox";
-      return tag;
-    };
-
-    const nameFor = (element: HTMLElement): string => {
-      const labelledBy = element.getAttribute("aria-labelledby");
-      const labelledText = labelledBy
-        ? labelledBy
-            .split(/\s+/)
-            .map((id) => document.getElementById(id)?.textContent ?? "")
-            .join(" ")
-        : "";
-      const inputLabels =
-        element instanceof HTMLInputElement ||
-        element instanceof HTMLTextAreaElement ||
-        element instanceof HTMLSelectElement
-          ? Array.from(element.labels ?? [], (label) => label.textContent ?? "").join(" ")
-          : "";
-      const inputValue =
-        element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-          ? element.value
-          : "";
-      const imageAlt = element instanceof HTMLImageElement ? element.alt : "";
-      return compact(
-        element.getAttribute("aria-label") ||
-          labelledText ||
-          inputLabels ||
-          element.innerText ||
-          imageAlt ||
-          element.getAttribute("title") ||
-          element.getAttribute("placeholder") ||
-          inputValue
-      );
-    };
-
-    const elements = Array.from(document.querySelectorAll<HTMLElement>(selector));
-    const results = elements.map((element) => {
-      let ref = element.getAttribute("data-dev-browser-ref") ?? "";
-      if (!refPattern.test(ref)) {
-        do {
-          ref = `R${counter++}`;
-        } while (usedRefs.has(ref));
-        element.setAttribute("data-dev-browser-ref", ref);
-        usedRefs.add(ref);
-      }
-
-      const rect = element.getBoundingClientRect();
-      const style = window.getComputedStyle(element);
-      const visible =
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        Number.parseFloat(style.opacity || "1") > 0 &&
-        rect.bottom >= 0 &&
-        rect.right >= 0 &&
-        rect.top <= window.innerHeight &&
-        rect.left <= window.innerWidth;
-
-      return {
-        ref,
-        role: roleFor(element),
-        name: nameFor(element),
-        landmark: landmarkFor(element),
-        visible,
-        box: {
-          x: rect.x,
-          y: rect.y,
-          width: rect.width,
-          height: rect.height,
-        },
-      };
-    });
-
-    root.__devBrowserRefCounter = counter;
-    return results;
-  });
-}
-
 async function resolveRef(page: Page, ref: string) {
   if (!REF_PATTERN.test(ref)) {
     throw new Error(`Invalid element ref "${ref}"`);
   }
 
-  const original = page.locator(`[data-dev-browser-ref="${ref}"]`).first();
+  let selector = `[data-dev-browser-ref="${ref}"]`;
+  let temporary = false;
+  let original = page.locator(selector).first();
+  if ((await original.count()) === 0) {
+    temporary = await page.evaluate((requestedRef) => {
+      const state = (
+        window as Window & {
+          __devBrowserPerceptionState?: { refs: WeakMap<Element, string> };
+        }
+      ).__devBrowserPerceptionState;
+      if (!state) return false;
+      const element = Array.from(document.querySelectorAll("*")).find(
+        (candidate) => state.refs.get(candidate) === requestedRef
+      );
+      if (!element) return false;
+      element.setAttribute("data-dev-browser-action-ref", requestedRef);
+      return true;
+    }, ref);
+    if (temporary) {
+      selector = `[data-dev-browser-action-ref="${ref}"]`;
+      original = page.locator(selector).first();
+    }
+  }
   if ((await original.count()) === 0) {
     const boundedRef = summarizeErrorContext(ref);
     throw new AgentProtocolError(
@@ -311,6 +181,15 @@ async function resolveRef(page: Page, ref: string) {
       { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
     );
   }
+  const cleanup = async () => {
+    if (temporary) {
+      await page
+        .locator(selector)
+        .evaluateAll((elements) =>
+          elements.forEach((element) => element.removeAttribute("data-dev-browser-action-ref"))
+        );
+    }
+  };
 
   let locator = original;
   let resolvedBy: "self" | "descendant" | "ancestor" = "self";
@@ -348,10 +227,10 @@ async function resolveRef(page: Page, ref: string) {
         { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
       );
     }
-    return { box: ancestorBox, locator: ancestor, resolvedBy: "ancestor" as const };
+    return { box: ancestorBox, locator: ancestor, resolvedBy: "ancestor" as const, cleanup };
   }
 
-  return { box, locator, resolvedBy };
+  return { box, locator, resolvedBy, cleanup };
 }
 
 async function readConfirmationText(page: Page): Promise<string> {
@@ -400,30 +279,46 @@ async function savePageScreenshot(page: Page, requestedName: string): Promise<st
   );
 }
 
-async function coordinateSpace(
-  page: Page
-): Promise<NonNullable<InteractiveResult["coordinateSpace"]>> {
-  return await page.evaluate(() => ({
-    unit: "css-px" as const,
-    screenshotScale: "css" as const,
-    viewport: { width: window.innerWidth, height: window.innerHeight },
-    devicePixelRatio: window.devicePixelRatio,
-  }));
-}
-
 async function snapshot(page: Page, depth = 12): Promise<string> {
   const value = await page.locator("body").ariaSnapshot({ timeout: DEFAULT_ACTION_TIMEOUT_MS });
   return limitSnapshotDepth(value, depth);
 }
 
-async function perceive(page: Page, limit = DEFAULT_READ_LIMIT, depth = 12) {
-  const allElements = await inspectElements(page);
-  return {
-    allElements,
-    elements: allElements.slice(0, limit),
-    snapshot: await snapshot(page, depth),
-    coordinateSpace: await coordinateSpace(page),
-  };
+async function perceive(
+  page: Page,
+  options: CollectPageStateOptions = {},
+  legacyRefs = false
+): Promise<PagePerception> {
+  return await collectPageState(page, { ...options, legacyRefs });
+}
+
+function applyPerception(
+  result: InteractiveResult,
+  perception: PagePerception,
+  protocolVersion: 1 | 2,
+  includeElements = true
+): void {
+  result.documentId = perception.documentId;
+  result.stateId = perception.stateId;
+  result.tree = perception.tree;
+  result.focusedRef = perception.focusedRef;
+  result.delta = perception.delta;
+  result.warnings = perception.warnings;
+  result.truncation = perception.truncation;
+  result.coordinateSpace =
+    protocolVersion === 2
+      ? perception.coordinateSpace
+      : {
+          unit: perception.coordinateSpace.unit,
+          screenshotScale: perception.coordinateSpace.screenshotScale,
+          viewport: perception.coordinateSpace.viewport,
+          devicePixelRatio: perception.coordinateSpace.devicePixelRatio,
+        };
+  if (protocolVersion === 1) result.snapshot = perception.tree;
+  if (includeElements) {
+    const visibleElements = perception.elements.filter((element) => element.actionable);
+    result.elements = visibleElements;
+  }
 }
 
 interface PageSignal {
@@ -508,6 +403,7 @@ export async function executeInteractiveAction(
   }
 
   const page = await manager.getPage(request.browser, request.page);
+  const protocolVersion = request.protocolVersion ?? 1;
   const result: InteractiveResult = {
     action: action.kind,
     page: request.page,
@@ -519,24 +415,43 @@ export async function executeInteractiveAction(
         timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
         waitUntil: "domcontentloaded",
       });
-      Object.assign(result, await perceive(page));
-      delete (result as InteractiveResult & { allElements?: InteractiveElement[] }).allElements;
+      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
 
+    case "observe": {
+      const perception = await perceive(
+        page,
+        {
+          full: action.full,
+          delta: action.delta,
+          track: action.track,
+          maxNodes: action.maxNodes,
+          maxChars: action.maxChars,
+          depth: action.depth,
+          breadth: action.breadth,
+          continuation: action.continuation,
+        },
+        false
+      );
+      applyPerception(result, perception, protocolVersion);
+      break;
+    }
+
     case "read": {
-      const perception = await perceive(page, action.limit ?? DEFAULT_READ_LIMIT, action.depth);
-      result.elements = perception.elements;
-      result.snapshot = perception.snapshot;
-      result.coordinateSpace = perception.coordinateSpace;
+      const perception = await perceive(
+        page,
+        { maxNodes: action.limit ?? DEFAULT_READ_LIMIT, depth: action.depth },
+        protocolVersion === 1
+      );
+      applyPerception(result, perception, protocolVersion);
       break;
     }
 
     case "find": {
-      const perception = await perceive(page);
-      result.elements = perception.elements;
-      result.snapshot = perception.snapshot;
-      result.coordinateSpace = perception.coordinateSpace;
-      result.matches = perception.allElements
+      const perception = await perceive(page, {}, protocolVersion === 1);
+      applyPerception(result, perception, protocolVersion, protocolVersion === 1);
+      result.matches = perception.elements
+        .filter((element) => element.actionable)
         .map((element) => ({ ...element, score: scoreElement(element, action.query) }))
         .filter((element) => element.score > 0)
         .sort((left, right) => right.score - left.score)
@@ -551,15 +466,19 @@ export async function executeInteractiveAction(
       const before = await pageSignal(page);
       const clickOnce = async () => {
         if ("ref" in action) {
-          const { box, locator, resolvedBy } = await resolveRef(page, action.ref);
+          const { box, locator, resolvedBy, cleanup } = await resolveRef(page, action.ref);
           const point = {
             x: box.x + box.width / 2,
             y: box.y + box.height / 2,
           };
-          if (action.method === "locator") {
-            await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
-          } else {
-            await page.mouse.click(point.x, point.y);
+          try {
+            if (action.method === "locator") {
+              await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
+            } else {
+              await page.mouse.click(point.x, point.y);
+            }
+          } finally {
+            await cleanup();
           }
           result.clicked = { ref: action.ref, method: action.method, point, resolvedBy };
         } else {
@@ -619,17 +538,18 @@ export async function executeInteractiveAction(
       result.attempts = attempts;
       result.waitForText = action.waitForText ?? null;
       result.waitSatisfied = waitSatisfied;
-      const perception = await perceive(page);
-      result.elements = perception.elements;
-      result.snapshot = perception.snapshot;
-      result.coordinateSpace = perception.coordinateSpace;
+      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
     }
 
     case "type": {
       if (action.ref) {
-        const { box } = await resolveRef(page, action.ref);
-        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        const { box, cleanup } = await resolveRef(page, action.ref);
+        try {
+          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        } finally {
+          await cleanup();
+        }
       }
       if (action.clear) {
         await page.keyboard.press("ControlOrMeta+A");
@@ -637,10 +557,7 @@ export async function executeInteractiveAction(
       }
       await page.keyboard.type(action.text, { delay: action.delayMs });
       result.typed = { ref: action.ref ?? null, characters: Array.from(action.text).length };
-      const perception = await perceive(page);
-      result.elements = perception.elements;
-      result.snapshot = perception.snapshot;
-      result.coordinateSpace = perception.coordinateSpace;
+      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
     }
 
@@ -662,7 +579,14 @@ export async function executeInteractiveAction(
 
   result.url = page.url();
   result.title = await page.title();
-  result.coordinateSpace ??= await coordinateSpace(page);
+  if (!result.coordinateSpace) {
+    applyPerception(
+      result,
+      await perceive(page, {}, protocolVersion === 1),
+      protocolVersion,
+      action.kind !== "find" || protocolVersion === 1
+    );
+  }
 
   if (request.shot || action.kind === "shot") {
     const name =

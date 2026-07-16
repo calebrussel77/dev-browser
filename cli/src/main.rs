@@ -9,7 +9,10 @@ use daemon::{
     current_daemon_pid, ensure_daemon, install_daemon_runtime, is_daemon_running,
     wait_for_daemon_exit,
 };
-use interactive::{build_interactive_request, Coordinates, InteractiveRequestOptions};
+use interactive::{
+    build_interactive_request, build_observe_action, Coordinates, InteractiveRequestOptions,
+    ObserveActionOptions,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use skill::install_skill;
@@ -237,6 +240,30 @@ enum Command {
         output: PageActionArgs,
     },
     #[command(
+        about = "Observe a compact, actionable page state",
+        long_about = "Return the protocol v2 page state with stable inline refs, coordinate metadata, deterministic truncation, and optional deltas."
+    )]
+    Observe {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        delta: bool,
+        #[arg(long, default_value = "default", value_name = "KEY")]
+        track: String,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        max_nodes: u16,
+        #[arg(long, default_value_t = 12_000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+        max_chars: u32,
+        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u8).range(1..=50))]
+        depth: u8,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+        breadth: u16,
+        #[arg(long, value_name = "CURSOR")]
+        continuation: Option<String>,
+    },
+    #[command(
         about = "Read the accessibility snapshot and interactive refs for a page",
         long_about = "Return an accessibility snapshot plus stable DOM refs for interactive elements. Each ref includes role, name, visibility, viewport coordinates, and its main/aside/dialog landmark path. Run read again after a rerender before using old refs."
     )]
@@ -423,6 +450,31 @@ fn run() -> Result<i32, Box<dyn Error>> {
             &output.target.page,
             output.shot.as_deref(),
             json!({ "kind": "navigate", "url": url }),
+        ),
+        Some(Command::Observe {
+            output,
+            full,
+            delta,
+            track,
+            max_nodes,
+            max_chars,
+            depth,
+            breadth,
+            continuation,
+        }) => run_interactive(
+            &cli,
+            &output.target.page,
+            output.shot.as_deref(),
+            build_observe_action(ObserveActionOptions {
+                full: *full,
+                delta: *delta,
+                track,
+                max_nodes: *max_nodes,
+                max_chars: *max_chars,
+                depth: *depth,
+                breadth: *breadth,
+                continuation: continuation.as_deref(),
+            }),
         ),
         Some(Command::Read {
             output,
@@ -971,6 +1023,46 @@ mod tests {
                 panic!("failed to parse {command:?}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn parses_every_observe_flag() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "observe",
+            "--page",
+            "TARGET",
+            "--full",
+            "--delta",
+            "--track",
+            "checkout",
+            "--max-nodes",
+            "999",
+            "--max-chars",
+            "99999",
+            "--depth",
+            "49",
+            "--breadth",
+            "499",
+            "--continuation",
+            "eyJ2IjoxLCJvZmZzZXQiOjN9",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Observe {
+                full: true,
+                delta: true,
+                ref track,
+                max_nodes: 999,
+                max_chars: 99_999,
+                depth: 49,
+                breadth: 499,
+                continuation: Some(_),
+                ..
+            }) if track == "checkout"
+        ));
     }
 
     #[test]
