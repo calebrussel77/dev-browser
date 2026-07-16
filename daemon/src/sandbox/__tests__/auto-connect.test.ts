@@ -30,7 +30,7 @@ class MockPage extends EventEmitter {
   private closed = false;
   readonly targetId: string;
   readonly pageTitle: string;
-  readonly pageUrl: string;
+  pageUrl: string;
 
   constructor(options: { targetId?: string; title?: string; url?: string } = {}) {
     super();
@@ -49,6 +49,10 @@ class MockPage extends EventEmitter {
 
   async title(): Promise<string> {
     return this.pageTitle;
+  }
+
+  async goto(url: string): Promise<void> {
+    this.pageUrl = url;
   }
 
   async close(): Promise<void> {
@@ -135,6 +139,46 @@ class MockBrowser extends EventEmitter {
   }
 }
 
+class SuccessfulCdpWebSocket extends EventTarget {
+  readyState = 0;
+
+  constructor(readonly endpoint: string) {
+    super();
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.dispatchEvent(new Event("open"));
+    });
+  }
+
+  send(message: string): void {
+    const request = JSON.parse(message) as { id: number };
+    const result =
+      request.id === 1
+        ? {
+            product: "Chrome/147.0.0.0",
+          }
+        : {
+            targetInfos: [{ targetId: "target-1", type: "page" }],
+          };
+
+    queueMicrotask(() => {
+      const event = new Event("message") as MessageEvent<string>;
+      Object.defineProperty(event, "data", {
+        value: JSON.stringify({
+          id: request.id,
+          result,
+        }),
+      });
+      this.dispatchEvent(event);
+    });
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+}
+
 type BrowserManagerInternals = {
   readDevToolsActivePort(expectedPort?: number): Promise<string | null>;
   discoverChrome(): Promise<string | null>;
@@ -152,12 +196,14 @@ function createEnoentError(filePath: string): NodeJS.ErrnoException {
 function createManager(
   options: {
     connectOverCDP?: ReturnType<typeof vi.fn>;
+    createSelectiveCdpTransport?: ReturnType<typeof vi.fn>;
     env?: NodeJS.ProcessEnv;
     fetch?: typeof globalThis.fetch;
     homedir?: () => string;
     launchPersistentContext?: ReturnType<typeof vi.fn>;
     platform?: NodeJS.Platform;
     readFile?: ReturnType<typeof vi.fn>;
+    webSocket?: typeof globalThis.WebSocket | null;
   } = {}
 ) {
   const connectOverCDP = options.connectOverCDP ?? vi.fn();
@@ -176,6 +222,9 @@ function createManager(
 
   const manager = new BrowserManager(path.join("/tmp", "dev-browser-auto-connect-tests"), {
     connectOverCDP: connectOverCDP as never,
+    ...(options.createSelectiveCdpTransport
+      ? { createSelectiveCdpTransport: options.createSelectiveCdpTransport as never }
+      : {}),
     env: options.env ?? {},
     fetch,
     homedir: options.homedir ?? (() => "/Users/tester"),
@@ -183,6 +232,7 @@ function createManager(
     mkdir: vi.fn(async () => undefined) as never,
     platform: options.platform ?? "darwin",
     readFile: readFile as never,
+    webSocket: options.webSocket ?? null,
   });
 
   return {
@@ -203,6 +253,146 @@ afterEach(() => {
 });
 
 describe("BrowserManager auto-connect", () => {
+  it("connects through a selective transport when a timeout is provided", async () => {
+    const context = new MockContext();
+    const browser = new MockBrowser([context]);
+    const transport = {
+      attachToTarget: vi.fn(),
+      close: vi.fn(),
+      detachFromTarget: vi.fn(async () => undefined),
+      listPageTargets: vi.fn(async () => []),
+      send: vi.fn(),
+    };
+    const createSelectiveCdpTransport = vi.fn(async () => transport);
+    const connectOverCDP = vi.fn(async () => browser);
+    const env: NodeJS.ProcessEnv = { DEV_BROWSER_CDP_PREFLIGHT: "0" };
+    const { manager } = createManager({
+      connectOverCDP,
+      createSelectiveCdpTransport,
+      env,
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      { connectTimeoutMs: 12_345 }
+    );
+
+    expect(createSelectiveCdpTransport).toHaveBeenCalledWith(
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      12_345
+    );
+    expect(connectOverCDP).toHaveBeenCalledWith(transport, {
+      noDefaults: true,
+      timeout: 12_345,
+    });
+    expect(env.PW_CHROMIUM_ATTACH_TO_OTHER).toBeUndefined();
+  });
+
+  it("lists raw tabs and attaches only the target requested by getPage", async () => {
+    const context = new MockContext();
+    const browser = new MockBrowser([context]);
+    const requestedPage = new MockPage({
+      targetId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      title: "LinkedIn",
+      url: "https://www.linkedin.com/feed/",
+    });
+    const attachToTarget = vi.fn(async (targetId: string) => {
+      expect(targetId).toBe(requestedPage.targetId);
+      context.pagesList.push(requestedPage);
+    });
+    const transport = {
+      attachToTarget,
+      close: vi.fn(),
+      detachFromTarget: vi.fn(async () => undefined),
+      listPageTargets: vi.fn(async () => [
+        {
+          id: requestedPage.targetId,
+          title: "LinkedIn",
+          url: requestedPage.url(),
+        },
+        {
+          id: "cccccccccccccccccccccccccccccccc",
+          title: "Gmail",
+          url: "https://mail.google.com/",
+        },
+      ]),
+      send: vi.fn(),
+    };
+    const { manager } = createManager({
+      connectOverCDP: vi.fn(async () => browser),
+      createSelectiveCdpTransport: vi.fn(async () => transport),
+      env: { DEV_BROWSER_CDP_PREFLIGHT: "0" },
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      { connectTimeoutMs: 1_000 }
+    );
+
+    await expect(manager.listPages("attached")).resolves.toEqual([
+      {
+        id: requestedPage.targetId,
+        name: null,
+        title: "LinkedIn",
+        url: requestedPage.url(),
+      },
+      {
+        id: "cccccccccccccccccccccccccccccccc",
+        name: null,
+        title: "Gmail",
+        url: "https://mail.google.com/",
+      },
+    ]);
+    expect(context.pages()).toEqual([]);
+
+    await expect(manager.getPage("attached", requestedPage.targetId)).resolves.toBe(
+      requestedPage
+    );
+    expect(attachToTarget).toHaveBeenCalledTimes(1);
+    expect(context.pages()).toEqual([requestedPage]);
+  });
+
+  it("opens a fresh authenticated-profile tab when an existing target is unresponsive", async () => {
+    const context = new MockContext();
+    const browser = new MockBrowser([context]);
+    const targetId = "dddddddddddddddddddddddddddddddd";
+    const attachToTarget = vi.fn(async () => undefined);
+    const detachFromTarget = vi.fn(async () => undefined);
+    const transport = {
+      attachToTarget,
+      close: vi.fn(),
+      detachFromTarget,
+      listPageTargets: vi.fn(async () => [
+        {
+          id: targetId,
+          title: "Busy CRM",
+          url: "https://crm.example.test/people",
+        },
+      ]),
+      send: vi.fn(),
+    };
+    const { manager } = createManager({
+      connectOverCDP: vi.fn(async () => browser),
+      createSelectiveCdpTransport: vi.fn(async () => transport),
+      env: { DEV_BROWSER_CDP_PREFLIGHT: "0" },
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      { connectTimeoutMs: 1 }
+    );
+
+    const page = await manager.getPage("attached", targetId);
+
+    expect(attachToTarget).toHaveBeenCalledWith(targetId);
+    expect(detachFromTarget).toHaveBeenCalledWith(targetId);
+    expect(page.url()).toBe("https://crm.example.test/people");
+    expect(context.newPageCalls).toBe(1);
+  });
+
   it("passes ignoreHTTPSErrors to launched browsers and only relaunches when it changes", async () => {
     const launchPersistentContext = vi.fn(async () => {
       const context = new MockContext();
@@ -518,6 +708,67 @@ describe("BrowserManager auto-connect", () => {
 
     expect(connectOverCDP).toHaveBeenCalledTimes(1);
     expect(env.PW_CHROMIUM_ATTACH_TO_OTHER).toBe("1");
+  });
+
+  it("passes the requested timeout to Playwright CDP attach", async () => {
+    const browser = new MockBrowser([new MockContext()]);
+    const connectOverCDP = vi.fn(async () => browser);
+    const { manager } = createManager({
+      connectOverCDP,
+      webSocket: null,
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      {
+        connectTimeoutMs: 12_345,
+      }
+    );
+
+    expect(connectOverCDP).toHaveBeenCalledWith(
+      "ws://127.0.0.1:9222/devtools/browser/external-session",
+      {
+        timeout: 12_345,
+      }
+    );
+  });
+
+  it("reports when raw CDP works but Playwright attach fails", async () => {
+    const env: NodeJS.ProcessEnv = {
+      DEV_BROWSER_CDP_PREFLIGHT: "1",
+    };
+    const connectOverCDP = vi.fn(async () => {
+      throw new Error("browserType.connectOverCDP: Timeout 1000ms exceeded");
+    });
+    const { manager } = createManager({
+      connectOverCDP,
+      env,
+      webSocket: SuccessfulCdpWebSocket as unknown as typeof globalThis.WebSocket,
+    });
+
+    await expect(
+      manager.connectBrowser(
+        "attached",
+        "ws://127.0.0.1:9222/devtools/browser/external-session",
+        {
+          connectTimeoutMs: 1_000,
+        }
+      )
+    ).rejects.toThrow(
+      /Raw CDP preflight succeeded \(Chrome\/147\.0\.0\.0, 1 targets\)/
+    );
+
+    expect(connectOverCDP).toHaveBeenCalledWith(
+      expect.objectContaining({
+        close: expect.any(Function),
+        send: expect.any(Function),
+      }),
+      {
+        noDefaults: true,
+        timeout: 1_000,
+      }
+    );
   });
 
   it("getBrowser returns connected entries without relaunching them", async () => {

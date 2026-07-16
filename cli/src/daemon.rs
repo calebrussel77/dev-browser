@@ -14,13 +14,14 @@ use std::time::{Duration, Instant};
 const DEV_BROWSER_DIR: &str = ".dev-browser";
 const EMBEDDED_DAEMON: &str = include_str!("../../daemon/dist/daemon.bundle.mjs");
 const EMBEDDED_SANDBOX_CLIENT: &str = include_str!("../../daemon/dist/sandbox-client.js");
+const PLAYWRIGHT_RUNTIME_VERSION: &str = "1.61.1";
 const EMBEDDED_PACKAGE_JSON: &str = r#"{
   "name": "dev-browser-runtime",
   "private": true,
   "type": "module",
   "dependencies": {
-    "playwright": "1.58.2",
-    "playwright-core": "1.58.2",
+    "playwright": "1.61.1",
+    "playwright-core": "1.61.1",
     "quickjs-emscripten": "^0.32.0"
   }
 }"#;
@@ -209,8 +210,26 @@ fn daemon_base_dir() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn embedded_runtime_installed(base_dir: &Path) -> bool {
-    dependency_installed(base_dir, "playwright")
+    dependency_installed_with_version(base_dir, "playwright", PLAYWRIGHT_RUNTIME_VERSION)
         && dependency_installed(base_dir, "quickjs-emscripten")
+}
+
+fn dependency_installed_with_version(
+    base_dir: &Path,
+    package_name: &str,
+    expected_version: &str,
+) -> bool {
+    let package_json = base_dir
+        .join("node_modules")
+        .join(package_name)
+        .join("package.json");
+    let Ok(contents) = fs::read_to_string(package_json) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    manifest.get("version").and_then(|value| value.as_str()) == Some(expected_version)
 }
 
 fn dependency_installed(base_dir: &Path, package_name: &str) -> bool {

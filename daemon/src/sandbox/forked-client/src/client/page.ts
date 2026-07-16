@@ -1135,14 +1135,39 @@ export class Page extends ChannelOwner<channels.PageChannel> implements api.Page
     return result.pdf;
   }
 
+  async ariaSnapshot(
+    options: TimeoutOptions & {
+      mode?: "ai" | "default";
+      depth?: number;
+      boxes?: boolean;
+      _track?: string;
+    } = {}
+  ): Promise<string> {
+    const result = await this.mainFrame()._channel.ariaSnapshot({
+      timeout: this._timeoutSettings.timeout(options),
+      track: options._track,
+      mode: options.mode,
+      depth: options.depth,
+      boxes: options.boxes,
+    });
+    return result.snapshot;
+  }
+
   async snapshotForAI(
     options: TimeoutOptions & { track?: string; depth?: number } = {}
   ): Promise<{ full: string; incremental?: string }> {
-    return await this._channel.snapshotForAI({
-      timeout: this._timeoutSettings.timeout(options),
-      track: options.track,
+    const full = await this.ariaSnapshot({
+      mode: "ai",
       depth: options.depth,
     });
+    if (!options.track) return { full };
+
+    const incremental = await this.ariaSnapshot({
+      mode: "ai",
+      depth: options.depth,
+      _track: options.track,
+    });
+    return incremental === full ? { full } : { full, incremental };
   }
 
   async _setDockTile(image: Buffer) {

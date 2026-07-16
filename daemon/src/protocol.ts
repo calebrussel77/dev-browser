@@ -14,6 +14,70 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
   timeoutMs: z.number().int().positive().optional(),
 });
 
+const InteractiveClickByRefSchema = z.object({
+  kind: z.literal("click"),
+  ref: z.string().regex(/^R\d+$/),
+  method: z.enum(["mouse", "locator"]).default("mouse"),
+  expectText: z.string().min(1).optional(),
+  waitForText: z.string().min(1).optional(),
+});
+
+const InteractiveClickByCoordinatesSchema = z.object({
+  kind: z.literal("click"),
+  x: z.number().finite().nonnegative(),
+  y: z.number().finite().nonnegative(),
+  method: z.literal("mouse").default("mouse"),
+  expectText: z.string().min(1).optional(),
+  waitForText: z.string().min(1).optional(),
+});
+
+const InteractiveActionSchema = z.union([
+  z.object({ kind: z.literal("pages") }),
+  z.object({
+    kind: z.literal("navigate"),
+    url: z.string().url(),
+  }),
+  z.object({
+    kind: z.literal("read"),
+    limit: z.number().int().positive().max(500).default(100),
+    depth: z.number().int().positive().max(50).default(12),
+  }),
+  z.object({
+    kind: z.literal("find"),
+    query: z.string().min(1),
+    limit: z.number().int().positive().max(50).default(10),
+  }),
+  InteractiveClickByRefSchema,
+  InteractiveClickByCoordinatesSchema,
+  z.object({
+    kind: z.literal("type"),
+    ref: z
+      .string()
+      .regex(/^R\d+$/)
+      .optional(),
+    text: z.string(),
+    clear: z.boolean().default(false),
+    delayMs: z.number().int().nonnegative().max(1_000).default(0),
+  }),
+  z.object({
+    kind: z.literal("confirm"),
+    expectText: z.string().min(1).optional(),
+  }),
+  z.object({ kind: z.literal("shot") }),
+]);
+
+const InteractiveRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("interactive"),
+  browser: z.string().min(1).default("default"),
+  page: z.string().min(1).default("main"),
+  action: InteractiveActionSchema,
+  shot: z.string().min(1).optional(),
+  headless: z.boolean().optional(),
+  ignoreHTTPSErrors: z.boolean().optional(),
+  connect: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+});
+
 const BrowsersRequestSchema = RequestBaseSchema.extend({
   type: z.literal("browsers"),
 });
@@ -37,6 +101,7 @@ const StopRequestSchema = RequestBaseSchema.extend({
 
 const RequestSchema = z.discriminatedUnion("type", [
   ExecuteRequestSchema,
+  InteractiveRequestSchema,
   BrowsersRequestSchema,
   BrowserStopRequestSchema,
   StatusRequestSchema,
@@ -83,6 +148,7 @@ const ResponseSchema = z.discriminatedUnion("type", [
 
 type Request = z.infer<typeof RequestSchema>;
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
+export type InteractiveRequest = z.infer<typeof InteractiveRequestSchema>;
 export type Response = z.infer<typeof ResponseSchema>;
 
 type ParseSuccess = { success: true; request: Request };

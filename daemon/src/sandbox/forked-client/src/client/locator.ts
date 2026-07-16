@@ -401,8 +401,15 @@ export class Locator implements api.Locator {
     });
   }
 
-  async ariaSnapshot(options?: TimeoutOptions): Promise<string> {
+  async ariaSnapshot(
+    options: TimeoutOptions & {
+      mode?: "ai" | "default";
+      depth?: number;
+      boxes?: boolean;
+    } = {}
+  ): Promise<string> {
     const result = await this._frame._channel.ariaSnapshot({
+      mode: options.mode,
       ...options,
       selector: this._selector,
       timeout: this._frame._timeout(options),
@@ -515,11 +522,13 @@ export class Locator implements api.Locator {
   async snapshotForAI(
     options: TimeoutOptions & { depth?: number } = {}
   ): Promise<{ full: string }> {
-    return await this._frame._page!._channel.snapshotForAI({
-      timeout: this._frame._timeout(options),
-      selector: this._selector,
-      depth: options.depth,
-    });
+    return {
+      full: await this.ariaSnapshot({
+        mode: "ai",
+        timeout: options.timeout,
+        depth: options.depth,
+      }),
+    };
   }
 
   async _expect(

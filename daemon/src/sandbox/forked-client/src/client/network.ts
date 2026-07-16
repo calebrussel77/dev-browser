@@ -89,7 +89,6 @@ export class Request extends ChannelOwner<channels.RequestChannel> implements ap
   private _redirectedTo: Request | null = null;
   _failureText: string | null = null;
   _response: Response | null = null;
-  private _hasResponse = false;
   private _provisionalHeaders: RawHeaders;
   private _actualHeadersPromise: Promise<RawHeaders> | undefined;
   _timing: ResourceTiming;
@@ -124,8 +123,6 @@ export class Request extends ChannelOwner<channels.RequestChannel> implements ap
       responseStart: -1,
       responseEnd: -1,
     };
-    this._hasResponse = this._initializer.hasResponse;
-    this._channel.on("response", () => (this._hasResponse = true));
   }
 
   url(): string {

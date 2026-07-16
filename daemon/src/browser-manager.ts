@@ -3,6 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 
+import {
+  SelectiveCdpTransport,
+  type CdpPageTarget,
+} from "./selective-cdp-transport.js";
+
+type SelectiveCdpTransportLike = Pick<
+  SelectiveCdpTransport,
+  | "attachToTarget"
+  | "close"
+  | "detachFromTarget"
+  | "listPageTargets"
+  | "onclose"
+  | "onmessage"
+  | "send"
+>;
+
 export interface BrowserEntry {
   name: string;
   type: "launched" | "connected";
@@ -13,6 +29,8 @@ export interface BrowserEntry {
   endpoint?: string;
   headless: boolean;
   ignoreHTTPSErrors: boolean;
+  selectiveTransport?: SelectiveCdpTransportLike;
+  targetAttachTimeoutMs?: number;
 }
 
 interface BrowserSummary {
@@ -31,6 +49,10 @@ interface BrowserPageSummary {
 
 type BrowserManagerDependencies = {
   connectOverCDP: typeof chromium.connectOverCDP;
+  createSelectiveCdpTransport: (
+    endpoint: string,
+    timeoutMs: number
+  ) => Promise<SelectiveCdpTransportLike>;
   env: NodeJS.ProcessEnv;
   fetch: typeof globalThis.fetch;
   homedir: () => string;
@@ -38,6 +60,7 @@ type BrowserManagerDependencies = {
   mkdir: typeof mkdir;
   platform: NodeJS.Platform;
   readFile: typeof readFile;
+  webSocket: typeof globalThis.WebSocket | null;
 };
 
 type DebuggerWebSocketLookupResult =
@@ -49,11 +72,34 @@ type DebuggerWebSocketLookupResult =
       status: "not-found" | "unavailable";
     };
 
+type ConnectBrowserOptions = {
+  connectTimeoutMs?: number;
+};
+
+type CdpPreflightResult =
+  | {
+      status: "ok";
+      product: string;
+      targetCount: number;
+    }
+  | {
+      status: "skipped";
+      reason: string;
+    }
+  | {
+      status: "failed";
+      reason: string;
+    };
+
 const DISCOVERY_PORTS = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229];
 const CHROMIUM_ATTACH_TO_OTHER_ENV = "PW_CHROMIUM_ATTACH_TO_OTHER";
+const CDP_PREFLIGHT_ENV = "DEV_BROWSER_CDP_PREFLIGHT";
 const PROBE_TIMEOUT_MS = 750;
 const MANUAL_CONNECT_TIMEOUT_MS = 5_000;
+const CDP_PREFLIGHT_TIMEOUT_MS = 5_000;
 const PAGE_TITLE_TIMEOUT_MS = 1_500;
+const SELECTIVE_TARGET_ATTACH_TIMEOUT_MS = 15_000;
+const SELECTIVE_TARGET_REUSE_TIMEOUT_MS = 5_000;
 const TARGET_ID_PATTERN = /^[a-f0-9]{16,}$/i;
 
 function isIgnorableFileError(error: unknown): boolean {
@@ -65,18 +111,40 @@ function isHttpEndpoint(endpoint: string): boolean {
   return endpoint.startsWith("http://") || endpoint.startsWith("https://");
 }
 
+function isWebSocketEndpoint(endpoint: string): boolean {
+  return endpoint.startsWith("ws://") || endpoint.startsWith("wss://");
+}
+
 export class BrowserManager {
   private readonly browsers = new Map<string, BrowserEntry>();
   private readonly baseDir: string;
   private readonly dependencies: BrowserManagerDependencies;
+  private readonly supportsSelectiveTransport: boolean;
 
   constructor(
     baseDir = path.join(os.homedir(), ".dev-browser", "browsers"),
     dependencies: Partial<BrowserManagerDependencies> = {}
   ) {
     this.baseDir = baseDir;
+    const webSocket =
+      dependencies.webSocket === undefined
+        ? typeof globalThis.WebSocket === "function"
+          ? globalThis.WebSocket
+          : null
+        : dependencies.webSocket;
+    this.supportsSelectiveTransport =
+      webSocket !== null || dependencies.createSelectiveCdpTransport !== undefined;
     this.dependencies = {
       connectOverCDP: chromium.connectOverCDP.bind(chromium) as typeof chromium.connectOverCDP,
+      createSelectiveCdpTransport: async (endpoint, timeoutMs) => {
+        if (!webSocket) {
+          throw new Error("WebSocket is not available in this Node.js runtime");
+        }
+        return SelectiveCdpTransport.connect(endpoint, {
+          timeoutMs,
+          webSocket,
+        });
+      },
       env: process.env,
       fetch: globalThis.fetch,
       homedir: os.homedir,
@@ -86,6 +154,7 @@ export class BrowserManager {
       mkdir,
       platform: process.platform,
       readFile,
+      webSocket,
       ...dependencies,
     };
   }
@@ -121,7 +190,7 @@ export class BrowserManager {
     return this.launchBrowser(name, requestedHeadless, requestedIgnoreHTTPSErrors);
   }
 
-  async autoConnect(name: string): Promise<BrowserEntry> {
+  async autoConnect(name: string, options: ConnectBrowserOptions = {}): Promise<BrowserEntry> {
     await this.ensureBaseDir();
 
     const existing = this.browsers.get(name);
@@ -144,7 +213,7 @@ export class BrowserManager {
       attemptedEndpoints.add(endpoint);
 
       try {
-        return await this.openConnectedBrowser(name, endpoint);
+        return await this.openConnectedBrowser(name, endpoint, options);
       } catch (error) {
         lastError = error;
         return null;
@@ -168,9 +237,13 @@ export class BrowserManager {
     throw new Error(this.buildAutoConnectError(lastError));
   }
 
-  async connectBrowser(name: string, endpoint: string): Promise<BrowserEntry> {
+  async connectBrowser(
+    name: string,
+    endpoint: string,
+    options: ConnectBrowserOptions = {}
+  ): Promise<BrowserEntry> {
     if (endpoint === "auto") {
-      return this.autoConnect(name);
+      return this.autoConnect(name, options);
     }
 
     await this.ensureBaseDir();
@@ -190,7 +263,7 @@ export class BrowserManager {
       await this.stopBrowser(name);
     }
 
-    return this.openConnectedBrowser(name, resolvedEndpoint);
+    return this.openConnectedBrowser(name, resolvedEndpoint, options);
   }
 
   getBrowser(name: string): BrowserEntry | undefined {
@@ -213,9 +286,41 @@ export class BrowserManager {
     entry.pages.delete(pageNameOrId);
 
     if (TARGET_ID_PATTERN.test(pageNameOrId)) {
-      const page = await this.findPageByTargetId(entry, pageNameOrId);
+      let page = await this.findPageByTargetId(entry, pageNameOrId);
       if (page) {
         return page;
+      }
+
+      if (entry.selectiveTransport) {
+        const rawTarget = (await entry.selectiveTransport.listPageTargets()).find(
+          (target) => target.id === pageNameOrId
+        );
+        await entry.selectiveTransport.attachToTarget(pageNameOrId);
+        const attachTimeoutMs =
+          entry.targetAttachTimeoutMs ?? SELECTIVE_TARGET_ATTACH_TIMEOUT_MS;
+        page = await this.waitForPageByTargetId(
+          entry,
+          pageNameOrId,
+          Math.min(attachTimeoutMs, SELECTIVE_TARGET_REUSE_TIMEOUT_MS)
+        );
+        if (page) {
+          return page;
+        }
+
+        await entry.selectiveTransport.detachFromTarget(pageNameOrId).catch(() => undefined);
+        if (!rawTarget) {
+          throw new Error(`Chrome target "${pageNameOrId}" no longer exists`);
+        }
+
+        const fallbackPage = await entry.context.newPage();
+        this.registerNamedPage(entry, pageNameOrId, fallbackPage);
+        if (rawTarget.url && rawTarget.url !== "about:blank") {
+          await fallbackPage.goto(rawTarget.url, {
+            timeout: attachTimeoutMs,
+            waitUntil: "domcontentloaded",
+          });
+        }
+        return fallbackPage;
       }
     }
 
@@ -237,7 +342,14 @@ export class BrowserManager {
 
     this.pruneClosedPages(entry);
     const namesByPage = this.getNamedPagesByPage(entry);
-    const summaries: BrowserPageSummary[] = [];
+    const summaries = new Map<string, BrowserPageSummary>();
+
+    if (entry.selectiveTransport) {
+      const targets = await entry.selectiveTransport.listPageTargets();
+      for (const target of targets) {
+        summaries.set(target.id, this.summarizeRawTarget(target));
+      }
+    }
 
     for (const { context, page } of this.getContextPages(entry)) {
       const id = await this.getPageTargetId(context, page);
@@ -256,7 +368,7 @@ export class BrowserManager {
         throw error;
       }
 
-      summaries.push({
+      summaries.set(id, {
         id,
         url: page.url(),
         title,
@@ -264,7 +376,7 @@ export class BrowserManager {
       });
     }
 
-    return summaries;
+    return Array.from(summaries.values());
   }
 
   async closePage(browserName: string, pageName: string): Promise<void> {
@@ -388,9 +500,43 @@ export class BrowserManager {
     return entry;
   }
 
-  private async openConnectedBrowser(name: string, endpoint: string): Promise<BrowserEntry> {
-    this.enableChromiumAttachToOtherTargets();
-    const browser = await this.dependencies.connectOverCDP(endpoint);
+  private async openConnectedBrowser(
+    name: string,
+    endpoint: string,
+    options: ConnectBrowserOptions = {}
+  ): Promise<BrowserEntry> {
+    const preflight = await this.preflightCdpEndpoint(endpoint, options.connectTimeoutMs);
+    let browser: Browser;
+    let selectiveTransport: SelectiveCdpTransportLike | undefined;
+
+    try {
+      if (
+        options.connectTimeoutMs !== undefined &&
+        isWebSocketEndpoint(endpoint) &&
+        this.supportsSelectiveTransport
+      ) {
+        selectiveTransport = await this.dependencies.createSelectiveCdpTransport(
+          endpoint,
+          options.connectTimeoutMs
+        );
+        browser = await this.dependencies.connectOverCDP(selectiveTransport, {
+          noDefaults: true,
+          timeout: options.connectTimeoutMs,
+        });
+      } else {
+        this.enableChromiumAttachToOtherTargets();
+        browser =
+          options.connectTimeoutMs === undefined
+            ? await this.dependencies.connectOverCDP(endpoint)
+            : await this.dependencies.connectOverCDP(endpoint, {
+                timeout: options.connectTimeoutMs,
+              });
+      }
+    } catch (error) {
+      selectiveTransport?.close();
+      throw this.buildConnectOverCdpError(endpoint, error, preflight);
+    }
+
     const contexts = browser.contexts();
 
     // Enumerate existing tabs for connected browsers, but leave them unnamed so getPage(name)
@@ -410,6 +556,8 @@ export class BrowserManager {
       endpoint,
       headless: false,
       ignoreHTTPSErrors: false,
+      selectiveTransport,
+      targetAttachTimeoutMs: options.connectTimeoutMs,
     };
 
     this.attachBrowserLifecycle(entry);
@@ -419,6 +567,216 @@ export class BrowserManager {
 
   private enableChromiumAttachToOtherTargets(): void {
     this.dependencies.env[CHROMIUM_ATTACH_TO_OTHER_ENV] = "1";
+  }
+
+  private async preflightCdpEndpoint(
+    endpoint: string,
+    connectTimeoutMs?: number
+  ): Promise<CdpPreflightResult> {
+    if (this.dependencies.env[CDP_PREFLIGHT_ENV] === "0") {
+      return {
+        status: "skipped",
+        reason: `${CDP_PREFLIGHT_ENV}=0 disables raw CDP diagnostics`,
+      };
+    }
+
+    if (connectTimeoutMs === undefined) {
+      return {
+        status: "skipped",
+        reason: "no connection timeout was provided",
+      };
+    }
+
+    if (!isWebSocketEndpoint(endpoint)) {
+      return {
+        status: "skipped",
+        reason: "endpoint is not a WebSocket URL",
+      };
+    }
+
+    const WebSocketImpl = this.dependencies.webSocket;
+    if (!WebSocketImpl) {
+      return {
+        status: "skipped",
+        reason: "WebSocket is not available in this Node.js runtime",
+      };
+    }
+
+    const timeoutMs = Math.min(connectTimeoutMs, CDP_PREFLIGHT_TIMEOUT_MS);
+
+    try {
+      return await new Promise<CdpPreflightResult>((resolve, reject) => {
+        let settled = false;
+        let product = "";
+        let socket: WebSocket | undefined;
+
+        const timeout = setTimeout(() => {
+          fail(new Error(`timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+          try {
+            if (socket && (socket.readyState === 0 || socket.readyState === 1)) {
+              socket.close();
+            }
+          } catch {
+            // Best effort after a diagnostic probe.
+          }
+        };
+
+        const succeed = (result: CdpPreflightResult) => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        const fail = (error: Error) => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+
+        try {
+          socket = new WebSocketImpl(endpoint);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+
+        socket.addEventListener("open", () => {
+          try {
+            socket?.send(JSON.stringify({ id: 1, method: "Browser.getVersion" }));
+          } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+          }
+        });
+
+        socket.addEventListener("message", (event) => {
+          if (typeof event.data !== "string") {
+            fail(new Error("received a non-text CDP response"));
+            return;
+          }
+
+          let payload: unknown;
+          try {
+            payload = JSON.parse(event.data);
+          } catch {
+            fail(new Error("received invalid JSON from the CDP WebSocket"));
+            return;
+          }
+
+          if (!payload || typeof payload !== "object" || !("id" in payload)) {
+            return;
+          }
+
+          const message = payload as {
+            id?: unknown;
+            error?: unknown;
+            result?: unknown;
+          };
+
+          if (message.error) {
+            fail(new Error(`CDP command failed: ${JSON.stringify(message.error)}`));
+            return;
+          }
+
+          if (message.id === 1) {
+            try {
+              product = this.extractCdpProduct(message.result);
+              socket?.send(JSON.stringify({ id: 2, method: "Target.getTargets" }));
+            } catch (error) {
+              fail(error instanceof Error ? error : new Error(String(error)));
+            }
+            return;
+          }
+
+          if (message.id === 2) {
+            try {
+              const targetCount = this.extractCdpTargetCount(message.result);
+              succeed({
+                status: "ok",
+                product,
+                targetCount,
+              });
+            } catch (error) {
+              fail(error instanceof Error ? error : new Error(String(error)));
+            }
+          }
+        });
+
+        socket.addEventListener("error", () => {
+          fail(new Error("WebSocket error before CDP preflight completed"));
+        });
+
+        socket.addEventListener("close", () => {
+          fail(new Error("WebSocket closed before CDP preflight completed"));
+        });
+      });
+    } catch (error) {
+      return {
+        status: "failed",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private extractCdpProduct(result: unknown): string {
+    if (!result || typeof result !== "object") {
+      throw new Error("Browser.getVersion returned no result");
+    }
+
+    const product = (result as { product?: unknown }).product;
+    return typeof product === "string" && product.length > 0 ? product : "unknown Chrome";
+  }
+
+  private extractCdpTargetCount(result: unknown): number {
+    if (!result || typeof result !== "object") {
+      throw new Error("Target.getTargets returned no result");
+    }
+
+    const targetInfos = (result as { targetInfos?: unknown }).targetInfos;
+    if (!Array.isArray(targetInfos)) {
+      throw new Error("Target.getTargets did not return a target list");
+    }
+
+    return targetInfos.length;
+  }
+
+  private buildConnectOverCdpError(
+    endpoint: string,
+    error: unknown,
+    preflight: CdpPreflightResult
+  ): Error {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const details = [`Could not attach to Chrome via Playwright CDP at ${endpoint}.`];
+
+    if (preflight.status === "ok") {
+      details.push(
+        `Raw CDP preflight succeeded (${preflight.product}, ${preflight.targetCount} targets), so Chrome is reachable but Playwright could not finish attaching.`
+      );
+    } else if (preflight.status === "skipped") {
+      details.push(`Raw CDP preflight was skipped: ${preflight.reason}.`);
+    } else {
+      details.push(`Raw CDP preflight failed: ${preflight.reason}.`);
+    }
+
+    details.push(
+      "Use `--timeout SECONDS` to control the Playwright attach timeout.",
+      "If `/json/version` returns 404, prefer `dev-browser --connect` without a URL so DevToolsActivePort can be used, or pass the exact ws://... endpoint from DevToolsActivePort.",
+      "If the daemon was already running before a fix or environment change, run `dev-browser stop` and retry.",
+      `Original error: ${errorMessage}`
+    );
+
+    return new Error(details.join("\n"));
   }
 
   private attachBrowserLifecycle(entry: BrowserEntry): void {
@@ -675,11 +1033,6 @@ export class BrowserManager {
           ? "chrome.exe --remote-debugging-port=9222"
           : "google-chrome --remote-debugging-port=9222";
 
-    const details = [
-      "Could not auto-discover a running Chrome instance with remote debugging enabled.",
-      "Enable Chrome remote debugging at chrome://inspect/#remote-debugging",
-      `or launch Chrome with: ${launchCommand}`,
-    ];
     const lastErrorMessage =
       lastError instanceof Error
         ? lastError.message
@@ -688,10 +1041,17 @@ export class BrowserManager {
           : null;
 
     if (lastErrorMessage) {
-      details.push(`Last connection error: ${lastErrorMessage}`);
+      return [
+        "Chrome's CDP endpoint was discovered, but dev-browser could not attach to it.",
+        `Last connection error: ${lastErrorMessage}`,
+      ].join("\n");
     }
 
-    return details.join("\n");
+    return [
+      "Could not auto-discover a running Chrome instance with remote debugging enabled.",
+      "Enable Chrome remote debugging at chrome://inspect/#remote-debugging",
+      `or launch Chrome with: ${launchCommand}`,
+    ].join("\n");
   }
 
   private async resolveHttpEndpoint(endpoint: string, timeoutMs: number): Promise<string | null> {
@@ -841,6 +1201,31 @@ export class BrowserManager {
     }
 
     return null;
+  }
+
+  private async waitForPageByTargetId(
+    entry: BrowserEntry,
+    targetId: string,
+    timeoutMs: number
+  ): Promise<Page | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const page = await this.findPageByTargetId(entry, targetId);
+      if (page) {
+        return page;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return null;
+  }
+
+  private summarizeRawTarget(target: CdpPageTarget): BrowserPageSummary {
+    return {
+      id: target.id,
+      name: null,
+      title: target.title,
+      url: target.url,
+    };
   }
 
   private async getPageTargetId(context: BrowserContext, page: Page): Promise<string | null> {
