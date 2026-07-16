@@ -6,6 +6,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { BrowserManager } from "../../browser-manager.js";
 import { removeDirectoryWithRetries } from "../../test-cleanup.js";
+import {
+  startAgentReliabilityFixture,
+  type AgentReliabilityFixture,
+} from "../../test-fixtures/agent-reliability-fixture.js";
 import { QuickJSSandbox } from "../quickjs-sandbox.js";
 
 const browserName = "named-pages";
@@ -52,10 +56,12 @@ function outputLines(output: CapturedOutput): string[] {
 describe.sequential("QuickJS named page management", () => {
   let browserRootDir = "";
   let manager: BrowserManager;
+  let fixture: AgentReliabilityFixture;
 
   beforeAll(async () => {
     browserRootDir = await mkdtemp(path.join(os.tmpdir(), "dev-browser-quickjs-named-pages-"));
     manager = new BrowserManager(path.join(browserRootDir, "browsers"));
+    fixture = await startAgentReliabilityFixture();
   }, 180_000);
 
   afterEach(async () => {
@@ -64,6 +70,7 @@ describe.sequential("QuickJS named page management", () => {
 
   afterAll(async () => {
     await manager.stopAll();
+    await fixture.close();
     await removeDirectoryWithRetries(browserRootDir);
   }, 180_000);
 
@@ -96,7 +103,7 @@ describe.sequential("QuickJS named page management", () => {
         sandbox,
         `
         const page = await browser.getPage("persist");
-        await page.goto("https://example.com");
+        await page.goto(${JSON.stringify(fixture.mainUrl)});
         await page.evaluate(() => {
           window.name = "persisted-state";
         });
@@ -118,8 +125,8 @@ describe.sequential("QuickJS named page management", () => {
     }
 
     expect(output.stderr).toEqual([]);
-    expect(outputLines(output)).toContain("https://example.com/");
-    expect(outputLines(output)).toContain("Example Domain");
+    expect(outputLines(output)).toContain(fixture.mainUrl);
+    expect(outputLines(output)).toContain("Agent reliability fixture");
     expect(outputLines(output)).toContain("persisted-state");
     expect(pageNames(await manager.listPages(browserName))).toEqual(["persist"]);
   }, 120_000);
@@ -138,7 +145,7 @@ describe.sequential("QuickJS named page management", () => {
         sandbox,
         `
         const page = await browser.newPage();
-        await page.goto("https://example.com");
+        await page.goto(${JSON.stringify(fixture.mainUrl)});
         console.log(await page.title());
       `
       );
@@ -149,9 +156,9 @@ describe.sequential("QuickJS named page management", () => {
     const livePages = entry.context.pages().filter((page) => !page.isClosed());
 
     expect(output.stderr).toEqual([]);
-    expect(outputLines(output)).toContain("Example Domain");
+    expect(outputLines(output)).toContain("Agent reliability fixture");
     expect(livePages).toHaveLength(baselinePageCount);
-    expect(livePages.map((page) => page.url())).not.toContain("https://example.com/");
+    expect(livePages.map((page) => page.url())).not.toContain(fixture.mainUrl);
     expect(pageNames(await manager.listPages(browserName))).toEqual([]);
   }, 120_000);
 
