@@ -252,4 +252,34 @@ describe("interactive request protocol", () => {
 
     expect(result).toMatchObject({ success: false });
   });
+
+  it("parses v2 state guards and page sessions", () => {
+    const guarded = parseRequest(JSON.stringify({
+      id: "guarded", type: "interactive", protocolVersion: 2, session: "opaque",
+      action: { kind: "click", ref: "R1", fromState: "doc-1:2", strictState: true },
+    }));
+    expect(guarded).toMatchObject({ success: true, request: { session: "opaque", action: {
+      fromState: "doc-1:2", strictState: true,
+    } } });
+
+    for (const request of [
+      { id: "open", type: "session", action: "open", browser: "default", page: "main", ttl: 300 },
+      { id: "renew", type: "session", action: "renew", session: "opaque", ttl: 60 },
+      { id: "close", type: "session", action: "close", session: "opaque" },
+    ]) expect(parseRequest(JSON.stringify(request))).toMatchObject({ success: true });
+  });
+
+  it("rejects session TTLs outside 1 through 3600 seconds", () => {
+    for (const ttl of [0, 3601]) {
+      expect(parseRequest(JSON.stringify({
+        id: `ttl-${ttl}`, type: "session", action: "open", browser: "default", page: "main", ttl,
+      }))).toMatchObject({ success: false });
+    }
+  });
+
+  it("preserves an optional session on arbitrary script execution", () => {
+    expect(parseRequest(JSON.stringify({
+      id: "execute-owner", type: "execute", browser: "default", script: "await browser.listPages()", session: "opaque-owner",
+    }))).toMatchObject({ success: true, request: { type: "execute", session: "opaque-owner" } });
+  });
 });

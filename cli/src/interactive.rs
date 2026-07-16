@@ -51,6 +51,7 @@ pub struct InteractiveRequestOptions<'a> {
     pub headless: bool,
     pub ignore_https_errors: bool,
     pub timeout_ms: u64,
+    pub session: Option<&'a str>,
 }
 
 pub struct ObserveActionOptions<'a> {
@@ -79,6 +80,15 @@ pub fn build_observe_action(options: ObserveActionOptions<'_>) -> Value {
         action["continuation"] = Value::String(continuation.to_string());
     }
     action
+}
+
+pub fn apply_state_guard(action: &mut Value, from_state: Option<&str>, strict_state: bool) {
+    if let Some(from_state) = from_state {
+        action["fromState"] = Value::String(from_state.to_string());
+    }
+    if strict_state {
+        action["strictState"] = Value::Bool(true);
+    }
 }
 
 pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action: Value) -> Value {
@@ -110,6 +120,9 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if options.ignore_https_errors {
         request["ignoreHTTPSErrors"] = Value::Bool(true);
     }
+    if let Some(session) = options.session {
+        request["session"] = Value::String(session.to_string());
+    }
 
     request
 }
@@ -117,8 +130,8 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
 #[cfg(test)]
 mod tests {
     use super::{
-        build_interactive_request, build_observe_action, Coordinates, InteractiveRequestOptions,
-        ObserveActionOptions,
+        apply_state_guard, build_interactive_request, build_observe_action, Coordinates,
+        InteractiveRequestOptions, ObserveActionOptions,
     };
     use serde_json::json;
 
@@ -147,6 +160,7 @@ mod tests {
                 headless: false,
                 ignore_https_errors: false,
                 timeout_ms: 15_000,
+                session: Some("opaque-session"),
             },
             json!({ "kind": "read", "limit": 100, "depth": 12 }),
         );
@@ -160,6 +174,7 @@ mod tests {
         assert_eq!(request["annotate"], true);
         assert_eq!(request["fullPage"], true);
         assert_eq!(request["action"]["kind"], "read");
+        assert_eq!(request["session"], "opaque-session");
     }
 
     #[test]
@@ -205,11 +220,20 @@ mod tests {
                 headless: false,
                 ignore_https_errors: false,
                 timeout_ms: 10_000,
+                session: None,
             },
             json!({ "kind": "read", "limit": 100, "depth": 12 }),
         );
 
         assert_eq!(request["protocolVersion"], 2);
         assert_eq!(request["action"]["kind"], "read");
+    }
+
+    #[test]
+    fn adds_state_guards_to_trusted_actions() {
+        let mut action = json!({ "kind": "click", "ref": "R7" });
+        apply_state_guard(&mut action, Some("doc-4:9"), true);
+        assert_eq!(action["fromState"], "doc-4:9");
+        assert_eq!(action["strictState"], true);
     }
 }

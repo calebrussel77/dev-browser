@@ -10,8 +10,8 @@ use daemon::{
     wait_for_daemon_exit,
 };
 use interactive::{
-    build_interactive_request, build_observe_action, Coordinates, InteractiveRequestOptions,
-    ObserveActionOptions,
+    apply_state_guard, build_interactive_request, build_observe_action, Coordinates,
+    InteractiveRequestOptions, ObserveActionOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -133,6 +133,13 @@ struct Cli {
 
     #[arg(
         long,
+        value_name = "SESSION_ID",
+        help = "Authorize script execution while this browser has a writer lease"
+    )]
+    session: Option<String>,
+
+    #[arg(
+        long,
         num_args = 0..=1,
         default_missing_value = "auto",
         value_name = "URL",
@@ -205,6 +212,37 @@ struct PageActionArgs {
         help = "Capture document CSS pixels instead of the current viewport"
     )]
     full_page: bool,
+
+    #[arg(long, value_name = "STATE")]
+    from_state: Option<String>,
+
+    #[arg(long)]
+    strict_state: bool,
+
+    #[arg(long, value_name = "SESSION_ID")]
+    session: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    Open {
+        #[arg(long, default_value = "default")]
+        browser: String,
+        #[arg(long, value_name = "TARGET")]
+        page: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(1..=3600))]
+        ttl: u16,
+    },
+    Renew {
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(1..=3600))]
+        ttl: u16,
+    },
+    Close {
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -224,6 +262,11 @@ impl ClickMethod {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(
+        subcommand,
+        about = "Open, renew, or close an optional page writer lease"
+    )]
+    Session(SessionCommand),
     #[command(
         about = "Run a script file against the browser",
         long_about = "Run a script file against the browser.\n\nThe file is executed the same way as stdin input: as top-level JavaScript with `await`, `browser`, and `console` available.\n\nUse top-level flags before `run`, for example `dev-browser --browser my-project run script.js`."
@@ -370,6 +413,12 @@ enum Command {
         full_page: bool,
         #[arg(long)]
         annotate: bool,
+        #[arg(long, value_name = "STATE")]
+        from_state: Option<String>,
+        #[arg(long)]
+        strict_state: bool,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
     },
     #[command(
         about = "Install Playwright browsers (Chromium)",
@@ -464,9 +513,15 @@ fn run() -> Result<i32, Box<dyn Error>> {
             let script = fs::read_to_string(file)?;
             run_script(&cli, script)
         }
-        Some(Command::Pages) => {
-            run_interactive(&cli, "main", None, false, false, json!({ "kind": "pages" }))
-        }
+        Some(Command::Pages) => run_interactive(
+            &cli,
+            "main",
+            None,
+            false,
+            false,
+            json!({ "kind": "pages" }),
+            None,
+        ),
         Some(Command::Navigate { url, output }) => {
             run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
         }
@@ -578,10 +633,19 @@ fn run() -> Result<i32, Box<dyn Error>> {
             padding,
             full_page,
             annotate,
+            from_state,
+            strict_state,
+            session,
         }) => {
             let mut action = json!({ "kind": "shot", "padding": padding });
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
+            }
+            if let Some(from_state) = from_state {
+                action["fromState"] = Value::String(from_state.clone());
+            }
+            if *strict_state {
+                action["strictState"] = Value::Bool(true);
             }
             run_interactive(
                 &cli,
@@ -590,7 +654,23 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 *annotate,
                 *full_page,
                 action,
+                session.as_deref(),
             )
+        }
+        Some(Command::Session(command)) => {
+            ensure_daemon()?;
+            let request = match command {
+                SessionCommand::Open { browser, page, ttl } => {
+                    json!({ "id": request_id("session-open"), "type": "session", "action": "open", "browser": browser, "page": page, "ttl": ttl })
+                }
+                SessionCommand::Renew { session, ttl } => {
+                    json!({ "id": request_id("session-renew"), "type": "session", "action": "renew", "session": session, "ttl": ttl })
+                }
+                SessionCommand::Close { session } => {
+                    json!({ "id": request_id("session-close"), "type": "session", "action": "close", "session": session })
+                }
+            };
+            send_request(request, ResultMode::Json)
         }
         Some(Command::Browsers) => {
             ensure_daemon()?;
@@ -664,13 +744,13 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
 
     let timeout_ms = timeout_ms(cli)?;
 
-    let mut request = json!({
-        "id": request_id("execute"),
-        "type": "execute",
-        "browser": cli.browser,
-        "script": script,
-        "timeoutMs": timeout_ms,
-    });
+    let mut request = build_execute_request(
+        request_id("execute"),
+        &cli.browser,
+        script,
+        timeout_ms,
+        cli.session.as_deref(),
+    );
 
     if cli.headless {
         request["headless"] = Value::Bool(true);
@@ -687,11 +767,36 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
     send_request(request, ResultMode::Json)
 }
 
+fn build_execute_request(
+    id: String,
+    browser: &str,
+    script: String,
+    timeout_ms: u64,
+    session: Option<&str>,
+) -> Value {
+    let mut request = json!({
+        "id": id,
+        "type": "execute",
+        "browser": browser,
+        "script": script,
+        "timeoutMs": timeout_ms,
+    });
+    if let Some(session) = session {
+        request["session"] = Value::String(session.to_string());
+    }
+    request
+}
+
 fn run_page_action(
     cli: &Cli,
     output: &PageActionArgs,
-    action: Value,
+    mut action: Value,
 ) -> Result<i32, Box<dyn Error>> {
+    apply_state_guard(
+        &mut action,
+        output.from_state.as_deref(),
+        output.strict_state,
+    );
     run_interactive(
         cli,
         &output.target.page,
@@ -699,6 +804,7 @@ fn run_page_action(
         output.annotate,
         output.full_page,
         action,
+        output.session.as_deref(),
     )
 }
 
@@ -709,6 +815,7 @@ fn run_interactive(
     annotate: bool,
     full_page: bool,
     action: Value,
+    session: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
     ensure_daemon()?;
     let action_name = action
@@ -727,6 +834,7 @@ fn run_interactive(
             headless: cli.headless,
             ignore_https_errors: cli.ignore_https_errors,
             timeout_ms: timeout_ms(cli)?,
+            session,
         },
         action,
     );
@@ -965,7 +1073,10 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_error_exit_code, stream_responses, Cli, Command, ResultMode};
+    use super::{
+        build_execute_request, cli_error_exit_code, stream_responses, Cli, Command, ResultMode,
+        SessionCommand,
+    };
     use clap::Parser;
     use std::io::Cursor;
 
@@ -1158,6 +1269,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_state_session_flags_and_all_session_commands() {
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--from-state",
+            "doc-1:7",
+            "--strict-state",
+            "--session",
+            "opaque-session",
+        ])
+        .unwrap();
+        assert!(
+            matches!(click.command, Some(Command::Click { ref output, .. })
+            if output.from_state.as_deref() == Some("doc-1:7") && output.strict_state
+                && output.session.as_deref() == Some("opaque-session"))
+        );
+
+        for args in [
+            vec![
+                "dev-browser",
+                "session",
+                "open",
+                "--browser",
+                "default",
+                "--page",
+                "TARGET",
+                "--ttl",
+                "300",
+            ],
+            vec![
+                "dev-browser",
+                "session",
+                "renew",
+                "--session",
+                "opaque",
+                "--ttl",
+                "60",
+            ],
+            vec!["dev-browser", "session", "close", "--session", "opaque"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+
+        let opened =
+            Cli::try_parse_from(["dev-browser", "session", "open", "--page", "TARGET"]).unwrap();
+        assert!(matches!(
+            opened.command,
+            Some(Command::Session(SessionCommand::Open { ttl: 300, .. }))
+        ));
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "session",
+            "open",
+            "--page",
+            "TARGET",
+            "--ttl",
+            "0"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn rejects_ambiguous_clicks() {
         let parsed = Cli::try_parse_from(["dev-browser", "click", "--page", "main"]);
         assert!(parsed.is_err());
@@ -1177,7 +1352,19 @@ mod tests {
 
     #[test]
     fn preserves_script_commands() {
-        let parsed = Cli::try_parse_from(["dev-browser", "run", "script.js"]).unwrap();
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "--session", "opaque", "run", "script.js"])
+                .unwrap();
+        assert_eq!(parsed.session.as_deref(), Some("opaque"));
         assert!(matches!(parsed.command, Some(Command::Run { .. })));
+
+        let request = build_execute_request(
+            "execute-1".to_string(),
+            "default",
+            "await browser.listPages()".to_string(),
+            30_000,
+            Some("opaque"),
+        );
+        assert_eq!(request["session"], "opaque");
     }
 }

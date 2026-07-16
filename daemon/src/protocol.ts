@@ -10,6 +10,11 @@ const RequestBaseSchema = z.object({
   id: z.string().min(1),
 });
 
+const StateGuardSchema = z.object({
+  fromState: z.string().regex(/^doc-\d+:\d+$/).optional(),
+  strictState: z.boolean().default(false),
+});
+
 const ExecuteRequestSchema = RequestBaseSchema.extend({
   type: z.literal("execute"),
   browser: z.string().min(1).default("default"),
@@ -18,9 +23,10 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
+  session: z.string().min(1).max(500).optional(),
 });
 
-const InteractiveClickByRefSchema = z.object({
+const InteractiveClickByRefSchema = StateGuardSchema.extend({
   kind: z.literal("click"),
   ref: z.string().regex(/^R\d+$/),
   method: z.enum(["mouse", "locator"]).default("mouse"),
@@ -28,7 +34,7 @@ const InteractiveClickByRefSchema = z.object({
   waitForText: z.string().min(1).optional(),
 });
 
-const InteractiveClickByCoordinatesSchema = z.object({
+const InteractiveClickByCoordinatesSchema = StateGuardSchema.extend({
   kind: z.literal("click"),
   x: z.number().finite().nonnegative(),
   y: z.number().finite().nonnegative(),
@@ -72,7 +78,7 @@ const InteractiveActionSchema = z.union([
   }),
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
-  z.object({
+  StateGuardSchema.extend({
     kind: z.literal("type"),
     ref: z
       .string()
@@ -82,11 +88,11 @@ const InteractiveActionSchema = z.union([
     clear: z.boolean().default(false),
     delayMs: z.number().int().nonnegative().max(1_000).default(0),
   }),
-  z.object({
+  StateGuardSchema.extend({
     kind: z.literal("confirm"),
     expectText: z.string().min(1).optional(),
   }),
-  z.object({
+  StateGuardSchema.extend({
     kind: z.literal("shot"),
     ref: z
       .string()
@@ -109,7 +115,14 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
+  session: z.string().min(1).max(500).optional(),
 });
+
+const SessionRequestSchema = z.union([
+  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("open"), browser: z.string().min(1).default("default"), page: z.string().min(1), ttl: z.number().int().min(1).max(3600).default(300) }),
+  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("renew"), session: z.string().min(1).max(500), ttl: z.number().int().min(1).max(3600).default(300) }),
+  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("close"), session: z.string().min(1).max(500) }),
+]);
 
 const BrowsersRequestSchema = RequestBaseSchema.extend({
   type: z.literal("browsers"),
@@ -132,7 +145,7 @@ const StopRequestSchema = RequestBaseSchema.extend({
   type: z.literal("stop"),
 });
 
-const RequestSchema = z.discriminatedUnion("type", [
+const RequestSchema = z.union([
   ExecuteRequestSchema,
   InteractiveRequestSchema,
   BrowsersRequestSchema,
@@ -140,6 +153,7 @@ const RequestSchema = z.discriminatedUnion("type", [
   StatusRequestSchema,
   InstallRequestSchema,
   StopRequestSchema,
+  SessionRequestSchema,
 ]);
 
 const ResponseBaseSchema = z.object({
@@ -184,8 +198,15 @@ const ResponseSchema = z.discriminatedUnion("type", [
 
 type Request = z.infer<typeof RequestSchema>;
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
+export type SessionRequest = z.infer<typeof SessionRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
-type ParsedShotAction = Extract<ParsedInteractiveAction, { kind: "shot" }>;
+type InputInteractiveAction = ParsedInteractiveAction extends infer Action
+  ? Action extends { kind: string }
+    ? Omit<Action, "strictState" | "padding"> &
+        { strictState?: boolean } &
+        (Action extends { kind: "shot" } ? { padding?: number } : unknown)
+    : never
+  : never;
 export type InteractiveRequest = Omit<
   z.infer<typeof InteractiveRequestSchema>,
   "protocolVersion" | "annotate" | "fullPage" | "action"
@@ -193,9 +214,7 @@ export type InteractiveRequest = Omit<
   protocolVersion?: 1 | 2;
   annotate?: boolean;
   fullPage?: boolean;
-  action:
-    | Exclude<ParsedInteractiveAction, ParsedShotAction>
-    | (Omit<ParsedShotAction, "padding"> & { padding?: number });
+  action: InputInteractiveAction;
 };
 export type Response = z.infer<typeof ResponseSchema>;
 

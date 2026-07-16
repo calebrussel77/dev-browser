@@ -9,6 +9,9 @@ import {
   type PerceptionElement,
 } from "./perception/collector.js";
 import type { InteractiveRequest } from "./protocol.js";
+import { discardValidationState, getLatestStateId } from "./page-state.js";
+import { validateObservedDecision } from "./ref-state.js";
+import { pageLeases } from "./sessions.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 
 export type InteractiveElement = PerceptionElement;
@@ -67,6 +70,10 @@ export interface InteractiveResult {
   attempts?: number;
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
+}
+
+export interface ActionExecutionHooks {
+  beforeTrustedInput?: () => void | Promise<void>;
 }
 
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
@@ -290,7 +297,7 @@ function applyPerception(
   result.tree = perception.tree;
   result.focusedRef = perception.focusedRef;
   result.delta = perception.delta;
-  result.warnings = perception.warnings;
+  result.warnings = [...(result.warnings ?? []), ...perception.warnings];
   result.truncation = perception.truncation;
   result.coordinateSpace =
     protocolVersion === 2
@@ -377,7 +384,8 @@ async function waitForVisibleText(
 
 export async function executeInteractiveAction(
   manager: BrowserManager,
-  request: InteractiveRequest
+  request: InteractiveRequest,
+  hooks: ActionExecutionHooks = {}
 ): Promise<InteractiveResult> {
   const { action } = request;
 
@@ -396,8 +404,31 @@ export async function executeInteractiveAction(
     page: request.page,
   };
 
+  const authorizeTrustedMutation = async () => {
+    await hooks.beforeTrustedInput?.();
+    pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+  };
+
+  if (
+    protocolVersion === 2 &&
+    (action.kind === "type" || (action.kind === "shot" && action.ref))
+  ) {
+    const previousLatestStateId = getLatestStateId(page);
+    const latest = await perceive(page, {}, false);
+    result.warnings = validateObservedDecision(
+      page,
+      request.page,
+      action,
+      "ref" in action ? action.ref : undefined,
+      latest,
+      previousLatestStateId
+    );
+    discardValidationState(page, latest.stateId, previousLatestStateId);
+  }
+
   switch (action.kind) {
     case "navigate":
+      await authorizeTrustedMutation();
       await page.goto(action.url, {
         timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
         waitUntil: "domcontentloaded",
@@ -452,6 +483,23 @@ export async function executeInteractiveAction(
       }
       const before = await pageSignal(page);
       const clickOnce = async () => {
+        if (protocolVersion === 2) {
+          const previousLatestStateId = getLatestStateId(page);
+          const latest = await perceive(page, {}, false);
+          const warnings = validateObservedDecision(
+            page,
+            request.page,
+            action,
+            "ref" in action ? action.ref : undefined,
+            latest,
+            previousLatestStateId
+          );
+          discardValidationState(page, latest.stateId, previousLatestStateId);
+          result.warnings = [
+            ...(result.warnings ?? []),
+            ...warnings,
+          ];
+        }
         if ("ref" in action) {
           const { box, locator, resolvedBy, cleanup } = await resolveRef(page, action.ref);
           const point = {
@@ -460,8 +508,10 @@ export async function executeInteractiveAction(
           };
           try {
             if (action.method === "locator") {
+              await authorizeTrustedMutation();
               await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
             } else {
+              await authorizeTrustedMutation();
               await page.mouse.click(point.x, point.y);
             }
           } finally {
@@ -469,6 +519,7 @@ export async function executeInteractiveAction(
           }
           result.clicked = { ref: action.ref, method: action.method, point, resolvedBy };
         } else {
+          await authorizeTrustedMutation();
           await page.mouse.click(action.x, action.y);
           result.clicked = {
             ref: null,
@@ -533,15 +584,19 @@ export async function executeInteractiveAction(
       if (action.ref) {
         const { box, cleanup } = await resolveRef(page, action.ref);
         try {
+          await authorizeTrustedMutation();
           await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
         } finally {
           await cleanup();
         }
       }
       if (action.clear) {
+        await authorizeTrustedMutation();
         await page.keyboard.press("ControlOrMeta+A");
+        await authorizeTrustedMutation();
         await page.keyboard.press("Backspace");
       }
+      await authorizeTrustedMutation();
       await page.keyboard.type(action.text, { delay: action.delayMs });
       result.typed = { ref: action.ref ?? null, characters: Array.from(action.text).length };
       applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);

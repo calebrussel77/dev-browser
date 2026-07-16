@@ -11,11 +11,12 @@ export interface PerceptionDelta {
   changed: string[];
 }
 
-interface Snapshot {
+export interface Snapshot {
   url: string;
   title: string;
   focusedRef: string | null;
   elements: Map<string, string>;
+  signature: string;
 }
 
 interface PageHistory {
@@ -23,19 +24,22 @@ interface PageHistory {
   documentNumber: number;
   stateNumber: number;
   tracks: Map<string, Snapshot>;
+  states: Map<string, Snapshot>;
+  latestStateId: string | null;
 }
 
 const histories = new WeakMap<Page, PageHistory>();
 let nextDocumentNumber = 1;
 
-function fingerprint(element: PerceptionElement): string {
+export function semanticFingerprint(element: PerceptionElement): string {
   return JSON.stringify({
+    role: element.role,
     name: element.name,
     description: element.description,
-    box: element.box,
-    visible: element.visible,
-    inViewport: element.inViewport,
-    obscured: element.obscured,
+    landmark: element.landmark,
+    placeholder: element.placeholder,
+    inputType: element.inputType,
+    stableAttributes: element.stableAttributes,
     disabled: element.disabled,
     readonly: element.readonly,
     required: element.required,
@@ -44,16 +48,40 @@ function fingerprint(element: PerceptionElement): string {
     expanded: element.expanded,
     pressed: element.pressed,
     current: element.current,
-    value: element.value,
-    focused: element.focused,
   });
+}
+
+export function getRecordedState(page: Page, stateId: string): Snapshot | undefined {
+  return histories.get(page)?.states.get(stateId);
+}
+
+export function getLatestStateId(page: Page): string | null {
+  return histories.get(page)?.latestStateId ?? null;
+}
+
+export function recordedStatesEqual(page: Page, left: string, right: string): boolean {
+  const history = histories.get(page);
+  const a = history?.states.get(left);
+  const b = history?.states.get(right);
+  return Boolean(a && b && a.signature === b.signature);
+}
+
+export function discardValidationState(
+  page: Page,
+  validationStateId: string,
+  restoreStateId: string | null
+): void {
+  const history = histories.get(page);
+  if (!history || history.latestStateId !== validationStateId) return;
+  history.states.delete(validationStateId);
+  history.latestStateId = restoreStateId;
 }
 
 export function recordPageState(
   page: Page,
   realmToken: string,
   track: string,
-  current: Omit<Snapshot, "elements"> & { elements: PerceptionElement[] },
+  current: Omit<Snapshot, "elements" | "signature"> & { elements: PerceptionElement[] },
   includeDelta: boolean
 ): { documentId: string; stateId: string; delta: PerceptionDelta | null } {
   let history = histories.get(page);
@@ -63,14 +91,24 @@ export function recordPageState(
       documentNumber: nextDocumentNumber++,
       stateNumber: 0,
       tracks: new Map(),
+      states: new Map(),
+      latestStateId: null,
     };
     histories.set(page, history);
   }
 
   history.stateNumber += 1;
-  const elements = new Map(current.elements.map((element) => [element.ref, fingerprint(element)]));
+  const elements = new Map(
+    current.elements.filter((element) => element.ref).map((element) => [element.ref, semanticFingerprint(element)])
+  );
   const previous = history.tracks.get(track);
-  const next: Snapshot = { ...current, elements };
+  const signature = JSON.stringify({
+    url: current.url,
+    title: current.title,
+    focusedRef: current.focusedRef,
+    elements: current.elements.map(semanticFingerprint),
+  });
+  const next: Snapshot = { ...current, elements, signature };
   history.tracks.set(track, next);
 
   let delta: PerceptionDelta | null = null;
@@ -96,5 +134,9 @@ export function recordPageState(
   }
 
   const documentId = `doc-${history.documentNumber}`;
-  return { documentId, stateId: `${documentId}:${history.stateNumber}`, delta };
+  const stateId = `${documentId}:${history.stateNumber}`;
+  history.states.set(stateId, next);
+  history.latestStateId = stateId;
+  while (history.states.size > 100) history.states.delete(history.states.keys().next().value!);
+  return { documentId, stateId, delta };
 }

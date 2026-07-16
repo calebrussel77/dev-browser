@@ -3,12 +3,14 @@ import { mkdir, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import {
+  AgentProtocolError,
   agentErrorExitCode,
   buildInteractiveFailure,
   buildInteractiveSuccess,
 } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
+import { authorizeExecuteRequest } from "./execute-policy.js";
 import { createKeyedLock, createMutex } from "./lock.js";
 import {
   getBrowsersDir,
@@ -22,8 +24,10 @@ import {
   serialize,
   type ExecuteRequest,
   type InteractiveRequest,
+  type SessionRequest,
   type Response,
 } from "./protocol.js";
+import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 
@@ -167,11 +171,11 @@ async function prepareBrowser(request: {
 
 async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promise<void> {
   await withBrowserLock(request.browser, async () => {
-    const timeoutMs = await prepareBrowser(request);
-
     const output = createMessageQueue(socket);
 
     try {
+      authorizeExecuteRequest(request);
+      const timeoutMs = await prepareBrowser(request);
       await runScript(
         request.script,
         manager,
@@ -205,6 +209,16 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
       });
     } catch (error) {
       await output.drain().catch(() => undefined);
+      if (error instanceof AgentProtocolError) {
+        await writeMessage(socket, {
+          id: request.id,
+          type: "error",
+          message: error.message,
+          exitCode: agentErrorExitCode(error.code),
+          error: error.toAgentError(),
+        });
+        return;
+      }
       await writeMessage(socket, {
         id: request.id,
         type: "error",
@@ -264,6 +278,28 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
       });
     }
   });
+}
+
+async function handleSession(socket: net.Socket, request: SessionRequest): Promise<void> {
+  try {
+    let data;
+    if (request.action === "open") {
+      await manager.getPage(request.browser, request.page);
+      data = pageLeases.open(request.browser, request.page, request.ttl);
+    } else if (request.action === "renew") {
+      data = pageLeases.renew(request.session, request.ttl);
+    } else {
+      data = pageLeases.close(request.session);
+    }
+    await writeMessage(socket, { id: request.id, type: "result", data });
+    await writeMessage(socket, { id: request.id, type: "complete", success: true });
+  } catch (error) {
+    const failure = buildInteractiveFailure({ requestId: request.id, error });
+    await writeMessage(socket, {
+      id: request.id, type: "error", message: failure.error.message,
+      exitCode: agentErrorExitCode(failure.error.code), error: failure.error, data: failure,
+    });
+  }
 }
 
 async function handleInstall(socket: net.Socket, request: { id: string }): Promise<void> {
@@ -397,6 +433,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
 
     case "interactive":
       await handleInteractive(socket, request);
+      return;
+
+    case "session":
+      await handleSession(socket, request);
       return;
 
     case "browsers":

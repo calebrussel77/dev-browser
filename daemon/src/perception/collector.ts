@@ -38,6 +38,8 @@ export interface PerceptionElement {
   current: string | boolean | null;
   value?: string | null;
   placeholder: string;
+  inputType: string;
+  stableAttributes: { id: string; testId: string; href: string };
   focused: boolean;
   nearby: { heading: string; label: string; context: string };
   frameId: "F0";
@@ -321,6 +323,12 @@ export async function collectPageState(
             : null,
           ...(full ? { value: compact(rawValue, 500) } : {}),
           placeholder: compact(element.getAttribute("placeholder")),
+          inputType: element instanceof HTMLInputElement ? element.type : element.tagName.toLowerCase(),
+          stableAttributes: {
+            id: compact(element.id, 100),
+            testId: compact(element.getAttribute("data-testid"), 100),
+            href: element instanceof HTMLAnchorElement ? compact(element.getAttribute("href"), 300) : "",
+          },
           focused: document.activeElement === element,
           nearby: {
             heading: compact(heading?.textContent),
