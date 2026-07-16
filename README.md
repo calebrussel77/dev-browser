@@ -12,6 +12,7 @@ A browser automation tool that lets AI agents and developers control browsers wi
 - **Persistent pages** - Navigate once, interact across multiple scripts
 - **Auto-connect** - Connect to your running Chrome or launch a fresh Chromium
 - **Full Playwright API** - goto, click, fill, locators, evaluate, screenshots, and more
+- **Interactive agent loop** - Read refs and landmarks, inspect screenshots, then click and type with trusted input one action at a time
 
 ## Demo
 
@@ -40,6 +41,35 @@ const tabs = await browser.listPages();
 console.log(JSON.stringify(tabs, null, 2));
 EOF
 ```
+
+### Interactive visual control
+
+For consequential UI work, prefer the persistent interactive commands over a monolithic script. They return structured JSON, and `--shot` writes a PNG under `~/.dev-browser/tmp` and returns its absolute path.
+
+```powershell
+# Discover existing tabs without attaching every renderer
+dev-browser --connect pages
+
+# Perceive: accessibility snapshot + refs + coordinates + main/aside/dialog landmarks
+dev-browser --connect read --page TARGET_ID --shot before.png
+
+# Find the correct duplicate label by accessible name and landmark
+dev-browser --connect find "connect button main profile card" --page TARGET_ID
+
+# Act through a trusted Playwright mouse event and wait for the expected UI
+dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
+
+# Verify the recipient before the final irreversible action
+dev-browser --connect confirm --page TARGET_ID --expect "Naminsita Bakayoko" --shot confirm.png
+
+# Focus and type through trusted mouse + keyboard input
+dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
+
+# The final click is blocked unless the current dialog still contains the expected recipient
+dev-browser --connect click --page TARGET_ID --ref R14 --expect-text "Naminsita Bakayoko" --shot sent.png
+```
+
+Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `find` always takes a fresh snapshot, and `click`/`type` return the refreshed snapshot and refs automatically. Refs persist while the same DOM element remains alive; if a link ref wraps a button, `click` targets that interactive descendant. `click` reports URL, snapshot, dialog, and `aria-expanded` changes. With `--wait-for TEXT`, it polls for the expected UI and retries exactly once only when the first click produced no observable change; guarded `--expect-text` clicks are never retried. `click` uses trusted Playwright input and never `HTMLElement.click()`. Screenshot pixels, ref boxes, and direct `--xy X,Y` all use the same CSS-pixel coordinate space, even when device pixel ratio is not 1.
 
 ### PowerShell (Windows)
 

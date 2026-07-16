@@ -20,6 +20,33 @@ LLM USAGE GUIDE:
     `--headless` and `--ignore-https-errors` do not change an external browser
     attached through `--connect`.
 
+  Prefer the interactive perception-action loop for consequential UI work:
+    dev-browser --connect pages
+    dev-browser --connect read --page TARGET_ID --shot before.png
+    dev-browser --connect find "connect button main profile card" --page TARGET_ID
+    dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
+    dev-browser --connect confirm --page TARGET_ID --expect "Naminsita Bakayoko" --shot confirm.png
+    dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
+    dev-browser --connect click --page TARGET_ID --ref R14 --expect-text "Naminsita Bakayoko" --shot sent.png
+
+    `read` returns the accessibility snapshot plus stable refs with role, name,
+    visibility, viewport coordinates, and main/aside/dialog landmark paths.
+    `find` takes a fresh snapshot on every call and ranks duplicate labels using
+    landmarks. `click` and `type` automatically return the refreshed snapshot,
+    refs, and coordinates. `click` reports URL/snapshot/dialog/aria-expanded
+    changes. `--wait-for TEXT` polls after clicking and retries exactly once only
+    if the first click caused no observable change; it never retries a guarded
+    `--expect-text` click. Link refs fall back to an interactive button descendant
+    or ancestor. Input uses trusted Playwright mouse/keyboard events and never
+    HTMLElement.click(). The browser and page remain alive between commands.
+
+    Every `--shot` result contains an absolute PNG path. Open that path with the
+    available image-viewing tool before the next consequential action. Screenshot
+    pixels, ref boxes, and `--xy X,Y` are all CSS pixels, regardless of DPR. Refs
+    remain valid while the same DOM element survives; use fresh returned refs.
+    Before irreversible actions, run `confirm --expect RECIPIENT`, then protect
+    the final click with the same `--expect-text RECIPIENT` value.
+
   Quick inspection:
     dev-browser --connect <<'EOF'
     const tabs = await browser.listPages();
