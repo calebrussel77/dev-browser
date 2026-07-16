@@ -3,6 +3,7 @@ import { mkdir, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { BrowserManager } from "./browser-manager.js";
+import { executeInteractiveAction } from "./interactive-actions.js";
 import { createKeyedLock, createMutex } from "./lock.js";
 import {
   getBrowsersDir,
@@ -11,7 +12,13 @@ import {
   getPidPath,
   requiresDaemonEndpointCleanup,
 } from "./local-endpoint.js";
-import { parseRequest, serialize, type ExecuteRequest, type Response } from "./protocol.js";
+import {
+  parseRequest,
+  serialize,
+  type ExecuteRequest,
+  type InteractiveRequest,
+  type Response,
+} from "./protocol.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 
@@ -126,24 +133,36 @@ function createMessageQueue(socket: net.Socket) {
   };
 }
 
+async function prepareBrowser(request: {
+  browser: string;
+  connect?: string;
+  headless?: boolean;
+  ignoreHTTPSErrors?: boolean;
+  timeoutMs?: number;
+}): Promise<number> {
+  const timeoutMs = request.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
+
+  if (request.connect === "auto") {
+    await manager.autoConnect(request.browser, {
+      connectTimeoutMs: timeoutMs,
+    });
+  } else if (request.connect) {
+    await manager.connectBrowser(request.browser, request.connect, {
+      connectTimeoutMs: timeoutMs,
+    });
+  } else {
+    await manager.ensureBrowser(request.browser, {
+      headless: request.headless,
+      ignoreHTTPSErrors: request.ignoreHTTPSErrors,
+    });
+  }
+
+  return timeoutMs;
+}
+
 async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promise<void> {
   await withBrowserLock(request.browser, async () => {
-    const timeoutMs = request.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
-
-    if (request.connect === "auto") {
-      await manager.autoConnect(request.browser, {
-        connectTimeoutMs: timeoutMs,
-      });
-    } else if (request.connect) {
-      await manager.connectBrowser(request.browser, request.connect, {
-        connectTimeoutMs: timeoutMs,
-      });
-    } else {
-      await manager.ensureBrowser(request.browser, {
-        headless: request.headless,
-        ignoreHTTPSErrors: request.ignoreHTTPSErrors,
-      });
-    }
+    const timeoutMs = await prepareBrowser(request);
 
     const output = createMessageQueue(socket);
 
@@ -181,6 +200,32 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
       });
     } catch (error) {
       await output.drain().catch(() => undefined);
+      await writeMessage(socket, {
+        id: request.id,
+        type: "error",
+        message: formatError(error),
+      });
+    }
+  });
+}
+
+async function handleInteractive(socket: net.Socket, request: InteractiveRequest): Promise<void> {
+  await withBrowserLock(request.browser, async () => {
+    await prepareBrowser(request);
+
+    try {
+      const result = await executeInteractiveAction(manager, request);
+      await writeMessage(socket, {
+        id: request.id,
+        type: "result",
+        data: result,
+      });
+      await writeMessage(socket, {
+        id: request.id,
+        type: "complete",
+        success: true,
+      });
+    } catch (error) {
       await writeMessage(socket, {
         id: request.id,
         type: "error",
@@ -302,6 +347,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
   switch (request.type) {
     case "execute":
       await handleExecute(socket, request);
+      return;
+
+    case "interactive":
+      await handleInteractive(socket, request);
       return;
 
     case "browsers":
