@@ -1,13 +1,15 @@
 mod connection;
 mod daemon;
+mod interactive;
 mod skill;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use connection::{connect_to_daemon, read_line, send_message};
 use daemon::{
     current_daemon_pid, ensure_daemon, install_daemon_runtime, is_daemon_running,
     wait_for_daemon_exit,
 };
+use interactive::{build_interactive_request, Coordinates, InteractiveRequestOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use skill::install_skill;
@@ -115,6 +117,7 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 #[command(about = "Control browsers with JavaScript automation scripts")]
 #[command(long_about = CLI_LONG_ABOUT)]
 #[command(after_long_help = CLI_AFTER_LONG_HELP)]
+#[command(subcommand_precedence_over_arg = true)]
 struct Cli {
     #[arg(
         long,
@@ -163,6 +166,47 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[derive(Args)]
+struct PageTargetArgs {
+    #[arg(
+        long,
+        default_value = "main",
+        value_name = "NAME_OR_TARGET_ID",
+        help = "Select a persistent named page or an existing target ID"
+    )]
+    page: String,
+}
+
+#[derive(Args)]
+struct PageActionArgs {
+    #[command(flatten)]
+    target: PageTargetArgs,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        value_name = "FILE",
+        help = "Save the resulting page screenshot and return its absolute path"
+    )]
+    shot: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ClickMethod {
+    Mouse,
+    Locator,
+}
+
+impl ClickMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mouse => "mouse",
+            Self::Locator => "locator",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     #[command(
@@ -175,6 +219,109 @@ enum Command {
             help = "Path to a JavaScript file to execute",
             long_help = "Path to the JavaScript file to execute.\n\nThis is equivalent to `dev-browser < script.js`, but can be easier to script or combine with shell tooling."
         )]
+        file: String,
+    },
+    #[command(
+        about = "List persistent and existing browser pages without attaching every target",
+        long_about = "List persistent named pages and existing Chrome targets. Use the returned target ID with read, find, click, type, confirm, or shot when operating an existing user tab."
+    )]
+    Pages,
+    #[command(
+        about = "Navigate one persistent page and return its resulting state",
+        long_about = "Navigate a persistent named page or existing target to a URL with waitUntil=domcontentloaded. Add --shot to save and return a PNG after navigation."
+    )]
+    Navigate {
+        #[arg(value_name = "URL")]
+        url: String,
+        #[command(flatten)]
+        output: PageActionArgs,
+    },
+    #[command(
+        about = "Read the accessibility snapshot and interactive refs for a page",
+        long_about = "Return an accessibility snapshot plus stable DOM refs for interactive elements. Each ref includes role, name, visibility, viewport coordinates, and its main/aside/dialog landmark path. Run read again after a rerender before using old refs."
+    )]
+    Read {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
+        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u8).range(1..=50))]
+        depth: u8,
+    },
+    #[command(
+        about = "Find interactive refs by accessible name, role, and landmark",
+        long_about = "Take a fresh accessibility snapshot, then rank visible interactive elements against a natural-language query. Names, roles, and landmarks such as main.profile-card or aside are scored separately so duplicate labels can be disambiguated."
+    )]
+    Find {
+        #[arg(value_name = "QUERY")]
+        query: String,
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
+        limit: u8,
+    },
+    #[command(
+        about = "Click through trusted Playwright mouse or locator input",
+        long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). --wait-for TEXT polls for expected UI and retries once only when the first click caused no observable change. --expect-text guards irreversible actions and disables retry. Screenshot pixels and --xy coordinates both use CSS pixels."
+    )]
+    Click {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            conflicts_with = "xy",
+            required_unless_present = "xy"
+        )]
+        ref_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "X,Y",
+            conflicts_with = "ref_id",
+            required_unless_present = "ref_id"
+        )]
+        xy: Option<Coordinates>,
+        #[arg(long, value_enum, default_value = "mouse")]
+        method: ClickMethod,
+        #[arg(long, value_name = "TEXT")]
+        expect_text: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        wait_for: Option<String>,
+    },
+    #[command(
+        about = "Focus and type through trusted Playwright keyboard input",
+        long_about = "Focus an optional interactive ref with a real mouse click and type through page.keyboard. Use --clear to select and replace existing input or contenteditable text."
+    )]
+    Type {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_name = "REF")]
+        ref_id: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
+        delay: u16,
+    },
+    #[command(
+        about = "Read and verify the current confirmation or dialog text",
+        long_about = "Return visible dialog text, falling back to visible body text. --expect makes the command fail unless the supplied recipient or confirmation text is present. Use this before an irreversible final click."
+    )]
+    Confirm {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long, value_name = "TEXT")]
+        expect: Option<String>,
+    },
+    #[command(
+        about = "Save a page screenshot and return its absolute PNG path",
+        long_about = "Capture a persistent named page or existing target and write it under ~/.dev-browser/tmp. Agents must open the returned absolute path with an image-viewing tool before the next consequential action."
+    )]
+    Shot {
+        #[command(flatten)]
+        target: PageTargetArgs,
+        #[arg(value_name = "FILE", default_value = "auto")]
         file: String,
     },
     #[command(
@@ -263,6 +410,95 @@ fn run() -> Result<i32, Box<dyn Error>> {
             let script = fs::read_to_string(file)?;
             run_script(&cli, script)
         }
+        Some(Command::Pages) => run_interactive(&cli, "main", None, json!({ "kind": "pages" })),
+        Some(Command::Navigate { url, output }) => run_interactive(
+            &cli,
+            &output.target.page,
+            output.shot.as_deref(),
+            json!({ "kind": "navigate", "url": url }),
+        ),
+        Some(Command::Read {
+            output,
+            limit,
+            depth,
+        }) => run_interactive(
+            &cli,
+            &output.target.page,
+            output.shot.as_deref(),
+            json!({ "kind": "read", "limit": limit, "depth": depth }),
+        ),
+        Some(Command::Find {
+            query,
+            output,
+            limit,
+        }) => run_interactive(
+            &cli,
+            &output.target.page,
+            output.shot.as_deref(),
+            json!({ "kind": "find", "query": query, "limit": limit }),
+        ),
+        Some(Command::Click {
+            output,
+            ref_id,
+            xy,
+            method,
+            expect_text,
+            wait_for,
+        }) => {
+            if xy.is_some() && matches!(method, ClickMethod::Locator) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--method locator requires --ref; coordinate clicks always use the mouse",
+                )
+                .into());
+            }
+            let mut action = json!({
+                "kind": "click",
+                "method": method.as_str(),
+            });
+            if let Some(ref_id) = ref_id {
+                action["ref"] = Value::String(ref_id.clone());
+            }
+            if let Some(coordinates) = xy {
+                action["x"] = json!(coordinates.x);
+                action["y"] = json!(coordinates.y);
+            }
+            if let Some(expect_text) = expect_text {
+                action["expectText"] = Value::String(expect_text.clone());
+            }
+            if let Some(wait_for) = wait_for {
+                action["waitForText"] = Value::String(wait_for.clone());
+            }
+            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+        }
+        Some(Command::Type {
+            output,
+            ref_id,
+            text,
+            clear,
+            delay,
+        }) => {
+            let mut action = json!({
+                "kind": "type",
+                "text": text,
+                "clear": clear,
+                "delayMs": delay,
+            });
+            if let Some(ref_id) = ref_id {
+                action["ref"] = Value::String(ref_id.clone());
+            }
+            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+        }
+        Some(Command::Confirm { output, expect }) => {
+            let mut action = json!({ "kind": "confirm" });
+            if let Some(expect) = expect {
+                action["expectText"] = Value::String(expect.clone());
+            }
+            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+        }
+        Some(Command::Shot { target, file }) => {
+            run_interactive(&cli, &target.page, Some(file), json!({ "kind": "shot" }))
+        }
         Some(Command::Browsers) => {
             ensure_daemon()?;
             send_request(
@@ -333,9 +569,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
     ensure_daemon()?;
 
-    let timeout_ms = u64::from(cli.timeout)
-        .checked_mul(1_000)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Timeout value is too large"))?;
+    let timeout_ms = timeout_ms(cli)?;
 
     let mut request = json!({
         "id": request_id("execute"),
@@ -358,6 +592,39 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
     }
 
     send_request(request, ResultMode::Json)
+}
+
+fn run_interactive(
+    cli: &Cli,
+    page: &str,
+    shot: Option<&str>,
+    action: Value,
+) -> Result<i32, Box<dyn Error>> {
+    ensure_daemon()?;
+    let action_name = action
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("action");
+    let request = build_interactive_request(
+        InteractiveRequestOptions {
+            id: request_id(action_name),
+            browser: &cli.browser,
+            page,
+            shot,
+            connect: cli.connect.as_deref(),
+            headless: cli.headless,
+            ignore_https_errors: cli.ignore_https_errors,
+            timeout_ms: timeout_ms(cli)?,
+        },
+        action,
+    );
+    send_request(request, ResultMode::Json)
+}
+
+fn timeout_ms(cli: &Cli) -> Result<u64, Box<dyn Error>> {
+    u64::from(cli.timeout).checked_mul(1_000).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Timeout value is too large").into()
+    })
 }
 
 fn send_request(message: Value, result_mode: ResultMode) -> Result<i32, Box<dyn Error>> {
@@ -532,4 +799,97 @@ fn format_duration_ms(duration_ms: u64) -> String {
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
     format!("{minutes}m {seconds}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn parses_interactive_agent_commands() {
+        let commands = [
+            vec![
+                "dev-browser",
+                "--connect",
+                "read",
+                "--page",
+                "TARGET",
+                "--shot",
+                "state.png",
+            ],
+            vec![
+                "dev-browser",
+                "--connect",
+                "find",
+                "connect main profile",
+                "--page",
+                "TARGET",
+            ],
+            vec![
+                "dev-browser",
+                "--connect",
+                "click",
+                "--ref",
+                "R12",
+                "--page",
+                "TARGET",
+                "--expect-text",
+                "Naminsita",
+                "--wait-for",
+                "Invitation sent",
+            ],
+            vec![
+                "dev-browser",
+                "--connect",
+                "click",
+                "--xy",
+                "901,631",
+                "--page",
+                "TARGET",
+            ],
+            vec![
+                "dev-browser",
+                "--connect",
+                "type",
+                "--ref",
+                "R13",
+                "--text",
+                "hello",
+                "--clear",
+                "--page",
+                "TARGET",
+            ],
+        ];
+
+        for command in commands {
+            if let Err(error) = Cli::try_parse_from(command.clone()) {
+                panic!("failed to parse {command:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_clicks() {
+        let parsed = Cli::try_parse_from(["dev-browser", "click", "--page", "main"]);
+        assert!(parsed.is_err());
+
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--page",
+            "main",
+            "--ref",
+            "R1",
+            "--xy",
+            "1,2",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn preserves_script_commands() {
+        let parsed = Cli::try_parse_from(["dev-browser", "run", "script.js"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Run { .. })));
+    }
 }
