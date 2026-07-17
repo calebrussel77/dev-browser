@@ -50,14 +50,14 @@ For consequential UI work, prefer the persistent interactive commands over a mon
 # Discover existing tabs without attaching every renderer
 dev-browser --connect pages
 
-# Perceive: accessibility snapshot + refs + coordinates + main/aside/dialog landmarks
-dev-browser --connect read --page TARGET_ID --shot before.png
+# Perceive: compact protocol-v2 state, refs, frames, open shadow roots, and coordinates
+dev-browser --connect observe --page TARGET_ID --annotate --shot before.png
 
 # Find the correct duplicate label deterministically; natural queries remain supported
 dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
 
 # Act through a trusted Playwright mouse event and wait for the expected UI
-dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
+dev-browser --connect click --page TARGET_ID --ref R12 --from-state doc-7:184 --wait-text "visible,body,contains,Add a note" --shot modal.png
 
 # Verify the recipient before the final irreversible action
 dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
@@ -67,13 +67,24 @@ dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" -
 
 # The final click is blocked unless the current dialog still contains the expected recipient
 dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190 --confirm-token TOKEN --shot sent.png
+
+# Persist bounded diagnostics only when needed
+dev-browser --connect click --page TARGET_ID --ref R12 --trace
+dev-browser trace show LAST
+
+# Discover the installed contract and diagnose runtime/CDP health
+dev-browser schema --json
+dev-browser capabilities --compact
+dev-browser doctor --connect --json
 ```
 
 Protocol v2 confirmation tokens are daemon-scoped, expire after 30 seconds, bind to the observed page/document/target/URL, and are burned on the first consumption attempt. Results, typed errors, waits, journals, popup/download/network metadata, and diagnostics use the same bounded secret redactor. `--expect-text` remains available for protocol v1 compatibility.
 
 An invalid, expired, reused, or out-of-scope confirmation token returns the stable `CONFIRMATION_INVALID` error and process exit status `8`.
 
-Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `find` always takes a fresh snapshot and accepts either the compatible natural query or combinable `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--scope`, repeated `--state`, and explicit last-resort `--index` filters. Results include exact match reasons, confidence, score gap, ambiguity, landmark, nearby context, frame, box, and actionability state. `click`/`type` return the refreshed snapshot and refs automatically. Refs persist while the same DOM element remains alive; if a link ref wraps a button, `click` reports and targets that interactive descendant. Ref actions share bounded visibility, stability, enabled-state, scrolling, and obstruction checks before trusted input. `click` reports URL, snapshot, dialog, and `aria-expanded` changes. With `--wait-for TEXT`, it polls for the expected UI and retries exactly once only when the first click produced no observable change; guarded `--expect-text` clicks are never retried. `click` uses trusted Playwright input and never `HTMLElement.click()`. Screenshot pixels, ref boxes, and direct `--xy X,Y` all use the same CSS-pixel coordinate space, even when device pixel ratio is not 1.
+Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `observe` is the canonical compact perception command; `read` remains compatible. `find` always takes a fresh snapshot and accepts either the compatible natural query or combinable `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--scope`, repeated `--state`, and explicit last-resort `--index` filters. Results include exact match reasons, confidence, score gap, ambiguity, landmark, nearby context, frame, box, and actionability state. Actions return a refreshed state and reject stale refs/states, ambiguity, obstruction, disabled targets, and page-lease conflicts with stable errors and exit statuses. Typed waits cover text, URL, refs, dialogs, toasts, popups, downloads, file choosers, navigation, responses, failed requests, and specialized network idle. Safe retries require evidence that the prior attempt produced no side effect; guarded or irreversible actions are never duplicated. Screenshot pixels, ref boxes, frame offsets, and direct `--xy X,Y` all use CSS pixels, including non-zero scroll and DPR greater than one.
+
+The CLI and daemon negotiate version, bundle, protocol, Playwright, and QuickJS provenance before each request. An idle mismatched daemon is restarted automatically; in-flight work is never killed silently. `doctor --json` distinguishes daemon, browser/CDP, and renderer failures and provides recovery codes. `--trace` stores a redacted, size-bounded journal under `~/.dev-browser/tmp/traces` with timing, before/after state, target/input method, requested screenshots, errors, network/lifecycle events, waits, retries, and recovery hints. Twenty recent traces are retained. External CDP traces are best-effort and report that limitation.
 
 ### PowerShell (Windows)
 
@@ -119,7 +130,7 @@ Windows npm installs download the native `dev-browser-windows-x64.exe` release a
 
 ### Using with AI agents
 
-After installing, just tell your agent to run `dev-browser --help` — the help output includes a full LLM usage guide with examples and API reference. No plugin or skill installation needed.
+After installing, tell your agent to run `dev-browser --help` for the concise command map. The authoritative contract is `dev-browser schema --json`; use `capabilities --compact` for fast discovery and `examples COMMAND` for a focused recipe. No plugin or skill installation is required.
 
 <details>
 <summary>Allowing dev-browser in Claude Code without permission prompts</summary>

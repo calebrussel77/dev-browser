@@ -22,14 +22,16 @@ LLM USAGE GUIDE:
 
   Prefer the interactive perception-action loop for consequential UI work:
     dev-browser --connect pages
-    dev-browser --connect read --page TARGET_ID --shot before.png
+    dev-browser --connect observe --page TARGET_ID --annotate --shot before.png
     dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
-    dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
+    dev-browser --connect click --page TARGET_ID --ref R12 --from-state doc-7:184 --wait-text "visible,body,contains,Add a note" --shot modal.png
     dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
     dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
     dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190 --confirm-token TOKEN --shot sent.png
+    dev-browser --connect click --page TARGET_ID --ref R12 --trace
+    dev-browser trace show LAST
 
-    `read` returns the accessibility snapshot plus stable refs with role, name,
+    `observe` returns compact protocol-v2 state plus stable refs with role, name,
     visibility, viewport coordinates, and main/aside/dialog landmark paths.
     `find` takes a fresh snapshot on every call. It keeps the natural query form
     and also accepts combinable role/name/within/near/frame/scope/state filters;
@@ -38,9 +40,11 @@ LLM USAGE GUIDE:
     actionability state. `click` and `type` automatically return the refreshed
     snapshot, refs, and coordinates. Ref actions share bounded visibility,
     stability, enabled-state, scrolling, and obstruction checks. `click` reports URL/snapshot/dialog/aria-expanded
-    changes. `--wait-for TEXT` polls after clicking and retries exactly once only
-    if the first click caused no observable change; it never retries a guarded
-    `--expect-text` click. Link refs fall back to an interactive button descendant
+    changes. Typed `--wait-*` conditions are event-driven and cover text, URL,
+    refs, dialogs, toasts, popups, downloads, file choosers, navigation,
+    responses, failed requests, and network idle. A retry requires evidence that
+    the prior attempt had no side effect; guarded and irreversible actions are
+    never retried. Link refs fall back to an interactive button descendant
     or ancestor. Input uses trusted Playwright mouse/keyboard events and never
     HTMLElement.click(). The browser and page remain alive between commands.
 
@@ -53,6 +57,18 @@ LLM USAGE GUIDE:
     `--from-state STATE --confirm-token TOKEN`. `--expect-text` remains v1 compatibility.
     Invalid, expired, reused, or out-of-scope tokens return
     `CONFIRMATION_INVALID` with process exit status 8.
+
+    Machine discovery and diagnostics:
+      dev-browser schema --json
+      dev-browser capabilities --compact
+      dev-browser examples click
+      dev-browser doctor --connect --json
+    The CLI automatically restarts an idle daemon when its embedded runtime,
+    protocol, Playwright, or QuickJS provenance is stale. It refuses to kill
+    in-flight work. Use `--trace` only when detailed diagnostics are needed;
+    traces are redacted, size-bounded, retained under ~/.dev-browser/tmp/traces,
+    and available with `dev-browser trace show LAST`. External CDP tracing is
+    best-effort and reports a warning when full context tracing is unavailable.
 
   Quick inspection:
     dev-browser --connect <<'EOF'
@@ -130,12 +146,13 @@ LLM USAGE GUIDE:
     EOF
 
     Diagnose before restarting the workflow:
+      dev-browser doctor --json
       dev-browser status
       dev-browser browsers
       dev-browser stop
 
-    After an upgrade, rebuild, or runtime change, run `dev-browser stop` once so
-    the next command starts the daemon with the current embedded code.
+    Runtime mismatches are normally repaired automatically when the daemon is idle.
+    Use `dev-browser stop` only for explicit recovery or shutdown.
 
   Common Playwright Page methods:
     page.goto(url, { waitUntil: "domcontentloaded" })
