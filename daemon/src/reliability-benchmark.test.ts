@@ -7,6 +7,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
+import { getRecordedState } from "./page-state.js";
+import { collectPageState } from "./perception/collector.js";
 import { startAgentReliabilityFixture, type AgentReliabilityFixture } from "./test-fixtures/agent-reliability-fixture.js";
 
 describe.sequential("maintained agent reliability benchmark", () => {
@@ -76,5 +78,53 @@ describe.sequential("maintained agent reliability benchmark", () => {
     expect(counters.main).toBe(completed);
     expect(JSON.stringify(observed).length).toBeLessThan(100_000);
     expect(Math.max(...latencies)).toBeLessThan(10_000);
+  }, 180_000);
+
+  it("measures large-page perception, delta size, memory growth, action latency, and registry cleanup", async () => {
+    const page = await manager.getPage(browser, pageName);
+    await page.setContent(`<main><button id="action">Act</button>${Array.from({ length: 2_000 }, (_, index) => `<button data-row="${index}">Row ${index}</button>`).join("")}</main>`);
+    const observe = (delta: boolean, track = "large") => executeInteractiveAction(manager, {
+      id: `benchmark-large-${delta}-${Date.now()}`, type: "interactive" as const, protocolVersion: 2 as const,
+      browser, page: pageName,
+      action: { kind: "observe" as const, full: false, delta, track, maxNodes: 1_000, maxChars: 100_000, depth: 12, breadth: 500 },
+    });
+
+    const heapBefore = process.memoryUsage().heapUsed;
+    const observeStarted = performance.now();
+    const full = await observe(false);
+    const observeLatencyMs = performance.now() - observeStarted;
+    const firstState = full.stateId!;
+    for (let index = 0; index < 24; index += 1) await observe(false, `memory-${index % 2}`);
+    const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
+
+    await collectPageState(page, { delta: false, track: "delta-measure", maxNodes: 1_000, maxChars: 100_000, depth: 12, breadth: 500 });
+    await page.locator("[data-row='0']").evaluate((element) => { element.textContent = "Row changed"; });
+    const delta = await collectPageState(page, { delta: true, track: "delta-measure", maxNodes: 1_000, maxChars: 100_000, depth: 12, breadth: 500 });
+    const fullSize = JSON.stringify(full).length;
+    const deltaSize = JSON.stringify(delta.delta ?? {}).length;
+
+    const actionState = await executeInteractiveAction(manager, {
+      id: "benchmark-large-find", type: "interactive", protocolVersion: 2,
+      browser, page: pageName,
+      action: { kind: "find", role: "button", name: "Act", nameMode: "exact", scope: "visible", states: [], limit: 1 },
+    });
+    const actionStarted = performance.now();
+    await executeInteractiveAction(manager, {
+      id: "benchmark-large-click", type: "interactive", protocolVersion: 2,
+      browser, page: pageName,
+      action: { kind: "click", ref: actionState.matches![0]!.ref, fromState: actionState.stateId, method: "mouse", retry: "never" },
+    });
+    const actionLatencyMs = performance.now() - actionStarted;
+
+    await page.setContent("<main><button>small</button></main>");
+    for (let index = 0; index < 105; index += 1) await observe(false, "cleanup");
+
+    expect(observeLatencyMs).toBeLessThan(10_000);
+    expect(actionLatencyMs).toBeLessThan(10_000);
+    expect(fullSize).toBeLessThan(500_000);
+    expect(deltaSize).toBeLessThan(fullSize);
+    expect(delta.delta?.changed.length).toBeGreaterThan(0);
+    expect(heapGrowth).toBeLessThan(128 * 1024 * 1024);
+    expect(getRecordedState(page, firstState)).toBeUndefined();
   }, 180_000);
 });
