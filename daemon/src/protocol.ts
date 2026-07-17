@@ -38,6 +38,7 @@ function isSafeRegex(value: string): boolean {
 
 const WaitValueSchema = z.string().min(1).max(WAIT_MATCH_MAX_LENGTH);
 const WaitMatchSchema = z.enum(["exact", "contains", "glob", "safe-regex"]);
+const ScopedRefSchema = z.string().min(2).max(32).regex(/^(?:F\d+:)?R\d+$/);
 const MatchFieldsSchema = z
   .object({
     match: WaitMatchSchema,
@@ -64,7 +65,7 @@ const UrlWaitConditionSchema = z.object({ kind: z.literal("url") }).and(MatchFie
 const RefWaitConditionSchema = z
   .object({
     kind: z.literal("ref"),
-    ref: z.string().regex(/^R\d+$/),
+    ref: ScopedRefSchema,
     state: z.enum([
       "attached",
       "detached",
@@ -146,7 +147,7 @@ export type WaitSpec = z.infer<typeof WaitSpecSchema>;
 
 const WaitableActionSchema = z.object({ wait: WaitSpecSchema.optional() });
 const RetryPolicySchema = z.enum(["never", "safe", "once"]);
-const RefSchema = z.string().regex(/^R\d+$/);
+const RefSchema = ScopedRefSchema;
 const PrimitiveBaseSchema = StateGuardSchema.merge(WaitableActionSchema);
 const RefPrimitiveSchema = PrimitiveBaseSchema.extend({ ref: RefSchema });
 const ScrollActionSchema = PrimitiveBaseSchema.extend({
@@ -194,7 +195,7 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
 
 const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
   kind: z.literal("click"),
-  ref: z.string().regex(/^R\d+$/),
+  ref: ScopedRefSchema,
   method: z.enum(["mouse", "locator"]).default("mouse"),
   expectText: z.string().min(1).optional(),
   waitForText: WaitValueSchema.optional(),
@@ -275,10 +276,7 @@ const InteractiveActionSchema = z.union([
   UploadActionSchema,
   StateGuardSchema.merge(WaitableActionSchema).extend({
     kind: z.literal("type"),
-    ref: z
-      .string()
-      .regex(/^R\d+$/)
-      .optional(),
+    ref: ScopedRefSchema.optional(),
     text: z.string(),
     clear: z.boolean().default(false),
     delayMs: z.number().int().nonnegative().max(1_000).default(0),
@@ -289,10 +287,7 @@ const InteractiveActionSchema = z.union([
   }),
   StateGuardSchema.extend({
     kind: z.literal("shot"),
-    ref: z
-      .string()
-      .regex(/^R\d+$/)
-      .optional(),
+    ref: ScopedRefSchema.optional(),
     padding: z.number().int().nonnegative().max(1_000).default(32),
   }),
 ]);

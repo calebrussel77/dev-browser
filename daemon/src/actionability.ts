@@ -1,5 +1,8 @@
-import type { ElementHandle, Locator, Page } from "playwright";
+import { randomUUID } from "node:crypto";
+import type { ElementHandle, Frame, Locator, Page } from "playwright";
 import { AgentProtocolError } from "./agent-protocol.js";
+import { parseScopedRef, registeredFrame } from "./frame-registry.js";
+import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "./frame-geometry.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
 
 export type ActionApplicability =
@@ -19,6 +22,7 @@ export interface ActionTargetOptions {
   hitTest: boolean;
   applicability: ActionApplicability;
   pageName?: string;
+  legacyRefs?: boolean;
 }
 export type ActionTargetMethod =
   | "mouse"
@@ -38,8 +42,12 @@ export interface ResolvedActionTarget {
   actualRef: string;
   resolvedBy: "self" | "descendant" | "ancestor";
   box: { x: number; y: number; width: number; height: number };
+  quad?: Array<{ x: number; y: number }>;
   scroll: { scrolled: boolean; before: { x: number; y: number }; after: { x: number; y: number } };
   actual: { role: string; name: string; tag: string };
+  frameId?: string;
+  framePath?: string[];
+  shadowContext?: string[];
   cleanup(): Promise<void>;
 }
 export interface ActionTargetMetadata {
@@ -47,8 +55,12 @@ export interface ActionTargetMetadata {
   actualRef: string;
   resolvedBy: ResolvedActionTarget["resolvedBy"];
   actual: ResolvedActionTarget["actual"];
+  frameId?: string;
+  framePath?: string[];
+  shadowContext?: string[];
   method: ActionTargetMethod;
   box: ResolvedActionTarget["box"];
+  quad?: ResolvedActionTarget["quad"];
   scroll: ResolvedActionTarget["scroll"];
 }
 
@@ -61,8 +73,12 @@ export function actionTargetMetadata(
     actualRef: target.actualRef,
     resolvedBy: target.resolvedBy,
     actual: target.actual,
+    frameId: target.frameId ?? "F0",
+    framePath: target.framePath ?? ["F0"],
+    shadowContext: target.shadowContext ?? [],
     method,
     box: target.box,
+    quad: target.quad,
     scroll: target.scroll,
   };
 }
@@ -198,22 +214,26 @@ async function validateApplicability(
     fail(pageName, "TARGET_MISSING", "Drag requires a draggable source");
 }
 
-async function inspectTarget(locator: Locator, originalRef: string) {
-  return locator.evaluate((element, requestedRef) => {
+async function inspectTarget(locator: Locator, originalRef: string, legacyRefs = false) {
+  return locator.evaluate((element, input) => {
+    const { requestedRef, legacyRefs } = input;
     const tag = element.tagName.toLowerCase();
     const implicitRole =
       tag === "button" ? "button" : tag === "a" ? "link" : tag === "input" ? "textbox" : "";
     const state = (
       window as Window & {
-        __devBrowserPerceptionState?: { refs: WeakMap<Element, string> };
+        __devBrowserPerceptionState?: { refs: WeakMap<Element, string>; boundedText?: (root: Node, maxChars?: number, maxNodes?: number) => { text: string } };
       }
     ).__devBrowserPerceptionState;
     const registeredRef = state?.refs.get(element);
     const attributeRef = element.getAttribute("data-dev-browser-ref");
+    const rawName = legacyRefs
+      ? element.getAttribute("aria-label") ?? element.textContent ?? ""
+      : element.getAttribute("aria-label") ?? state?.boundedText?.(element, 500, 100).text ?? "";
     return {
       actual: {
         role: element.getAttribute("role") ?? implicitRole,
-        name: (element.getAttribute("aria-label") ?? element.textContent ?? "")
+        name: rawName
           .replace(/\s+/g, " ")
           .trim()
           .slice(0, 80),
@@ -222,8 +242,21 @@ async function inspectTarget(locator: Locator, originalRef: string) {
       actualRef:
         registeredRef ??
         (attributeRef && /^R\d+$/.test(attributeRef) ? attributeRef : requestedRef),
+      shadowContext: (() => {
+        const path: string[] = [];
+        let current: Node = element;
+        for (let depth = 0; depth < 20; depth += 1) {
+          const root = current.getRootNode();
+          if (!(root instanceof ShadowRoot)) break;
+          const host = root.host;
+          const testId = host.getAttribute("data-testid");
+          path.unshift(`${host.tagName.toLowerCase()}${host.id ? `#${host.id.slice(0, 50)}` : ""}${testId ? `[data-testid=${testId.slice(0, 50)}]` : ""}`);
+          current = host;
+        }
+        return path;
+      })(),
     };
-  }, originalRef);
+  }, { requestedRef: originalRef, legacyRefs });
 }
 
 export async function resolveActionTarget(
@@ -232,39 +265,48 @@ export async function resolveActionTarget(
   options: ActionTargetOptions
 ): Promise<ResolvedActionTarget> {
   const pageName = options.pageName ?? "main";
-  if (!/^R\d+$/.test(ref))
-    fail(pageName, "TARGET_MISSING", "Target ref is invalid", { ref: ref.slice(0, 80) });
-  let selector = `[data-dev-browser-ref="${ref}"]`;
-  let temporary = false;
+  const scoped = parseScopedRef(ref);
+  if (!scoped)
+    return fail(pageName, "TARGET_MISSING", "Target ref is invalid", { ref: ref.slice(0, 80) });
+  const frameEntry = scoped.frameId === "F0" ? registeredFrame(page, "F0") : registeredFrame(page, scoped.frameId);
+  if (scoped.frameId !== "F0" && (!frameEntry || frameEntry.frame.isDetached()))
+    throw new AgentProtocolError("FRAME_DETACHED", `Frame ${scoped.frameId} is detached or expired`, true, {
+      details: { frameId: scoped.frameId }, nextCommands: [observeRecoveryCommand(pageName)],
+    });
+  const context: Page | Frame = frameEntry?.frame ?? page;
+  if (frameEntry && !(await frameAncestorsVisible(frameEntry.frame)))
+    return fail(pageName, "TARGET_HIDDEN", `Frame ${scoped.frameId} or an ancestor frame is hidden`, { frameId: scoped.frameId });
+  const token = `dev-browser-${randomUUID()}`;
+  const selector = `[data-dev-browser-action-ref="${token}"]`;
   let identity: ElementHandle<Element> | null = null;
-  let original = page.locator(selector).first();
-  if ((await original.count()) === 0) {
-    temporary = await page.evaluate((requestedRef) => {
+  let previousActionAttribute: string | null = null;
+  const handle = await context.evaluateHandle(({ requestedRef, legacyRefs }) => {
       const state = (
-        window as Window & { __devBrowserPerceptionState?: { refs: WeakMap<Element, string> } }
+        window as Window & { __devBrowserPerceptionState?: { refs: WeakMap<Element, string>; byRef?: Map<string, WeakRef<Element>> } }
       ).__devBrowserPerceptionState;
-      const element = Array.from(document.querySelectorAll("*")).find(
-        (candidate) => state?.refs.get(candidate) === requestedRef
-      );
-      if (!element) return false;
-      element.setAttribute("data-dev-browser-action-ref", requestedRef);
-      return true;
-    }, ref);
-    if (temporary) {
-      selector = `[data-dev-browser-action-ref="${ref}"]`;
-      original = page.locator(selector).first();
-    }
+      const candidate = state?.byRef?.get(requestedRef)?.deref();
+      if (candidate && candidate.isConnected && state?.refs.get(candidate) === requestedRef) return candidate;
+      return legacyRefs ? document.querySelector(`[data-dev-browser-ref="${requestedRef}"]`) : null;
+    }, { requestedRef: scoped.localRef, legacyRefs: options.legacyRefs === true });
+  identity = handle.asElement();
+  if (!identity) {
+    await handle.dispose();
+    return fail(pageName, "TARGET_MISSING", `Target ref "${ref}" is missing`, { ref });
   }
+  previousActionAttribute = await identity.getAttribute("data-dev-browser-action-ref");
+  await identity.evaluate((element, ownedToken) => element.setAttribute("data-dev-browser-action-ref", ownedToken), token);
+  let original = context.locator(selector).first();
   const cleanup = async () => {
-    await identity?.dispose().catch(() => {});
+    const owned = identity;
     identity = null;
-    if (temporary)
-      await page
-        .locator(selector)
-        .evaluateAll((elements) =>
-          elements.forEach((element) => element.removeAttribute("data-dev-browser-action-ref"))
-        )
-        .catch(() => {});
+    if (owned) {
+      await owned.evaluate((element, state) => {
+        if (element.getAttribute("data-dev-browser-action-ref") !== state.token) return;
+        if (state.previous === null) element.removeAttribute("data-dev-browser-action-ref");
+        else element.setAttribute("data-dev-browser-action-ref", state.previous);
+      }, { token, previous: previousActionAttribute }).catch(() => {});
+      await owned.dispose().catch(() => {});
+    }
   };
   try {
     if ((await original.count()) === 0)
@@ -313,19 +355,33 @@ export async function resolveActionTarget(
         resolvedBy = "ancestor";
       }
     }
-    identity = await locator.elementHandle();
-    if (!identity) fail(pageName, "TARGET_MISSING", "Resolved target is missing");
-    const identityHandle = identity!;
-    const initialTarget = await inspectTarget(locator, ref);
+    const identityHandle = await locator.elementHandle();
+    if (!identityHandle) return fail(pageName, "TARGET_MISSING", "Resolved target is missing");
+    const initialTarget = await inspectTarget(locator, scoped.localRef, options.legacyRefs === true);
     // Reject intrinsic hidden/disabled/inapplicable states before asking
     // Playwright to wait for a scroll that can never make them actionable.
     await validateApplicability(locator, options.applicability, pageName);
+    if (frameEntry && !(await frameAncestorsVisible(frameEntry.frame)))
+      fail(pageName, "TARGET_HIDDEN", `Frame ${scoped.frameId} or an ancestor frame became hidden`, { frameId: scoped.frameId });
     const before = await offsets(page);
     if (options.scroll) {
-      await locator.scrollIntoViewIfNeeded({ timeout: Math.max(options.timeoutMs, 500) });
+      if (frameEntry && frameEntry.id !== "F0") {
+        const chain: Frame[] = [];
+        let cursor: Frame = frameEntry.frame;
+        while (cursor.parentFrame()) { chain.unshift(cursor); cursor = cursor.parentFrame()!; }
+        for (const child of chain) {
+          const frameElement = await child.frameElement();
+          try {
+            await frameElement.evaluate((element) => (element as HTMLElement).scrollIntoView({ block: "center", inline: "center" }));
+          } finally {
+            await frameElement.dispose();
+          }
+        }
+      }
+      await locator.evaluate((element) => element.scrollIntoView({ block: "center", inline: "center" }));
     }
     const after = await offsets(page);
-    const box = await stableBox(locator, options.timeoutMs, pageName);
+    const localBox = await stableBox(locator, options.timeoutMs, pageName);
     const current = await locator.elementHandle();
     if (!current)
       fail(pageName, "TARGET_MISSING", "Resolved target detached during stability sampling");
@@ -335,12 +391,13 @@ export async function resolveActionTarget(
       currentHandle
     );
     await currentHandle.dispose();
+    await identityHandle.dispose();
     if (!sameElement)
       fail(pageName, "TARGET_MISSING", "Resolved target changed during stability sampling", {
         originalRef: ref,
       });
     await validateApplicability(locator, options.applicability, pageName);
-    const finalTarget = await inspectTarget(locator, ref);
+    const finalTarget = await inspectTarget(locator, scoped.localRef, options.legacyRefs === true);
     if (finalTarget.actualRef !== initialTarget.actualRef)
       fail(pageName, "TARGET_MISSING", "Resolved target identity changed during actionability checks", {
         originalRef: ref,
@@ -348,7 +405,10 @@ export async function resolveActionTarget(
     if (options.hitTest) {
       const obstruction = await locator.evaluate(
         (element, point) => {
-          const hit = document.elementFromPoint(point.x, point.y);
+          const root = element.getRootNode();
+          const hit = root instanceof ShadowRoot
+            ? root.elementFromPoint(point.x, point.y)
+            : document.elementFromPoint(point.x, point.y);
           if (!hit || hit === element || element.contains(hit) || hit.contains(element))
             return null;
           const rect = hit.getBoundingClientRect();
@@ -359,23 +419,54 @@ export async function resolveActionTarget(
             box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
           };
         },
-        { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+        { x: localBox.x + localBox.width / 2, y: localBox.y + localBox.height / 2 }
       );
       if (obstruction)
         fail(pageName, "TARGET_OBSCURED", "Target center is obstructed", { obstruction });
+      if (frameEntry && frameEntry.id !== "F0") {
+        let child: Frame = frameEntry.frame;
+        let projectedPoint = { x: localBox.x + localBox.width / 2, y: localBox.y + localBox.height / 2 };
+        while (child.parentFrame()) {
+          projectedPoint = projectPoint(await frameContentMatrix(child), projectedPoint);
+          const frameElement = await child.frameElement();
+          try {
+            const frameObstruction = await frameElement.evaluate((element, point) => {
+              const hit = document.elementFromPoint(point.x, point.y);
+              if (!hit || hit === element || element.contains(hit) || hit.contains(element)) return null;
+              return { tag: hit.tagName.toLowerCase(), role: hit.getAttribute("role") ?? "", name: (hit.getAttribute("aria-label") ?? "").slice(0, 80) };
+            }, projectedPoint);
+            if (frameObstruction)
+              fail(pageName, "TARGET_OBSCURED", `Frame ${frameEntry.id} is obstructed in its parent`, { frameId: frameEntry.id, obstruction: frameObstruction });
+          } finally {
+            await frameElement.dispose();
+          }
+          child = child.parentFrame()!;
+        }
+      }
     }
+    const box = await locator.boundingBox();
+    if (!box) return fail(pageName, "TARGET_MISSING", "Resolved target has no top-level bounding box");
+    const quad = projectRect(await frameToTopMatrix(frameEntry?.frame ?? page.mainFrame()), localBox).quad;
     return {
       locator,
       originalRef: ref,
-      actualRef: finalTarget.actualRef,
+      actualRef: scoped.frameId === "F0" ? finalTarget.actualRef : `${scoped.frameId}:${finalTarget.actualRef}`,
       resolvedBy,
       box,
+      quad,
       scroll: { scrolled: before.x !== after.x || before.y !== after.y, before, after },
       actual: finalTarget.actual,
+      frameId: scoped.frameId,
+      framePath: frameEntry?.path ?? ["F0"],
+      shadowContext: finalTarget.shadowContext,
       cleanup,
     };
   } catch (error) {
     await cleanup();
+    if (frameEntry?.frame.isDetached())
+      throw new AgentProtocolError("FRAME_DETACHED", `Frame ${scoped.frameId} detached during actionability checks`, true, {
+        details: { frameId: scoped.frameId }, nextCommands: [observeRecoveryCommand(pageName)],
+      });
     throw error;
   }
 }

@@ -10,6 +10,7 @@ import type {
 } from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
+import { collectLiveSnapshot } from "./live-snapshot.js";
 import type { WaitCondition, WaitSpec } from "./protocol.js";
 
 const POLL_INTERVAL_MS = 25;
@@ -19,6 +20,7 @@ type ConditionObservation = {
   condition: WaitCondition;
   passed: boolean;
   observed?: string | number | boolean | null;
+  coverage?: "complete" | "truncated";
 };
 
 export interface WaitEvents {
@@ -54,6 +56,7 @@ export interface WaitResult {
 
 export interface WaitStateContext<State> {
   collect(): Promise<State>;
+  protocolVersion?: 1 | 2;
   onPopup?: (popup: Page) => void;
   onDownload?: (download: Download) => void;
   popupMetadata?: (
@@ -246,6 +249,8 @@ async function domSnapshot(page: Page): Promise<{
       states: Record<string, string>;
     }
   >;
+  truncated: boolean;
+  hiddenFrameIds: string[];
 }> {
   return await page.evaluate(() => {
     const visible = (element: Element) => {
@@ -300,6 +305,8 @@ async function domSnapshot(page: Page): Promise<{
       dialogs: text('[role="dialog"],dialog[open]'),
       toasts: text('[role="status"],[role="alert"],[data-toast],[data-testid*="toast"]'),
       refs,
+      truncated: false,
+      hiddenFrameIds: [],
     };
   });
 }
@@ -330,6 +337,18 @@ async function scopedText(page: Page, scope: "body" | "dialog" | "toast"): Promi
           .trim()
       );
   }, scope);
+}
+
+async function sharedDomSnapshot(page: Page, protocolVersion: 1 | 2): ReturnType<typeof domSnapshot> {
+  if (protocolVersion === 1) return domSnapshot(page);
+  const live = await collectLiveSnapshot(page);
+  return { dialogs: live.dialogs, toasts: live.toasts, refs: live.refs, truncated: live.truncated, hiddenFrameIds: live.hiddenFrameIds };
+}
+
+async function sharedScopedText(page: Page, scope: "body" | "dialog" | "toast", protocolVersion: 1 | 2): Promise<{ texts: string[]; truncated: boolean }> {
+  if (protocolVersion === 1) return { texts: await scopedText(page, scope), truncated: false };
+  const live = await collectLiveSnapshot(page);
+  return { texts: scope === "dialog" ? live.dialogs : scope === "toast" ? live.toasts : live.bodyText, truncated: live.truncated };
 }
 
 async function installTransientCapture(page: Page, ownerToken: string): Promise<void> {
@@ -559,7 +578,19 @@ export async function runWithWait<State>(
   if (page.isClosed())
     throw new AgentProtocolError("PAGE_CLOSED", "Page closed before wait dispatch", true);
   const started = Date.now();
-  const initial = await domSnapshot(page);
+  const protocolVersion = stateContext.protocolVersion ?? 2;
+  const initial = await sharedDomSnapshot(page, protocolVersion);
+  const refBaselines = new Map<string, (typeof initial.refs)[string] | undefined>();
+  const coveredRefBaselines = new Set<string>();
+  const initiallyTruncatedRefBaselines = new Set<string>();
+  for (const condition of spec.conditions) {
+    if (condition.kind !== "ref") continue;
+    const baseline = initial.refs[condition.ref];
+    if (baseline || !initial.truncated) {
+      refBaselines.set(condition.ref, baseline);
+      coveredRefBaselines.add(condition.ref);
+    } else initiallyTruncatedRefBaselines.add(condition.ref);
+  }
   const events: WaitEvents = {
     requests: [],
     mutations: [],
@@ -715,44 +746,51 @@ export async function runWithWait<State>(
       };
     }
     if (condition.kind === "text") {
-      const texts = await scopedText(page, condition.scope);
-      const matched = texts.some(matcher(condition.match, condition.value));
+      const scoped = await sharedScopedText(page, condition.scope, protocolVersion);
+      const matched = scoped.texts.some(matcher(condition.match, condition.value));
       return {
         condition,
-        passed: condition.state === "visible" ? matched : !matched,
-        observed: bounded(texts.join(" | ")),
+        passed: !scoped.truncated && (condition.state === "visible" ? matched : !matched),
+        observed: bounded(scoped.texts.join(" | ")),
+        coverage: scoped.truncated ? "truncated" : "complete",
       };
     }
-    const current = await domSnapshot(page);
+    const current = await sharedDomSnapshot(page, protocolVersion);
     if (condition.kind === "dialog" || condition.kind === "toast") {
       const before = condition.kind === "dialog" ? initial.dialogs : initial.toasts;
       const after = condition.kind === "dialog" ? current.dialogs : current.toasts;
       const passed =
-        condition.state === "opened" ? after.length > before.length : after.length < before.length;
-      return { condition, passed, observed: after.length };
+        !initial.truncated && !current.truncated &&
+        (condition.state === "opened" ? after.length > before.length : after.length < before.length);
+      return { condition, passed, observed: after.length, coverage: initial.truncated || current.truncated ? "truncated" : "complete" };
     }
     if (condition.kind !== "ref") {
       throw new Error(`Unsupported wait condition: ${(condition as { kind: string }).kind}`);
     }
-    const before = initial.refs[condition.ref];
+    let before = refBaselines.get(condition.ref);
     const after = current.refs[condition.ref];
+    const frameId = /^(F\d+):/.exec(condition.ref)?.[1] ?? "F0";
+    const hiddenByFrame = current.hiddenFrameIds.includes(frameId);
+    const unknownAbsent = !after && current.truncated;
     if (condition.state === "attached" || condition.state === "detached") {
       return {
         condition,
-        passed: condition.state === "attached" ? Boolean(after) : !after,
-        observed: Boolean(after),
+        passed: unknownAbsent ? false : condition.state === "attached" ? Boolean(after) || hiddenByFrame : !after && !hiddenByFrame,
+        observed: Boolean(after) || hiddenByFrame,
+        coverage: unknownAbsent ? "truncated" : "complete",
       };
     }
     if (condition.state === "visible" || condition.state === "hidden") {
-      const visible = Boolean(after?.visible);
+      const visible = hiddenByFrame ? false : Boolean(after?.visible);
       return {
         condition,
-        passed: condition.state === "visible" ? visible : !visible,
+        passed: unknownAbsent ? false : condition.state === "visible" ? visible : hiddenByFrame || !visible,
         observed: visible,
+        coverage: unknownAbsent ? "truncated" : "complete",
       };
     }
     if (condition.state === "enabled" || condition.state === "disabled") {
-      if (!after) return { condition, passed: false, observed: null };
+      if (!after) return { condition, passed: false, observed: null, coverage: current.truncated ? "truncated" : "complete" };
       const enabled = after.enabled;
       return {
         condition,
@@ -760,6 +798,14 @@ export async function runWithWait<State>(
         observed: enabled,
       };
     }
+    if (!coveredRefBaselines.has(condition.ref)) {
+      if (after || !current.truncated) {
+        refBaselines.set(condition.ref, after);
+        coveredRefBaselines.add(condition.ref);
+      }
+      return { condition, passed: false, observed: after?.value ?? null, coverage: "truncated" };
+    }
+    before = refBaselines.get(condition.ref);
     let previous: string | null | undefined;
     let actual: string | null | undefined;
     if (condition.state === "valueChanged") {
@@ -775,9 +821,10 @@ export async function runWithWait<State>(
     }
     return {
       condition,
-      passed:
+      passed: !unknownAbsent &&
         actual !== previous && (condition.expected === undefined || actual === condition.expected),
       observed: actual ?? null,
+      coverage: unknownAbsent || initiallyTruncatedRefBaselines.has(condition.ref) ? "truncated" : "complete",
     };
   };
 

@@ -3,6 +3,14 @@ import { describe, expect, it } from "vitest";
 import { parseRequest } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("accepts scoped frame refs in actions and typed waits", () => {
+    const parsed = parseRequest(JSON.stringify({
+      id: "frame-ref", type: "interactive", protocolVersion: 2,
+      action: { kind: "click", ref: "F12:R34", wait: { mode: "all", timeoutMs: 100, conditions: [{ kind: "ref", ref: "F12:R34", state: "visible" }] } },
+    }));
+    expect(parsed).toMatchObject({ success: true, request: { action: { ref: "F12:R34", wait: { conditions: [{ ref: "F12:R34" }] } } } });
+    expect(parseRequest(JSON.stringify({ id: "long-frame-ref", type: "interactive", protocolVersion: 2, action: { kind: "click", ref: `F${"1".repeat(40)}:R1` } }))).toMatchObject({ success: false });
+  });
   it("parses every typed wait condition and rejects unsafe or oversized matchers", () => {
     const conditions = [
       { kind: "text", state: "visible", scope: "body", match: "contains", value: "Saved" },

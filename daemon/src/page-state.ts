@@ -48,6 +48,10 @@ export function semanticFingerprint(element: PerceptionElement): string {
     expanded: element.expanded,
     pressed: element.pressed,
     current: element.current,
+    frameId: element.frameId,
+    framePath: element.framePath,
+    frameDocumentId: element.frameDocumentId,
+    shadowContext: element.shadowContext,
   });
 }
 

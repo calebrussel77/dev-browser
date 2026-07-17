@@ -93,6 +93,8 @@ export function findTargets(
         if (normalize(element.frameId) !== normalize(filters.frame)) return [];
         reasons.push(`frame=${filters.frame}`);
         score += 20;
+      } else if (element.frameId !== "F0") {
+        reasons.push(`frame=${element.frameId}`);
       }
       for (const state of filters.states) {
         if (!hasState(element, state)) return [];

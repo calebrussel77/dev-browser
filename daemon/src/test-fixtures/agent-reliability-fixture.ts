@@ -60,9 +60,33 @@ function closeServer(server: Server): Promise<void> {
 
 function framePage(kind: string, nestedChildUrl?: string): string {
   const nested = nestedChildUrl
-    ? `<iframe data-testid="nested-child-frame" title="Nested child frame" src="${nestedChildUrl}"></iframe>`
+    ? `<div style="height:40px"></div><iframe style="margin-left:24px;border:3px solid #333" data-testid="nested-child-frame" title="Nested child frame" src="${nestedChildUrl}"></iframe>`
     : "";
-  return html(`<p data-testid="frame-kind">${kind}</p>${nested}`);
+  const controls = kind === "same-origin"
+    ? `<button data-testid="same-frame-action">Same frame action</button><output data-testid="frame-result">idle</output>
+       <input aria-label="Frame editor"><select aria-label="Frame select"><option value="a">Alpha</option><option value="b">Beta</option></select>
+       <label><input type="checkbox" aria-label="Frame check">Frame check</label><button data-testid="frame-hover">Frame hover</button>
+       <div draggable="true" role="button" aria-label="Frame drag source">drag</div><div role="button" aria-label="Frame drop target">drop</div>
+       <input type="file" aria-label="Frame upload"><output data-testid="frame-events">idle</output>`
+    : kind === "cross-origin"
+      ? '<label>Cross frame input<input aria-label="Cross frame input"></label>'
+      : kind === "nested-child"
+        ? '<button data-testid="nested-frame-action">Nested frame action</button><output data-testid="nested-result">idle</output>'
+        : kind === "initial"
+          ? '<button data-testid="initial-frame-action">Initial frame action</button><output>initial-clicks:0</output>'
+          : kind === "navigated"
+            ? '<button data-testid="navigated-frame-action">Navigated frame action</button><output>navigated-clicks:0</output>'
+            : "";
+  return html(`<p data-testid="frame-kind">${kind}</p>${controls}${nested}`, `
+    document.querySelector('[data-testid=same-frame-action]')?.addEventListener('click', () => document.querySelector('[data-testid=frame-result]').textContent = 'clicked');
+    document.querySelector('[data-testid=frame-hover]')?.addEventListener('mouseenter', () => document.querySelector('[data-testid=frame-events]').textContent = 'hovered');
+    document.querySelector('[aria-label="Frame drop target"]')?.addEventListener('dragover', event => event.preventDefault());
+    document.querySelector('[aria-label="Frame drop target"]')?.addEventListener('drop', event => { event.preventDefault(); document.querySelector('[data-testid=frame-events]').textContent = 'dropped'; });
+    document.querySelector('[aria-label="Frame upload"]')?.addEventListener('change', event => document.querySelector('[data-testid=frame-events]').textContent = event.target.files[0]?.name ?? 'idle');
+    document.querySelector('[data-testid=nested-frame-action]')?.addEventListener('click', () => document.querySelector('[data-testid=nested-result]').textContent = 'clicked');
+    let initialClicks = 0; document.querySelector('[data-testid=initial-frame-action]')?.addEventListener('click', () => document.querySelector('output').textContent = 'initial-clicks:' + (++initialClicks));
+    let navigatedClicks = 0; document.querySelector('[data-testid=navigated-frame-action]')?.addEventListener('click', () => document.querySelector('output').textContent = 'navigated-clicks:' + (++navigatedClicks));
+  `, 'body{margin:0;padding:8px}');
 }
 
 function mainPage(origin: string, crossOriginFrameUrl: string): string {
@@ -195,7 +219,10 @@ document.querySelector("[data-testid=load-more]").addEventListener("click", (eve
   if (loadCount === 3) event.currentTarget.disabled = true;
 });
 const openHost = document.querySelector("[data-testid=shadow-host]");
-openHost.attachShadow({ mode: "open" }).innerHTML = '<button data-testid="shadow-action">Shadow action</button>';
+const openRoot = openHost.attachShadow({ mode: "open" });
+openRoot.innerHTML = '<button data-testid="shadow-action">Shadow action</button><output data-testid="shadow-result">idle</output><div id="nested-shadow-host"></div>';
+openRoot.querySelector('[data-testid=shadow-action]').addEventListener('click', () => openRoot.querySelector('[data-testid=shadow-result]').textContent = 'clicked');
+openRoot.querySelector('#nested-shadow-host').attachShadow({ mode: "open" }).innerHTML = '<input aria-label="Nested shadow input">';
 const closedHost = document.querySelector("[data-testid=closed-shadow-host]");
 closedHost.attachShadow({ mode: "closed" }).innerHTML = '<button>Closed action</button>';`,
     `body { font-family: sans-serif; margin: 0; }
@@ -207,7 +234,7 @@ section { margin: 24px 0; }
 [data-testid="obscured-target"], [data-testid="obscuring-layer"] { position: absolute; inset: 0; }
 [data-testid="obscuring-layer"] { z-index: 2; display: grid; place-items: center; background: rgba(255, 0, 0, .75); }
 [data-testid="tall-spacer"] { height: 1600px; }
-iframe { display: block; width: 360px; height: 90px; margin: 8px 0; }`
+iframe { display: block; width: 360px; height: 260px; margin: 8px 0; }`
   );
 }
 

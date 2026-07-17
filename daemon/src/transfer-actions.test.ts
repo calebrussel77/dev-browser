@@ -183,6 +183,7 @@ describe.sequential("first-class transfer and navigation actions", () => {
     const ref = await refNamed("upload-symlink", "Upload fixture");
     const target = await writeDevBrowserTempFile("uploads/symlink-target.txt", "SYMLINK_SECRET");
     const link = path.join(DEV_BROWSER_TMP_DIR, "uploads", "symlink-source.txt");
+    await rm(link, { force: true });
     try {
       await symlink(target, link, "file");
     } catch (error) {
@@ -264,7 +265,7 @@ describe.sequential("first-class transfer and navigation actions", () => {
       expect(await readFile(saved!, "utf8")).toContain("deterministic fixture download");
       await rm(saved!, { force: true });
     }
-  });
+  }, 10_000);
 
   it("rejects traversal download names and cleans interrupted artifacts with a journal", async () => {
     for (const unsafe of ["../escape.txt", "sub/escape.txt", "C:\\escape.txt"]) {

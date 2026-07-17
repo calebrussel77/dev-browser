@@ -13,9 +13,12 @@ import {
 import { AgentProtocolError } from "./agent-protocol.js";
 import {
   attemptErrorReason,
+  attemptFrameContext,
   boundedWaitEvents,
   emptyWaitEvents,
   mergeWaitEvents,
+  originatingAttemptFrameContext,
+  recordAttempt,
   trustedInputError as attemptError,
   unchangedAttempt,
   withAttemptJournal,
@@ -49,6 +52,7 @@ import {
 } from "./wait-engine.js";
 import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
+import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -253,7 +257,7 @@ async function saveDownload(
     }));
     const saved = await reserved.handle.stat();
     if (!saved.isFile()) throw new Error("not a regular file");
-    journal.push({
+    recordAttempt(journal, {
       attempt: journal.length + 1,
       startedAt,
       inputMethod: "download",
@@ -261,7 +265,7 @@ async function saveDownload(
       change: unchangedAttempt(),
       retryDecision: "stop",
       reason: "artifact-saved",
-    });
+    }, originatingAttemptFrameContext(journal));
     return {
       filename: reserved.filename,
       bytes: saved.size,
@@ -270,7 +274,7 @@ async function saveDownload(
       page: pageName,
     };
   } catch {
-    journal.push({
+    recordAttempt(journal, {
       attempt: journal.length + 1,
       startedAt,
       inputMethod: "download",
@@ -278,7 +282,7 @@ async function saveDownload(
       change: unchangedAttempt(),
       retryDecision: "stop",
       reason: "download-failed",
-    });
+    }, originatingAttemptFrameContext(journal));
     throw withAttemptJournal(new AgentProtocolError("DOWNLOAD_FAILED", "Download could not be saved safely", true, {
       nextCommands: [observeRecoveryCommand(pageName)],
     }), journal);
@@ -341,6 +345,7 @@ async function resolveRef(page: Page, ref: string, options: Partial<ActionTarget
     hitTest: options.hitTest ?? false,
     applicability: options.applicability ?? "pointer",
     pageName: options.pageName,
+    legacyRefs: options.legacyRefs,
   });
 }
 
@@ -426,48 +431,21 @@ interface PageSignal {
   dom: string;
   focus: string;
   values: string[];
+  truncated: boolean;
 }
 
 async function pageSignal(page: Page): Promise<PageSignal> {
-  const state = await page.evaluate(() => {
-    const visible = (element: Element): boolean => {
-      const rect = element.getBoundingClientRect();
-      const style = window.getComputedStyle(element);
-      return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden"
-      );
-    };
-    return {
-      dialogs: Array.from(document.querySelectorAll('[role="dialog"],dialog'))
-        .filter(visible)
-        .map((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim()),
-      ariaExpanded: Array.from(document.querySelectorAll("[aria-expanded]"))
-        .filter(visible)
-        .map(
-          (element) =>
-            `${element.getAttribute("data-dev-browser-ref") ?? element.id}:${element.getAttribute("aria-expanded")}`
-        ),
-      dom: document.documentElement.outerHTML.replace(
-        / data-dev-browser-(?:ref|action-ref)="[^"]*"/g,
-        ""
-      ),
-      focus: (() => {
-        const element = document.activeElement;
-        if (!element || element === document.body) return "";
-        return `${element.tagName}:${element.id}:${element.getAttribute("name") ?? ""}:${element.getAttribute("aria-label") ?? ""}`;
-      })(),
-      values: Array.from(
-        document.querySelectorAll("input,textarea,select,[contenteditable=true]")
-      ).map((element, index) => {
-        const field = element as HTMLInputElement;
-        return `${index}:${"value" in field ? field.value : (element.textContent ?? "")}`;
-      }),
-    };
-  });
-  return { url: page.url(), snapshot: await snapshot(page), ...state };
+  const live = await collectLiveSnapshot(page);
+  return {
+    url: page.url(),
+    snapshot: JSON.stringify(live.frameSignals.map(({ frameId, url, dom }) => ({ frameId, url, dom }))).slice(0, 12_000),
+    dialogs: live.dialogs,
+    ariaExpanded: Object.entries(live.refs).filter(([, value]) => value.states.expanded !== "").map(([ref, value]) => `${ref}:${value.states.expanded}`),
+    dom: JSON.stringify(live.frameSignals).slice(0, 24_000),
+    focus: live.frameSignals.map((frame) => `${frame.frameId}:${frame.focus}`).join("|").slice(0, 2_000),
+    values: Object.entries(live.refs).map(([ref, value]) => `${ref}:${value.value}`).slice(0, 2_000),
+    truncated: live.truncated,
+  };
 }
 
 function compareSignals(before: PageSignal, after: PageSignal): AttemptChange {
@@ -479,9 +457,12 @@ function compareSignals(before: PageSignal, after: PageSignal): AttemptChange {
     dom: before.dom !== after.dom,
     focus: before.focus !== after.focus,
     value: JSON.stringify(before.values) !== JSON.stringify(after.values),
+    coverageTruncated: before.truncated || after.truncated,
     any: false,
   };
   change.any =
+    before.truncated ||
+    after.truncated ||
     change.url ||
     change.snapshot ||
     change.dialog ||
@@ -490,6 +471,16 @@ function compareSignals(before: PageSignal, after: PageSignal): AttemptChange {
     change.focus ||
     change.value;
   return change;
+}
+
+function addFrameSignalEvidence(events: WaitEvents, change: AttemptChange, context: AttemptJournalEntry["frameContext"]): void {
+  if (!context || context.frameId === "F0") return;
+  if ((change.dom || change.snapshot) && events.mutations.length === 0)
+    events.mutations.push({ type: "frame-state", target: `${context.frameId}:${context.ref ?? "document"}`.slice(0, 160) });
+  if (change.value && events.valueChanges.length === 0)
+    events.valueChanges.push({ type: "frame-value", target: `${context.frameId}:${context.ref ?? "document"}`.slice(0, 160) });
+  if (change.focus && events.focusChanges.length === 0)
+    events.focusChanges.push({ type: "frame-focus", target: `${context.frameId}:${context.ref ?? "document"}`.slice(0, 160) });
 }
 
 function actionWaitSpec(
@@ -524,21 +515,8 @@ async function hasIrreversibleClickIntent(
   page: Page,
   action: Extract<InteractiveRequest["action"], { kind: "click" }>
 ): Promise<boolean> {
-  const descriptor = await page.evaluate((target) => {
-    let element: Element | null = null;
-    if ("ref" in target) {
-      const state = (
-        window as Window & { __devBrowserPerceptionState?: { refs: WeakMap<Element, string> } }
-      ).__devBrowserPerceptionState;
-      element =
-        Array.from(document.querySelectorAll("*")).find(
-          (candidate) =>
-            candidate.getAttribute("data-dev-browser-ref") === target.ref ||
-            state?.refs.get(candidate) === target.ref
-        ) ?? null;
-    } else {
-      element = document.elementFromPoint(target.x, target.y);
-    }
+  const descriptor = "ref" in action ? await describeLiveRef(page, action.ref) : await page.evaluate((target) => {
+    const element = document.elementFromPoint(target.x, target.y);
     if (!element) return "";
     const input = element as HTMLInputElement;
     return [
@@ -624,7 +602,7 @@ export async function executeInteractiveAction(
       if (action.wait) {
         const waited = await runWithWait(
           page,
-          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+          { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
           action.wait,
           async () => {
             await authorizeTrustedMutation();
@@ -672,7 +650,7 @@ export async function executeInteractiveAction(
         if (action.wait) {
           const waited = await runWithWait(
             page,
-            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
             action.wait,
             dispatch
           );
@@ -717,6 +695,7 @@ export async function executeInteractiveAction(
         change: { ...unchangedAttempt(), any: navigated, url: beforeUrl !== afterUrl, snapshot: documentChanged, dom: Boolean(beforeStateId && beforeStateId !== result.stateId) },
         retryDecision: "stop",
         reason: navigated ? "action-complete" : "no-history-entry",
+        frameContext: attemptFrameContext(),
       }];
       break;
     }
@@ -724,10 +703,12 @@ export async function executeInteractiveAction(
     case "upload": {
       const startedAt = new Date().toISOString();
       const uploadJournal: AttemptJournalEntry[] = [];
+      let resolved: ResolvedActionTarget | undefined;
       const failUpload = (error: AgentProtocolError, reason: string): never => {
-        uploadJournal.push({
+        recordAttempt(uploadJournal, {
           attempt: 1, startedAt, inputMethod: "upload", sideEffects: emptyWaitEvents(),
           change: unchangedAttempt(), retryDecision: "stop", reason,
+          frameContext: attemptFrameContext(action.ref, resolved),
         });
         throw withAttemptJournal(error, uploadJournal);
       };
@@ -747,7 +728,6 @@ export async function executeInteractiveAction(
         ), "unsafe-upload-source")
       );
       await validateDecisionRefs([action.ref]);
-      let resolved: ResolvedActionTarget | undefined;
       const dispatch = async () => {
         await hooks.beforeTrustedInput?.();
         resolved = await resolveRef(page, action.ref, {
@@ -756,6 +736,7 @@ export async function executeInteractiveAction(
           scroll: false,
           hitTest: true,
           applicability: "upload",
+          legacyRefs: protocolVersion === 1,
         });
         await validateDecisionRefs([action.ref]);
         pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
@@ -772,7 +753,7 @@ export async function executeInteractiveAction(
         if (action.wait) {
           const waited = await runWithWait(
             page,
-            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
             action.wait,
             dispatch
           );
@@ -789,7 +770,7 @@ export async function executeInteractiveAction(
         };
         result.targets = [actionTargetMetadata(resolved!, "upload")];
         result.attempts = 1;
-        uploadJournal.push({
+        recordAttempt(uploadJournal, {
           attempt: 1,
           startedAt,
           inputMethod: "upload",
@@ -797,15 +778,17 @@ export async function executeInteractiveAction(
           change: { ...unchangedAttempt(), any: true, value: true },
           retryDecision: "stop",
           reason: "action-complete",
+          frameContext: attemptFrameContext(action.ref, resolved),
         });
         result.attemptJournal = uploadJournal;
       } catch (error) {
         const typed = pageAwareTrustedInputError(error, page, request.page);
         if (uploadJournal.length === 0)
-          uploadJournal.push({
+          recordAttempt(uploadJournal, {
             attempt: 1, startedAt, inputMethod: "upload",
             sideEffects: boundedWaitEvents(capturedWaitEvents(error) ?? emptyWaitEvents()),
             change: unchangedAttempt(), retryDecision: "stop", reason: attemptErrorReason(typed),
+            frameContext: attemptFrameContext(action.ref, resolved),
           });
         throw withAttemptJournal(typed, uploadJournal);
       } finally {
@@ -883,6 +866,7 @@ export async function executeInteractiveAction(
         await hooks.beforeTrustedInput?.();
         await revalidateClick();
       };
+      let clickFrameContext: AttemptJournalEntry["frameContext"] = attemptFrameContext("ref" in action ? action.ref : null);
       const clickOnce = async () => {
         if ("ref" in action) {
           // Validate the observed decision before resolving the live element.
@@ -894,8 +878,10 @@ export async function executeInteractiveAction(
             scroll: true,
             hitTest: true,
             applicability: "pointer",
+            legacyRefs: protocolVersion === 1,
           });
           const { box, locator, resolvedBy, cleanup } = resolved;
+          clickFrameContext = attemptFrameContext(action.ref, resolved);
           const point = {
             x: box.x + box.width / 2,
             y: box.y + box.height / 2,
@@ -981,6 +967,7 @@ export async function executeInteractiveAction(
             page,
             {
               collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              protocolVersion,
               onPopup: (popup) => openedPopups.push(popup),
               onDownload: (download) => startedDownloads.push(download),
             },
@@ -998,15 +985,18 @@ export async function executeInteractiveAction(
               await capturePopupMetadata(openedPopups[0], page.url())
             );
           after = await pageSignal(page);
-          journal.push({
+          const successfulChange = compareSignals(attemptBefore, after);
+          addFrameSignalEvidence(waited.waitResult.events, successfulChange, clickFrameContext);
+          recordAttempt(journal, {
             attempt,
             startedAt,
             inputMethod: action.method,
+            frameContext: clickFrameContext,
             sideEffects: waited.waitResult.events,
-            change: compareSignals(attemptBefore, after),
+            change: successfulChange,
             retryDecision: "stop",
             reason: wait ? "wait-satisfied" : "action-complete",
-          });
+          }, originatingAttemptFrameContext(journal));
           if (wait && !waitIncludes(wait, "popup") && openedPopups[0]) {
             const popup = await buildPopupResult(
               manager, request.browser, request.page, openedPopups[0], waited.waitResult.events.popup[0]
@@ -1036,11 +1026,14 @@ export async function executeInteractiveAction(
             captured
           );
           const typedError = attemptError(error, page);
+          if (typedError.code === "WAIT_TIMEOUT")
+            await new Promise<void>((resolve) => setTimeout(resolve, 150));
           after = await pageSignal(page).catch(() => attemptBefore);
           const change = compareSignals(attemptBefore, after);
+          addFrameSignalEvidence(sideEffects, change, clickFrameContext);
           if (wait && !waitIncludes(wait, "popup") && sideEffects.popup[0] && openedPopups[0]) {
-            journal.push({
-              attempt, startedAt, inputMethod: action.method, sideEffects, change,
+            recordAttempt(journal, {
+              attempt, startedAt, inputMethod: action.method, frameContext: clickFrameContext, sideEffects, change,
               retryDecision: "stop", reason: "unexpected-popup",
             });
             const popup = await buildPopupResult(
@@ -1054,10 +1047,11 @@ export async function executeInteractiveAction(
             ), journal);
           }
           if (!wait && typedError.code === "WAIT_TIMEOUT") {
-            journal.push({
+            recordAttempt(journal, {
               attempt,
               startedAt,
               inputMethod: action.method,
+              frameContext: clickFrameContext,
               sideEffects,
               change,
               retryDecision: "stop",
@@ -1066,10 +1060,11 @@ export async function executeInteractiveAction(
             break;
           }
           if (typedError.code !== "WAIT_TIMEOUT") {
-            journal.push({
+            recordAttempt(journal, {
               attempt,
               startedAt,
               inputMethod: action.method,
+              frameContext: clickFrameContext,
               sideEffects,
               change,
               retryDecision: "stop",
@@ -1085,14 +1080,15 @@ export async function executeInteractiveAction(
             sideEffects,
             change,
           });
-          journal.push({
+          recordAttempt(journal, {
             attempt,
             startedAt,
             inputMethod: action.method,
+            frameContext: clickFrameContext,
             sideEffects,
             change,
             ...decision,
-          });
+          }, originatingAttemptFrameContext(journal));
           if (decision.retryDecision === "retry") continue;
           throw withAttemptJournal(
             new AgentProtocolError(
@@ -1125,11 +1121,11 @@ export async function executeInteractiveAction(
           );
         } catch (error) {
           const typed = attemptError(error, page);
-          journal.push({
+          recordAttempt(journal, {
             attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: "popup",
             sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop",
             reason: "popup-metadata-unavailable",
-          });
+          }, originatingAttemptFrameContext(journal));
           throw withAttemptJournal(typed, journal);
         }
       break;
@@ -1150,6 +1146,7 @@ export async function executeInteractiveAction(
         change: unchangedAttempt(),
         retryDecision: "stop",
         reason,
+        frameContext: attemptFrameContext(action.ref ?? null, resolvedTypeTarget),
       });
       const dispatchTypeInput = async (
         method: "mouse" | "keyboard",
@@ -1161,10 +1158,10 @@ export async function executeInteractiveAction(
           await validateDecisionRefs([action.ref]);
           pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
           await input();
-          journal.push(typeEntry(method, "action-complete", startedAt));
+          recordAttempt(journal, typeEntry(method, "action-complete", startedAt));
         } catch (error) {
           const typed = attemptError(error, page);
-          journal.push(typeEntry(method, attemptErrorReason(typed), startedAt));
+          recordAttempt(journal, typeEntry(method, attemptErrorReason(typed), startedAt));
           throw withAttemptJournal(typed, journal);
         }
       };
@@ -1176,6 +1173,7 @@ export async function executeInteractiveAction(
             scroll: true,
             hitTest: true,
             applicability: "type",
+            legacyRefs: protocolVersion === 1,
           });
           resolvedTypeTarget = resolved;
           const { box, cleanup } = resolved;
@@ -1198,7 +1196,7 @@ export async function executeInteractiveAction(
       if (action.wait) {
         const waited = await runWithWait(
           page,
-          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+          { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
           action.wait,
           dispatchType
         );
@@ -1266,6 +1264,7 @@ export async function executeInteractiveAction(
               scroll: action.kind !== "scroll",
               hitTest: action.kind === "hover" || action.kind === "drag",
               applicability,
+              legacyRefs: protocolVersion === 1,
             });
           },
           authorize: async (refs) => {
@@ -1299,6 +1298,7 @@ export async function executeInteractiveAction(
             page,
             {
               collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              protocolVersion,
               onPopup: (popup) => openedPopups.push(popup),
               onDownload: (download) => startedDownloads.push(download),
             },
@@ -1393,11 +1393,11 @@ export async function executeInteractiveAction(
           );
         } catch (error) {
           const journal = summary.attemptJournal ?? [];
-          journal.push({
+          recordAttempt(journal, {
             attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: "popup",
             sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop",
             reason: "popup-metadata-unavailable",
-          });
+          }, originatingAttemptFrameContext(journal));
           throw withAttemptJournal(attemptError(error, page), journal);
         }
       if (!result.stateId)
@@ -1446,6 +1446,7 @@ export async function executeInteractiveAction(
         timeoutMs: request.timeoutMs,
         scroll: true,
         applicability: "pointer",
+        legacyRefs: protocolVersion === 1,
       });
       try {
         focusedShotTarget = actionTargetMetadata(resolved, "screenshot");

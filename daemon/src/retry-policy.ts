@@ -11,6 +11,7 @@ export interface AttemptChange {
   dom: boolean;
   focus: boolean;
   value: boolean;
+  coverageTruncated?: boolean;
 }
 
 export interface AttemptJournalEntry {
@@ -21,6 +22,7 @@ export interface AttemptJournalEntry {
   change: AttemptChange;
   retryDecision: "retry" | "stop";
   reason: string;
+  frameContext?: { frameId: string; framePath: string[]; shadowContext: string[]; ref: string | null };
 }
 
 export function hasSideEffects(events: WaitEvents): boolean {
@@ -48,6 +50,8 @@ export function retryDecision(input: {
   change: AttemptChange;
 }): { retryDecision: "retry" | "stop"; reason: string } {
   if (input.attempt >= 2) return { retryDecision: "stop", reason: "retry-limit-reached" };
+  if (input.change.coverageTruncated)
+    return { retryDecision: "stop", reason: "observation-coverage-truncated" };
   if (input.policy === "never") return { retryDecision: "stop", reason: "retry-policy-never" };
   if (input.guarded) return { retryDecision: "stop", reason: "guarded-expect-text" };
   if (input.policy === "once" && input.irreversibleIntent)

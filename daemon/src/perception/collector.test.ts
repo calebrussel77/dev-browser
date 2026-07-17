@@ -1,7 +1,7 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { collectPageState } from "./collector.js";
+import { boundedCandidatePrefix, collectPageState } from "./collector.js";
 
 describe.sequential("unified page perception", () => {
   let browser: Browser;
@@ -15,6 +15,31 @@ describe.sequential("unified page perception", () => {
   afterAll(async () => {
     await browser?.close();
   }, 30_000);
+
+  it("pre-bounds a thousand frame candidates before expensive description", () => {
+    let reads = 0;
+    const children = new Proxy({ length: 1_001 } as ArrayLike<number>, {
+      get(target, property) {
+        if (property === "length") return target.length;
+        if (typeof property === "string" && /^\d+$/.test(property)) { reads += 1; return Number(property); }
+        return Reflect.get(target, property);
+      },
+    });
+    const selected = boundedCandidatePrefix(children);
+    expect(selected).toMatchObject({ truncated: true, items: { length: 128 } });
+    expect(reads).toBe(128);
+
+    let siblingReads = 0;
+    const hundredThousandSiblings = new Proxy({ length: 100_000 } as ArrayLike<number>, {
+      get(target, property) {
+        if (property === "length") return target.length;
+        if (typeof property === "string" && /^\d+$/.test(property)) { siblingReads += 1; return Number(property); }
+        return Reflect.get(target, property);
+      },
+    });
+    expect(boundedCandidatePrefix(hundredThousandSiblings, 1_000)).toMatchObject({ truncated: true, items: { length: 1_000 } });
+    expect(siblingReads).toBe(1_000);
+  });
 
   it("keeps duplicate accessible names attached to distinct inline refs without DOM mutations", async () => {
     await page.setContent(`

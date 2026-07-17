@@ -8,6 +8,7 @@ import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { retryDecision } from "./retry-policy.js";
+import { collectPageState } from "./perception/collector.js";
 import {
   startAgentReliabilityFixture,
   type AgentReliabilityFixture,
@@ -37,9 +38,10 @@ describe.sequential("typed event-driven wait engine", () => {
     async () => {
       const page = await manager.getPage("wait", "conditions");
       await page.goto(fixture.mainUrl);
-      await page
-        .locator("[data-testid=text-input]")
-        .evaluate((element) => element.setAttribute("data-dev-browser-ref", "R7"));
+      const observed = await collectPageState(page, { full: true });
+      const inputRef = observed.elements.find(
+        (element) => element.stableAttributes.testId === "text-input"
+      )!.ref;
       const outcome = await runWithWait(
         page,
         { collect: async () => ({ url: page.url() }) },
@@ -55,7 +57,7 @@ describe.sequential("typed event-driven wait engine", () => {
               value: "Saved locally",
             },
             { kind: "url", match: "glob", value: "**/spa/details" },
-            { kind: "ref", ref: "R7", state: "valueChanged", expected: "done" },
+            { kind: "ref", ref: inputRef, state: "valueChanged", expected: "done" },
             { kind: "toast", state: "opened" },
             {
               kind: "response",
@@ -449,42 +451,46 @@ describe.sequential("typed event-driven wait engine", () => {
     async () => {
       const page = await manager.getPage("wait", "state-families");
       const cases = [
-        ["attached", "", "document.body.innerHTML='<button data-dev-browser-ref=R1>One</button>'"],
+        ["attached", "<button data-testid=target>One</button>", "void 0"],
         [
           "detached",
-          "<button data-dev-browser-ref=R1>One</button>",
-          "document.querySelector('[data-dev-browser-ref=R1]').remove()",
+          "<button data-testid=target>One</button>",
+          "document.querySelector('[data-testid=target]').remove()",
         ],
         [
           "visible",
-          "<button hidden data-dev-browser-ref=R1>One</button>",
-          "document.querySelector('[data-dev-browser-ref=R1]').hidden=false",
+          "<button hidden data-testid=target>One</button>",
+          "document.querySelector('[data-testid=target]').hidden=false",
         ],
         [
           "hidden",
-          "<button data-dev-browser-ref=R1>One</button>",
-          "document.querySelector('[data-dev-browser-ref=R1]').hidden=true",
+          "<button data-testid=target>One</button>",
+          "document.querySelector('[data-testid=target]').hidden=true",
         ],
         [
           "enabled",
-          "<button disabled data-dev-browser-ref=R1>One</button>",
-          "document.querySelector('[data-dev-browser-ref=R1]').disabled=false",
+          "<button disabled data-testid=target>One</button>",
+          "document.querySelector('[data-testid=target]').disabled=false",
         ],
         [
           "disabled",
-          "<button data-dev-browser-ref=R1>One</button>",
-          "document.querySelector('[data-dev-browser-ref=R1]').disabled=true",
+          "<button data-testid=target>One</button>",
+          "document.querySelector('[data-testid=target]').disabled=true",
         ],
       ] as const;
       for (const [state, markup, script] of cases) {
         await page.setContent(markup);
+        const observed = await collectPageState(page, { full: true });
+        const ref = observed.elements.find(
+          (element) => element.stableAttributes.testId === "target"
+        )!.ref;
         const result = await runWithWait(
           page,
           { collect: async () => null },
           {
             mode: "all",
             timeoutMs: 300,
-            conditions: [{ kind: "ref", ref: "R1", state }],
+            conditions: [{ kind: "ref", ref, state }],
           },
           () => page.evaluate(script)
         );
@@ -506,13 +512,15 @@ describe.sequential("typed event-driven wait engine", () => {
           expected: "true",
         } as const,
       ]) {
-        await page.setContent(
-          '<input type="checkbox" data-dev-browser-ref="R1" aria-expanded="false">'
-        );
+        await page.setContent('<input type="checkbox" data-testid="target" aria-expanded="false">');
+        const observed = await collectPageState(page, { full: true });
+        const ref = observed.elements.find(
+          (element) => element.stableAttributes.testId === "target"
+        )!.ref;
         const result = await runWithWait(
           page,
           { collect: async () => null },
-          { mode: "all", timeoutMs: 300, conditions: [condition] },
+          { mode: "all", timeoutMs: 300, conditions: [{ ...condition, ref }] },
           () =>
             page.evaluate((state) => {
               const input = document.querySelector<HTMLInputElement>("input")!;

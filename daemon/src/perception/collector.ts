@@ -1,7 +1,10 @@
-import type { Page } from "playwright";
+import type { Frame, Page } from "playwright";
 
 import { AgentProtocolError } from "../agent-protocol.js";
+import { beginFrameGeneration, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
+import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "../frame-geometry.js";
 import { recordPageState, type PerceptionDelta } from "../page-state.js";
+import { collectRealm } from "./realm-collector.js";
 import { buildCompactTree } from "./tree.js";
 
 export interface CollectPageStateOptions {
@@ -24,6 +27,7 @@ export interface PerceptionElement {
   landmark: string;
   semanticAncestors: string[];
   box: { x: number; y: number; width: number; height: number };
+  quad?: Array<{ x: number; y: number }>;
   visible: boolean;
   inViewport: boolean;
   actionable: boolean;
@@ -42,8 +46,12 @@ export interface PerceptionElement {
   stableAttributes: { id: string; testId: string; href: string };
   focused: boolean;
   nearby: { heading: string; label: string; context: string };
-  frameId: "F0";
-  shadowContext: [];
+  frameId: string;
+  framePath?: string[];
+  frameUrl?: string;
+  frameName?: string;
+  frameDocumentId?: string;
+  shadowContext: string[];
   depth: number;
 }
 
@@ -68,6 +76,9 @@ export interface PagePerception {
 }
 
 const DEFAULTS = { maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 };
+const MAX_FRAMES_PER_OBSERVATION = 64;
+const MAX_RECORDS_PER_OBSERVATION = 2_000;
+const MAX_WORK_PER_FRAME = 5_000;
 
 function bounded(value: number | undefined, fallback: number, maximum: number): number {
   return Math.max(1, Math.min(maximum, Math.trunc(value ?? fallback)));
@@ -97,7 +108,7 @@ function decodeCursor(cursor: string | undefined): number {
   });
 }
 
-export async function collectPageState(
+async function collectLegacyPageState(
   page: Page,
   options: CollectPageStateOptions = {}
 ): Promise<PagePerception> {
@@ -366,7 +377,7 @@ export async function collectPageState(
       nextCommands: ["dev-browser observe"],
     });
   }
-  const built = buildCompactTree(raw.records, maxNodes, maxChars, offset, maxDepth, breadth);
+  const built = buildCompactTree(raw.records as unknown as PerceptionElement[], maxNodes, maxChars, offset, maxDepth, breadth);
   const omittedNodes = built.omittedNodes;
   const history = recordPageState(
     page,
@@ -376,7 +387,7 @@ export async function collectPageState(
       url: raw.url,
       title: raw.title,
       focusedRef: raw.focusedRef,
-      elements: raw.records,
+      elements: raw.records as unknown as PerceptionElement[],
     },
     options.delta ?? false
   );
@@ -397,5 +408,222 @@ export async function collectPageState(
       omittedNodes,
       continuation: built.omittedNodes > 0 ? encodeCursor(offset + built.consumedNodes) : null,
     },
+  };
+}
+
+const MAX_FRAME_CANDIDATE_SCAN = 128;
+
+export function boundedCandidatePrefix<T>(children: ArrayLike<T>, limit = MAX_FRAME_CANDIDATE_SCAN): { items: T[]; truncated: boolean } {
+  const count = Math.min(children.length, limit);
+  const items: T[] = [];
+  for (let index = 0; index < count; index += 1) items.push(children[index]!);
+  return { items, truncated: children.length > count };
+}
+
+async function deterministicFrames(page: Page): Promise<{ entries: Array<{ frame: Frame; id: string; path: string[] }>; truncated: boolean }> {
+  const ordered: Array<{ frame: Frame; id: string; path: string[] }> = [];
+  let truncated = false;
+  const domChildren = async (frame: Frame): Promise<{ frames: Frame[]; truncated: boolean }> => {
+    const result = await frame.evaluateHandle(({ maxFrames, maxWork }) => {
+      const elements: Element[] = [], stack: Element[] = [];
+      let work = 0, wasTruncated = false;
+      const pushReverse = (children: HTMLCollection) => {
+        const remaining = Math.max(0, maxWork - work - stack.length);
+        const selected = Math.min(children.length, remaining);
+        if (children.length > selected) wasTruncated = true;
+        for (let index = selected - 1; index >= 0; index -= 1) stack.push(children.item(index)!);
+      };
+      pushReverse(document.documentElement?.children ?? document.children);
+      while (stack.length > 0 && work < maxWork && elements.length < maxFrames) {
+        const element = stack.pop()!; work += 1;
+        if (element.matches("iframe,frame")) elements.push(element);
+        const remaining = Math.max(0, maxWork - work - stack.length);
+        const lightCount = Math.min(element.children.length, remaining);
+        const shadow = element.shadowRoot?.children;
+        const shadowCount = Math.min(shadow?.length ?? 0, remaining - lightCount);
+        if (lightCount < element.children.length || shadowCount < (shadow?.length ?? 0)) wasTruncated = true;
+        for (let index = shadowCount - 1; index >= 0; index -= 1) stack.push(shadow!.item(index)!);
+        for (let index = lightCount - 1; index >= 0; index -= 1) stack.push(element.children.item(index)!);
+      }
+      if (stack.length > 0 || elements.length >= maxFrames) wasTruncated = true;
+      return { elements, truncated: wasTruncated };
+    }, { maxFrames: MAX_FRAME_CANDIDATE_SCAN, maxWork: 1_000 });
+    try {
+      const truncatedHandle = await result.getProperty("truncated");
+      const wasTruncated = await truncatedHandle.jsonValue() as boolean;
+      await truncatedHandle.dispose();
+      const elementsHandle = await result.getProperty("elements");
+      try {
+        const properties = await elementsHandle.getProperties();
+        const frames: Frame[] = [];
+        for (let index = 0; index < MAX_FRAME_CANDIDATE_SCAN; index += 1) {
+          const handle = properties.get(String(index))?.asElement();
+          if (!handle) break;
+          const child = await handle.contentFrame();
+          if (child) frames.push(child);
+          await handle.dispose();
+        }
+        return { frames, truncated: wasTruncated };
+      } finally { await elementsHandle.dispose(); }
+    } finally { await result.dispose(); }
+  };
+  const visit = async (frame: Frame, path: string[]) => {
+    if (ordered.length >= MAX_FRAMES_PER_OBSERVATION) return;
+    const id = stableFrameId(page, frame);
+    ordered.push({ frame, id, path: [...path, id] });
+    const selected = await domChildren(frame);
+    truncated ||= selected.truncated;
+    const selectedSet = new Set(selected.frames);
+    const fallback = selected.truncated ? [] : frame.childFrames().filter((child) => !selectedSet.has(child))
+      .sort((left, right) => left.name().localeCompare(right.name()) || left.url().localeCompare(right.url()));
+    const remainingCandidates = Math.max(0, MAX_FRAME_CANDIDATE_SCAN - selected.frames.length);
+    if (fallback.length > remainingCandidates) truncated = true;
+    const candidates = [...selected.frames, ...fallback.slice(0, remainingCandidates)];
+    if (candidates.length > Math.max(0, MAX_FRAMES_PER_OBSERVATION - ordered.length)) truncated = true;
+    for (const child of candidates) {
+      if (ordered.length >= MAX_FRAMES_PER_OBSERVATION) break;
+      await visit(child, [...path, id]);
+    }
+  };
+  await visit(page.mainFrame(), []);
+  return { entries: ordered, truncated };
+}
+
+async function frameTransform(frame: Frame): Promise<{ x: number; y: number; scaleX: number; scaleY: number }> {
+  if (!frame.parentFrame()) return { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+  const element = await frame.frameElement();
+  try {
+    const [box, metrics] = await Promise.all([
+      element.boundingBox(),
+      element.evaluate((node) => {
+        const html = node as HTMLElement;
+        return { clientLeft: html.clientLeft, clientTop: html.clientTop, offsetWidth: html.offsetWidth, offsetHeight: html.offsetHeight };
+      }),
+    ]);
+    if (!box || metrics.offsetWidth <= 0 || metrics.offsetHeight <= 0)
+      throw new Error("frame element has no stable box");
+    const scaleX = box.width / metrics.offsetWidth, scaleY = box.height / metrics.offsetHeight;
+    return { x: box.x + metrics.clientLeft * scaleX, y: box.y + metrics.clientTop * scaleY, scaleX, scaleY };
+  } finally {
+    await element.dispose();
+  }
+}
+
+async function frameChainObscured(frame: Frame): Promise<boolean> {
+  let child = frame;
+  while (child.parentFrame()) {
+    const element = await child.frameElement();
+    try {
+      const obscured = await element.evaluate((node) => {
+        const rect = (node as Element).getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return Boolean(hit && hit !== node && !node.contains(hit) && !hit.contains(node));
+      });
+      if (obscured) return true;
+    } finally {
+      await element.dispose();
+    }
+    child = child.parentFrame()!;
+  }
+  return false;
+}
+
+async function targetObscuredAcrossFrames(frame: Frame, localPoint: { x: number; y: number }): Promise<boolean> {
+  let child = frame, point = localPoint;
+  while (child.parentFrame()) {
+    point = projectPoint(await frameContentMatrix(child), point);
+    const element = await child.frameElement();
+    try {
+      const obscured = await element.evaluate((node, projected) => {
+        const hit = document.elementFromPoint(projected.x, projected.y);
+        return Boolean(hit && hit !== node && !node.contains(hit) && !hit.contains(node));
+      }, point);
+      if (obscured) return true;
+    } finally { await element.dispose(); }
+    child = child.parentFrame()!;
+  }
+  return false;
+}
+
+export async function collectPageState(
+  page: Page,
+  options: CollectPageStateOptions = {}
+): Promise<PagePerception> {
+  // Protocol v1 deliberately keeps its original top-document R# contract.
+  if (options.legacyRefs) return collectLegacyPageState(page, options);
+  const full = options.full ?? false;
+  const maxDepth = bounded(options.depth, DEFAULTS.depth, 50);
+  const breadth = bounded(options.breadth, DEFAULTS.breadth, 500);
+  const initialTop = await page.mainFrame().evaluate(collectRealm, { full, legacyRefs: false, maxRecords: MAX_RECORDS_PER_OBSERVATION, maxWork: MAX_WORK_PER_FRAME });
+  beginFrameGeneration(page, initialTop.realmToken);
+  const selectedFrames = await deterministicFrames(page);
+  const frames = selectedFrames.entries;
+  const warnings: string[] = ["Closed shadow roots cannot be inspected; observation covers light DOM and open shadow roots only"];
+  const registered: RegisteredFrame[] = [];
+  const records: PerceptionElement[] = [];
+  let top: Awaited<ReturnType<typeof collectRealm>> | undefined;
+  let collectionTruncated = selectedFrames.truncated;
+  for (const entry of frames) {
+    try {
+      const [raw, matrix, inheritedVisible] = await Promise.all([
+        entry.id === "F0" ? Promise.resolve(initialTop) : entry.frame.evaluate(collectRealm, { full, legacyRefs: false, maxRecords: Math.max(0, MAX_RECORDS_PER_OBSERVATION - records.length), maxWork: MAX_WORK_PER_FRAME }),
+        frameToTopMatrix(entry.frame),
+        frameAncestorsVisible(entry.frame),
+      ]);
+      if (entry.id === "F0") top = raw;
+      registered.push({ id: entry.id, frame: entry.frame, realmToken: raw.realmToken, path: entry.path, url: raw.url.slice(0, 500), name: entry.frame.name().slice(0, 100) });
+      collectionTruncated ||= raw.truncated;
+      for (const record of raw.records) {
+        if (records.length >= MAX_RECORDS_PER_OBSERVATION) { collectionTruncated = true; break; }
+        const ref = record.ref && entry.id !== "F0" ? `${entry.id}:${record.ref}` : record.ref;
+        const projected = projectRect(matrix, record.box);
+        const box = inheritedVisible ? projected.box : { x: 0, y: 0, width: 0, height: 0 };
+        const frameObscured = inheritedVisible && entry.id !== "F0" && record.actionable && record.visible
+          ? await targetObscuredAcrossFrames(entry.frame, { x: record.box.x + record.box.width / 2, y: record.box.y + record.box.height / 2 }) : false;
+        const topViewport = top?.viewport ?? page.viewportSize() ?? raw.viewport;
+        records.push({
+          ...record,
+          ref,
+          box,
+          quad: projected.quad,
+          visible: inheritedVisible && record.visible,
+          actionable: inheritedVisible && record.actionable,
+          obscured: record.obscured || frameObscured,
+          inViewport: inheritedVisible && record.visible && box.x + box.width >= 0 && box.y + box.height >= 0 && box.x <= topViewport.width && box.y <= topViewport.height,
+          frameId: entry.id,
+          framePath: entry.path,
+          frameUrl: raw.url.slice(0, 500),
+          frameName: entry.frame.name().slice(0, 100),
+          frameDocumentId: raw.realmToken.slice(0, 100),
+        });
+      }
+    } catch (error) {
+      if (entry.id === "F0") throw error;
+      warnings.push(`Frame ${entry.id} could not be inspected because it detached, navigated, or became inaccessible`);
+    }
+  }
+  if (!top) throw new AgentProtocolError("PAGE_CLOSED", "Top document could not be inspected", true);
+  if (selectedFrames.truncated)
+    warnings.push(`Frame candidate scan was truncated at ${MAX_FRAME_CANDIDATE_SCAN} direct children before inspection`);
+  registerFrames(page, top.realmToken, registered);
+  const maxNodes = bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000);
+  const maxChars = bounded(options.maxChars, DEFAULTS.maxChars, 100_000);
+  const offset = decodeCursor(options.continuation);
+  if (offset > records.length)
+    throw new AgentProtocolError("STALE_STATE", "Invalid or expired continuation cursor", true, { nextCommands: ["dev-browser observe"] });
+  const built = buildCompactTree(records, maxNodes, maxChars, offset, maxDepth, breadth);
+  const history = recordPageState(page, top.realmToken, options.track ?? "default", {
+    url: top.url, title: top.title,
+    focusedRef: records.find((record) => record.focused)?.ref || null,
+    elements: records,
+  }, options.delta ?? false);
+  const viewport = top.viewport;
+  const coordinate = await page.evaluate(() => ({ devicePixelRatio, scroll: { x: scrollX, y: scrollY } }));
+  return {
+    documentId: history.documentId, stateId: history.stateId, url: top.url, title: top.title,
+    coordinateSpace: { unit: "css-px", viewport, devicePixelRatio: coordinate.devicePixelRatio, scroll: coordinate.scroll, screenshotScale: "css" },
+    focusedRef: records.find((record) => record.focused)?.ref || null,
+    tree: built.tree, elements: built.elements, delta: history.delta, warnings: warnings.slice(0, 20),
+    truncation: { truncated: built.omittedNodes > 0 || collectionTruncated, omittedNodes: built.omittedNodes + (collectionTruncated ? 1 : 0), continuation: built.omittedNodes > 0 ? encodeCursor(offset + built.consumedNodes) : null },
   };
 }

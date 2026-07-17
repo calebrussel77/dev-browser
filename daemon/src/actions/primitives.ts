@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 
-import { attemptErrorReason, emptyWaitEvents, trustedInputError, unchangedAttempt, withAttemptJournal } from "../action-journal.js";
+import { attemptErrorReason, attemptFrameContext, emptyWaitEvents, recordAttempt, trustedInputError, unchangedAttempt, withAttemptJournal } from "../action-journal.js";
 import type { InteractiveRequest } from "../protocol.js";
 import type { AttemptJournalEntry } from "../retry-policy.js";
 import {
@@ -64,6 +64,9 @@ async function scrollUntil(page: Page, query: string, maxSteps: number, wheel: (
 export async function executePrimitive(context: PrimitiveContext): Promise<PrimitiveSummary> {
   const { page, action, resolve, authorize, timeoutMs } = context;
   const journal: AttemptJournalEntry[] = [];
+  let journalContext = attemptFrameContext(
+    action.kind === "drag" ? action.from : action.kind === "scroll" ? action.ref ?? null : action.ref
+  );
   const entry = (method: InputMethod, reason: string): AttemptJournalEntry => ({
     attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: method,
     sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop", reason,
@@ -73,10 +76,10 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     try {
       await authorize(refs);
       await input();
-      journal.push({ ...entry(method, "action-complete"), startedAt });
+      recordAttempt(journal, { ...entry(method, "action-complete"), startedAt }, journalContext);
     } catch (error) {
       const typed = trustedInputError(error, page);
-      journal.push({ ...entry(method, attemptErrorReason(typed)), startedAt });
+      recordAttempt(journal, { ...entry(method, attemptErrorReason(typed)), startedAt }, journalContext);
       throw withAttemptJournal(typed, journal);
     }
   };
@@ -99,6 +102,7 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     let targetMetadata: ActionTargetMetadata[] | undefined;
     if (action.ref) {
       const target = await resolve(action.ref);
+      journalContext = attemptFrameContext(action.ref, target);
       try {
         await dispatch("locator", [action.ref], () => target.locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }));
         targetMetadata = [actionTargetMetadata(target, "locator")];
@@ -128,10 +132,11 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
   } catch (error) {
     await Promise.allSettled(targets.map((target) => target.cleanup()));
     const typed = trustedInputError(error, page);
-    journal.push(entry(method, attemptErrorReason(typed)));
+    recordAttempt(journal, entry(method, attemptErrorReason(typed)), journalContext);
     throw withAttemptJournal(typed, journal);
   }
   const target = targets[0]!;
+  journalContext = attemptFrameContext(refs[0] ?? null, target);
   try {
     if (action.kind === "focus") {
       await dispatch("focus", refs, () => target.locator.focus({ timeout: timeoutMs }));

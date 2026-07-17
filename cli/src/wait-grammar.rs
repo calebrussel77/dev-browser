@@ -123,9 +123,26 @@ impl WaitArgs {
         }
         for item in &self.wait_ref {
             let parts: Vec<_> = item.splitn(4, ',').collect();
+            let reference = parts.first().copied().unwrap_or("");
+            let local = reference
+                .split_once(':')
+                .map_or(reference, |(frame, local)| {
+                    if frame.len() >= 2
+                        && frame.starts_with('F')
+                        && frame[1..]
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                    {
+                        local
+                    } else {
+                        ""
+                    }
+                });
             if parts.len() < 2
-                || !parts[0].starts_with('R')
-                || !parts[0][1..]
+                || reference.len() > 32
+                || local.len() < 2
+                || !local.starts_with('R')
+                || !local[1..]
                     .chars()
                     .all(|character| character.is_ascii_digit())
             {
@@ -271,6 +288,20 @@ mod tests {
         assert_eq!(wait["conditions"].as_array().unwrap().len(), 13);
         assert_eq!(wait["conditions"][0]["kind"], "text");
         assert_eq!(wait["conditions"][0]["match"], "contains");
+    }
+
+    #[test]
+    fn accepts_bounded_scoped_refs_and_rejects_oversized_wait_refs() {
+        let mut args = WaitArgs::default();
+        args.wait_ref.push("F12:R34,visible".into());
+        assert_eq!(
+            args.build_spec(None).unwrap().unwrap()["conditions"][0]["ref"],
+            "F12:R34"
+        );
+        args.wait_ref.clear();
+        args.wait_ref
+            .push(format!("F{}:R1,visible", "1".repeat(40)));
+        assert!(args.build_spec(None).is_err());
     }
 
     #[test]

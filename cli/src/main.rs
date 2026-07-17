@@ -25,6 +25,30 @@ use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wait_grammar::WaitArgs;
 
+fn parse_ref_id(value: &str) -> Result<String, String> {
+    if value.len() > 32 {
+        return Err("ref must be at most 32 characters".into());
+    }
+    let local = if let Some((frame, local)) = value.split_once(':') {
+        if !frame.starts_with('F')
+            || frame.len() < 2
+            || !frame[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Err("ref must match R# or F#:R#".into());
+        }
+        local
+    } else {
+        value
+    };
+    if !local.starts_with('R')
+        || local.len() < 2
+        || !local[1..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("ref must match R# or F#:R#".into());
+    }
+    Ok(value.to_owned())
+}
+
 const CLI_LONG_ABOUT: &str = r###"Dev Browser is a CLI for controlling local or external browsers with JavaScript scripts.
 Scripts run in a sandboxed QuickJS runtime (not Node.js). Top-level `await` is
 available, along with a preconnected `browser` global and standard `console` output.
@@ -483,6 +507,7 @@ enum Command {
         #[arg(
             long = "ref",
             value_name = "REF",
+            value_parser = parse_ref_id,
             conflicts_with = "xy",
             required_unless_present = "xy"
         )]
@@ -512,7 +537,7 @@ enum Command {
     Type {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_name = "REF")]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
         #[arg(long, value_name = "TEXT")]
         text: String,
@@ -526,7 +551,7 @@ enum Command {
     Focus {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[command(flatten)]
         wait: WaitArgs,
@@ -534,7 +559,7 @@ enum Command {
     Press {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[arg(long)]
         key: String,
@@ -544,7 +569,7 @@ enum Command {
     Paste {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[arg(long, required = true, conflicts_with_all = ["shot", "annotate"])]
         text_stdin: bool,
@@ -554,7 +579,7 @@ enum Command {
     Scroll {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
         ref_id: Option<String>,
         #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
         delta_y: Option<f64>,
@@ -574,7 +599,7 @@ enum Command {
     Select {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[arg(long, conflicts_with = "label", required_unless_present = "label")]
         value: Option<String>,
@@ -586,7 +611,7 @@ enum Command {
     Check {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[command(flatten)]
         wait: WaitArgs,
@@ -594,7 +619,7 @@ enum Command {
     Uncheck {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[command(flatten)]
         wait: WaitArgs,
@@ -602,7 +627,7 @@ enum Command {
     Hover {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref")]
+        #[arg(long = "ref", value_parser = parse_ref_id)]
         ref_id: String,
         #[command(flatten)]
         wait: WaitArgs,
@@ -610,9 +635,9 @@ enum Command {
     Drag {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_ref_id)]
         from: String,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_ref_id)]
         to: String,
         #[command(flatten)]
         wait: WaitArgs,
@@ -620,7 +645,7 @@ enum Command {
     Upload {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_name = "REF", required = true)]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id, required = true)]
         ref_id: String,
         #[arg(long, value_name = "TEMP_FILE", required = true)]
         file: String,
@@ -646,7 +671,7 @@ enum Command {
         target: PageTargetArgs,
         #[arg(value_name = "FILE", default_value = "auto")]
         file: String,
-        #[arg(long = "ref", value_name = "REF")]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
         #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(0..=1000))]
         padding: u16,
@@ -1691,6 +1716,23 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["dev-browser", "upload", "--ref", "R1"]).is_err());
         assert!(Cli::try_parse_from(["dev-browser", "upload", "--file", "fixture.txt"]).is_err());
+    }
+
+    #[test]
+    fn preserves_scoped_frame_refs_for_interactive_commands() {
+        let cli = Cli::try_parse_from(["dev-browser", "click", "--ref", "F12:R34"])
+            .expect("scoped frame ref should parse");
+        match cli.command {
+            Some(Command::Click { ref_id, .. }) => assert_eq!(ref_id.as_deref(), Some("F12:R34")),
+            _ => panic!("expected click command"),
+        }
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            &format!("F{}:R1", "1".repeat(40))
+        ])
+        .is_err());
     }
 
     #[test]
