@@ -312,6 +312,21 @@ describe("interactive request protocol", () => {
     });
   });
 
+  it("parses structured find filters and rejects empty or invalid combinations", () => {
+    const structured = parseRequest(JSON.stringify({
+      id: "structured-find", type: "interactive", protocolVersion: 2,
+      action: { kind: "find", role: "button", name: "Connect", nameMode: "exact", within: "main", near: "Profile", frame: "F0", scope: "document", states: ["enabled", "collapsed"], index: 0, limit: 5 },
+    }));
+    expect(structured).toMatchObject({ success: true, request: { action: { kind: "find", scope: "document", states: ["enabled", "collapsed"] } } });
+    for (const action of [
+      { kind: "find" },
+      { kind: "find", nameMode: "contains" },
+      { kind: "find", query: "Connect", scope: "everywhere" },
+      { kind: "find", query: "Connect", states: ["unknown"] },
+      { kind: "find", query: "Connect", index: -1 },
+    ]) expect(parseRequest(JSON.stringify({ id: "bad-find", type: "interactive", action }))).toMatchObject({ success: false });
+  });
+
   it("parses annotation and full-page artifact options", () => {
     const result = parseRequest(
       JSON.stringify({

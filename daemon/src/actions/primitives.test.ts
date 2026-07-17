@@ -194,7 +194,16 @@ describe.sequential("trusted interaction primitives", () => {
       authorize: async () => {},
       resolve: async (requested) => {
         if (requested === "R2") throw new Error("target resolution failed");
-        return { locator: page.locator("body"), cleanup: async () => { cleaned += 1; } };
+        return {
+          locator: page.locator("body"),
+          originalRef: requested,
+          actualRef: requested,
+          resolvedBy: "self",
+          box: { x: 0, y: 0, width: 1, height: 1 },
+          scroll: { scrolled: false, before: { x: 0, y: 0 }, after: { x: 0, y: 0 } },
+          actual: { role: "", name: "", tag: "body" },
+          cleanup: async () => { cleaned += 1; },
+        };
       },
     })).rejects.toThrow("target resolution failed");
     expect(cleaned).toBe(1);
@@ -230,5 +239,52 @@ describe.sequential("trusted interaction primitives", () => {
       expect(JSON.stringify(failure)).not.toContain("SECOND_DISPATCH_SECRET");
       expect(await page.locator('[aria-label="Field"]').inputValue()).toBe("");
     } finally { if (lease) pageLeases.close(lease.sessionId); }
+  });
+
+  it("rejects stale primitive refs before actionability can scroll the page", async () => {
+    const page = await manager.getPage(browser, "main");
+    await page.setViewportSize({ width: 800, height: 400 });
+    await page.setContent(
+      `<div style="height:1200px"></div><button aria-label="Offscreen action">Act</button>`
+    );
+    const target = await ref("Offscreen action");
+    await page.locator("button").evaluate((element) =>
+      element.setAttribute("aria-label", "Changed action")
+    );
+
+    await expect(
+      run({
+        kind: "hover",
+        ref: target.ref,
+        fromState: target.stateId,
+        strictState: true,
+      })
+    ).rejects.toMatchObject({ code: "STALE_STATE" });
+    expect(await page.evaluate(() => scrollY)).toBe(0);
+  });
+
+  it("reports ancestor fallback metadata and uses the actual ref for a primitive", async () => {
+    const page = await manager.getPage(browser, "main");
+    await page.setContent(
+      `<button aria-label="Ancestor action"><span role="button" aria-label="Child action" style="display:contents">Child</span></button>`
+    );
+    const read = await run({ kind: "read", limit: 100, depth: 12 });
+    const ancestor = read.elements!.find((element) => element.name === "Ancestor action")!;
+    const child = read.elements!.find((element) => element.name === "Child action")!;
+
+    const hovered = await run({ kind: "hover", ref: child.ref, fromState: read.stateId });
+
+    expect(hovered.hovered).toEqual({ ref: ancestor.ref });
+    expect(hovered.targets).toEqual([
+      expect.objectContaining({
+        originalRef: child.ref,
+        actualRef: ancestor.ref,
+        resolvedBy: "ancestor",
+        method: "hover",
+        actual: { role: "button", name: "Ancestor action", tag: "button" },
+        box: expect.any(Object),
+        scroll: expect.objectContaining({ scrolled: expect.any(Boolean) }),
+      }),
+    ]);
   });
 });

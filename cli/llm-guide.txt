@@ -23,7 +23,7 @@ LLM USAGE GUIDE:
   Prefer the interactive perception-action loop for consequential UI work:
     dev-browser --connect pages
     dev-browser --connect read --page TARGET_ID --shot before.png
-    dev-browser --connect find "connect button main profile card" --page TARGET_ID
+    dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
     dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
     dev-browser --connect confirm --page TARGET_ID --expect "Naminsita Bakayoko" --shot confirm.png
     dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
@@ -31,9 +31,13 @@ LLM USAGE GUIDE:
 
     `read` returns the accessibility snapshot plus stable refs with role, name,
     visibility, viewport coordinates, and main/aside/dialog landmark paths.
-    `find` takes a fresh snapshot on every call and ranks duplicate labels using
-    landmarks. `click` and `type` automatically return the refreshed snapshot,
-    refs, and coordinates. `click` reports URL/snapshot/dialog/aria-expanded
+    `find` takes a fresh snapshot on every call. It keeps the natural query form
+    and also accepts combinable role/name/within/near/frame/scope/state filters;
+    use index only as an explicit last resort. Matches report exact reasons,
+    confidence, score gap, ambiguity, duplicate-disambiguating context, and
+    actionability state. `click` and `type` automatically return the refreshed
+    snapshot, refs, and coordinates. Ref actions share bounded visibility,
+    stability, enabled-state, scrolling, and obstruction checks. `click` reports URL/snapshot/dialog/aria-expanded
     changes. `--wait-for TEXT` polls after clicking and retries exactly once only
     if the first click caused no observable change; it never retries a guarded
     `--expect-text` click. Link refs fall back to an interactive button descendant

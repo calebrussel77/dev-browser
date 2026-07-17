@@ -84,7 +84,7 @@ describe.sequential("wait engine reliability regressions", () => {
             })
           ),
       },
-      { mode: "all", timeoutMs: 1_000, conditions: [{ kind: "popup" }] },
+      { mode: "all", timeoutMs: 10_000, conditions: [{ kind: "popup" }] },
       () =>
         (page as typeof page & { emit(event: string, value: unknown): void }).emit("popup", {
           url: () => "https://example.test/popup",
@@ -92,7 +92,9 @@ describe.sequential("wait engine reliability regressions", () => {
     );
     expect(result.waitResult.events.popup[0]).toMatchObject({ warning: expect.any(String) });
     expect(aborted).toBe(true);
-    expect(Date.now() - started).toBeLessThan(750);
+    // This must be bounded by the popup metadata deadline, not the outer wait.
+    // Keep bounded scheduler headroom while still detecting a large deadline regression.
+    expect(Date.now() - started).toBeLessThan(1_500);
   });
 
   it("bounds huge observations and includes event evidence in timeout details", async () => {

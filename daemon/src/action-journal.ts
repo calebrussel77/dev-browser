@@ -34,7 +34,7 @@ export function attemptErrorReason(error: AgentProtocolError): string {
   if (error.code === "LEASE_CONFLICT") return "lease-conflict";
   if (error.code === "STALE_REF" || error.code === "STALE_STATE") return "state-revalidation-failed";
   if (error.code === "PAGE_CLOSED") return "page-closed";
-  if (error.code === "TARGET_DISABLED" || error.code === "TARGET_HIDDEN" || error.code === "TARGET_MISSING") return "target-not-actionable";
+  if (error.code === "TARGET_DISABLED" || error.code === "TARGET_HIDDEN" || error.code === "TARGET_MISSING" || error.code === "TARGET_OBSCURED") return "target-not-actionable";
   return "trusted-input-error";
 }
 

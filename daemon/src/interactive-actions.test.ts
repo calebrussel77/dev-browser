@@ -680,13 +680,36 @@ describe.sequential("interactive Playwright actions", () => {
     const link = elements(read).find(
       (element) => element.role === "link" && element.name.includes("Wrapped action")
     );
+    const button = elements(read).find(
+      (element) => element.role === "button" && element.name === "Wrapped action"
+    );
 
     const result = await executeInteractiveAction(
       manager,
       request({ kind: "click", ref: link!.ref, method: "mouse" })
     );
 
-    expect(result.clicked?.resolvedBy).toBe("descendant");
+    expect(result.clicked).toMatchObject({
+      ref: button!.ref,
+      actualRef: button!.ref,
+      originalRef: link!.ref,
+      resolvedBy: "descendant",
+      method: "mouse",
+      actual: { role: "button", name: "Wrapped action", tag: "button" },
+      scroll: { scrolled: expect.any(Boolean) },
+      box: expect.any(Object),
+    });
+    expect(result.targets).toEqual([
+      expect.objectContaining({
+        originalRef: link!.ref,
+        actualRef: button!.ref,
+        resolvedBy: "descendant",
+        method: "mouse",
+        actual: { role: "button", name: "Wrapped action", tag: "button" },
+        box: expect.any(Object),
+        scroll: expect.objectContaining({ scrolled: expect.any(Boolean) }),
+      }),
+    ]);
     const page = await manager.getPage(browserName, "profile");
     await expect(
       page.evaluate(() => (window as unknown as { __wrappedTrusted: boolean }).__wrappedTrusted)
@@ -738,13 +761,26 @@ describe.sequential("interactive Playwright actions", () => {
     );
     const note = elements(read).find((element) => element.name === "Invitation note");
 
-    await executeInteractiveAction(
+    const result = await executeInteractiveAction(
       manager,
       request({ kind: "type", ref: note!.ref, text: "Hello Naminsita", clear: true, delayMs: 0 })
     );
 
     const page = await manager.getPage(browserName, "profile");
     await expect(page.locator("#note").textContent()).resolves.toBe("Hello Naminsita");
+    expect(result.typed).toMatchObject({
+      ref: note!.ref,
+      actualRef: note!.ref,
+      originalRef: note!.ref,
+      resolvedBy: "self",
+      method: "keyboard",
+      box: expect.any(Object),
+      scroll: { scrolled: expect.any(Boolean) },
+    });
+    expect(result.targets).toEqual([
+      expect.objectContaining({ actualRef: note!.ref, method: "keyboard" }),
+    ]);
+    expect(result.attemptJournal).toHaveLength(4);
   });
 
   it("writes a screenshot and returns its absolute path", async () => {
@@ -810,10 +846,15 @@ describe.sequential("interactive Playwright actions", () => {
       manager,
       request({ kind: "read", limit: 100, depth: 12 })
     );
-    const connect = elements(read).find((element) => element.name === "Connect")!;
+    const link = elements(read).find(
+      (element) => element.role === "link" && element.name.includes("Wrapped action")
+    )!;
+    const button = elements(read).find(
+      (element) => element.role === "button" && element.name === "Wrapped action"
+    )!;
     const result = await executeInteractiveAction(
       manager,
-      request({ kind: "shot", ref: connect.ref, padding: 8 }, { shot: "auto" })
+      request({ kind: "shot", ref: link.ref, padding: 8 }, { shot: "auto" })
     );
 
     expect(result.artifacts?.screenshot).toMatchObject({
@@ -823,6 +864,16 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.artifacts!.screenshot!.width).toBeLessThan(
       result.artifacts!.screenshot!.coordinateSpace.viewport.width
     );
+    expect(result.targets).toEqual([
+      expect.objectContaining({
+        originalRef: link.ref,
+        actualRef: button.ref,
+        resolvedBy: "descendant",
+        method: "screenshot",
+        box: expect.any(Object),
+        scroll: expect.objectContaining({ scrolled: expect.any(Boolean) }),
+      }),
+    ]);
     await rm(result.screenshotPath!, { force: true });
   });
 
@@ -1160,9 +1211,10 @@ describe.sequential("interactive Playwright actions", () => {
         )
       )
     ).rejects.toMatchObject({
-      code: "RENDERER_UNRESPONSIVE",
+      code: "TARGET_OBSCURED",
       details: {
-        attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "trusted-input-error" }],
+        obstruction: { tag: "div", box: expect.any(Object) },
+        attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "target-not-actionable" }],
       },
     });
 
@@ -1188,5 +1240,86 @@ describe.sequential("interactive Playwright actions", () => {
         attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "page-closed" }],
       },
     });
+  });
+
+  it("revalidates type after every input hook and blocks replacement before keyboard input", async () => {
+    const targetPage = "type-final-validation";
+    const page = await manager.getPage(browserName, targetPage);
+    await page.setContent(`<input id="field" aria-label="Replaceable field">`);
+    const read = await executeInteractiveAction(manager, {
+      ...request({ kind: "read", limit: 100, depth: 12 }),
+      protocolVersion: 2,
+      page: targetPage,
+    });
+    const field = elements(read).find((element) => element.name === "Replaceable field")!;
+    let hooks = 0;
+    let failure: unknown;
+    try {
+      await executeInteractiveAction(
+        manager,
+        {
+          ...request({
+            kind: "type",
+            ref: field.ref,
+            text: "SENSITIVE_REPLACEMENT_TEXT",
+            clear: false,
+            delayMs: 0,
+            fromState: read.stateId,
+          }),
+          protocolVersion: 2,
+          page: targetPage,
+        },
+        {
+          beforeTrustedInput: () => {
+            hooks += 1;
+            if (hooks === 2) {
+              return page.locator("#field").evaluate((element) =>
+                element.replaceWith(element.cloneNode(true))
+              );
+            }
+          },
+        }
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "STALE_REF",
+      details: {
+        attemptJournal: [
+          { inputMethod: "mouse", reason: "action-complete" },
+          { inputMethod: "keyboard", reason: "state-revalidation-failed" },
+        ],
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain("SENSITIVE_REPLACEMENT_TEXT");
+    expect(await page.locator("#field").inputValue()).toBe("");
+  });
+
+  it("blocks typing when the target center is obstructed", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.setContent(
+      `<input aria-label="Secret field"><div role="dialog" aria-label="Blocking dialog" style="position:fixed;inset:0;z-index:9"></div>`
+    );
+    const read = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
+    const field = elements(read).find((element) => element.name === "Secret field");
+
+    await expect(
+      executeInteractiveAction(
+        manager,
+        request({
+          kind: "type",
+          ref: field!.ref,
+          text: "must-not-type",
+          clear: false,
+          delayMs: 0,
+        })
+      )
+    ).rejects.toMatchObject({ code: "TARGET_OBSCURED" });
+    expect(await page.locator("input").inputValue()).toBe("");
   });
 });

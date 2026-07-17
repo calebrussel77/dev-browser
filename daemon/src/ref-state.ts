@@ -3,6 +3,7 @@ import type { Page } from "playwright";
 import { AgentProtocolError } from "./agent-protocol.js";
 import { getRecordedState, recordedStatesEqual, semanticFingerprint } from "./page-state.js";
 import type { PagePerception } from "./perception/collector.js";
+import { observeRecoveryCommand } from "./recovery-command.js";
 
 export interface StateGuard { fromState?: string; strictState?: boolean }
 
@@ -11,7 +12,7 @@ function stale(pageName: string, code: "STALE_REF" | "STALE_STATE", message: str
     details: {
       latest: { documentId: latest.documentId, stateId: latest.stateId, url: latest.url, title: latest.title },
     },
-    nextCommands: [`dev-browser observe --page ${pageName} --delta`],
+    nextCommands: [observeRecoveryCommand(pageName)],
   });
 }
 

@@ -277,6 +277,58 @@ enum ScrollDirection {
     Left,
     Right,
 }
+
+#[derive(Clone, Copy, ValueEnum)]
+enum NameMode {
+    Exact,
+    Contains,
+}
+impl NameMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Contains => "contains",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum FindScope {
+    Visible,
+    Viewport,
+    Document,
+}
+impl FindScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Viewport => "viewport",
+            Self::Document => "document",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum FindState {
+    Enabled,
+    Disabled,
+    Checked,
+    Unchecked,
+    Expanded,
+    Collapsed,
+    Selected,
+}
+impl FindState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Checked => "checked",
+            Self::Unchecked => "unchecked",
+            Self::Expanded => "expanded",
+            Self::Collapsed => "collapsed",
+            Self::Selected => "selected",
+        }
+    }
+}
 impl ScrollDirection {
     fn as_str(self) -> &'static str {
         match self {
@@ -376,11 +428,30 @@ enum Command {
         about = "Find interactive refs by accessible name, role, and landmark",
         long_about = "Take a fresh accessibility snapshot, then rank visible interactive elements against a natural-language query. Names, roles, and landmarks such as main.profile-card or aside are scored separately so duplicate labels can be disambiguated."
     )]
+    #[command(group(clap::ArgGroup::new("find_target").required(true).multiple(true)))]
     Find {
-        #[arg(value_name = "QUERY")]
-        query: String,
+        #[arg(value_name = "QUERY", group = "find_target")]
+        query: Option<String>,
         #[command(flatten)]
         output: PageActionArgs,
+        #[arg(long, group = "find_target")]
+        role: Option<String>,
+        #[arg(long, group = "find_target")]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value = "exact", requires = "name")]
+        name_mode: NameMode,
+        #[arg(long, group = "find_target")]
+        within: Option<String>,
+        #[arg(long, group = "find_target")]
+        near: Option<String>,
+        #[arg(long, group = "find_target")]
+        frame: Option<String>,
+        #[arg(long, value_enum, default_value = "visible")]
+        scope: FindScope,
+        #[arg(long = "state", value_enum, action = clap::ArgAction::Append, group = "find_target")]
+        states: Vec<FindState>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=999))]
+        index: Option<u16>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
     },
@@ -703,12 +774,35 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Find {
             query,
             output,
+            role,
+            name,
+            name_mode,
+            within,
+            near,
+            frame,
+            scope,
+            states,
+            index,
             limit,
-        }) => run_page_action(
-            &cli,
-            output,
-            json!({ "kind": "find", "query": query, "limit": limit }),
-        ),
+        }) => {
+            let action = build_find_action(
+                query.as_deref(),
+                role.as_deref(),
+                name.as_deref(),
+                name_mode.as_str(),
+                within.as_deref(),
+                near.as_deref(),
+                frame.as_deref(),
+                scope.as_str(),
+                &states
+                    .iter()
+                    .map(|state| state.as_str())
+                    .collect::<Vec<_>>(),
+                *index,
+                *limit,
+            );
+            run_page_action(&cli, output, action)
+        }
         Some(Command::Click {
             output,
             ref_id,
@@ -1095,6 +1189,46 @@ fn apply_wait(action: &mut Value, wait: &WaitArgs) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_find_action(
+    query: Option<&str>,
+    role: Option<&str>,
+    name: Option<&str>,
+    name_mode: &str,
+    within: Option<&str>,
+    near: Option<&str>,
+    frame: Option<&str>,
+    scope: &str,
+    states: &[&str],
+    index: Option<u16>,
+    limit: u8,
+) -> Value {
+    let mut action = json!({ "kind": "find", "scope": scope, "states": states, "limit": limit });
+    if let Some(value) = query {
+        action["query"] = json!(value);
+    }
+    if let Some(value) = role {
+        action["role"] = json!(value);
+    }
+    if let Some(value) = name {
+        action["name"] = json!(value);
+        action["nameMode"] = json!(name_mode);
+    }
+    if let Some(value) = within {
+        action["within"] = json!(value);
+    }
+    if let Some(value) = near {
+        action["near"] = json!(value);
+    }
+    if let Some(value) = frame {
+        action["frame"] = json!(value);
+    }
+    if let Some(value) = index {
+        action["index"] = json!(value);
+    }
+    action
+}
+
 fn run_interactive(
     cli: &Cli,
     page: &str,
@@ -1365,8 +1499,9 @@ fn format_duration_ms(duration_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_retry_policy, build_execute_request, build_primitive_action, cli_error_exit_code,
-        read_text_stream, stream_responses, Cli, Command, ResultMode, SessionCommand,
+        apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
+        cli_error_exit_code, read_text_stream, stream_responses, Cli, Command, ResultMode,
+        SessionCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1836,5 +1971,67 @@ mod tests {
             json!({ "kind": "paste", "ref": "R7", "text": "secret\nwith newline" })
         );
         assert_eq!(stdin.position(), 19);
+    }
+
+    #[test]
+    fn parses_and_serializes_every_structured_find_filter() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--role",
+            "button",
+            "--name",
+            "Connect",
+            "--name-mode",
+            "contains",
+            "--within",
+            "main",
+            "--near",
+            "Profile",
+            "--frame",
+            "F0",
+            "--scope",
+            "document",
+            "--state",
+            "enabled",
+            "--state",
+            "collapsed",
+            "--index",
+            "1",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Find { ref role, ref name, ref states, index: Some(1), .. }) if role.as_deref() == Some("button") && name.as_deref() == Some("Connect") && states.len() == 2)
+        );
+        let action = build_find_action(
+            None,
+            Some("button"),
+            Some("Connect"),
+            "contains",
+            Some("main"),
+            Some("Profile"),
+            Some("F0"),
+            "document",
+            &["enabled", "collapsed"],
+            Some(1),
+            5,
+        );
+        assert_eq!(
+            action,
+            json!({ "kind": "find", "role": "button", "name": "Connect", "nameMode": "contains", "within": "main", "near": "Profile", "frame": "F0", "scope": "document", "states": ["enabled", "collapsed"], "index": 1, "limit": 5 })
+        );
+        assert!(Cli::try_parse_from(["dev-browser", "find"]).is_err());
+        assert!(Cli::try_parse_from(["dev-browser", "find", "--name-mode", "contains"]).is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--role",
+            "button",
+            "--index",
+            "1000"
+        ])
+        .is_err());
     }
 }

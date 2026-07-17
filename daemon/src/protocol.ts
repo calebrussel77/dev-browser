@@ -220,6 +220,26 @@ const ObserveOptionsSchema = z.object({
     .optional(),
 });
 
+const StructuredFindSchema = z.object({
+  kind: z.literal("find"),
+  query: z.string().min(1).max(2_000).optional(),
+  role: z.string().min(1).max(100).optional(),
+  name: z.string().min(1).max(2_000).optional(),
+  nameMode: z.enum(["exact", "contains"]).default("exact"),
+  within: z.string().min(1).max(500).optional(),
+  near: z.string().min(1).max(2_000).optional(),
+  frame: z.string().min(1).max(200).optional(),
+  scope: z.enum(["visible", "viewport", "document"]).default("visible"),
+  states: z.array(z.enum(["enabled", "disabled", "checked", "unchecked", "expanded", "collapsed", "selected"])).max(7).default([]),
+  index: z.number().int().nonnegative().max(999).optional(),
+  limit: z.number().int().positive().max(50).default(10),
+}).superRefine((value, context) => {
+  if (!value.query && !value.role && !value.name && !value.within && !value.near && !value.frame && value.states.length === 0)
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "find requires a query or structured filter" });
+  if (!value.name && value.nameMode !== "exact")
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["nameMode"], message: "nameMode requires name" });
+});
+
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
   WaitableActionSchema.extend({
@@ -232,11 +252,7 @@ const InteractiveActionSchema = z.union([
     limit: z.number().int().positive().max(500).default(100),
     depth: z.number().int().positive().max(50).default(12),
   }),
-  z.object({
-    kind: z.literal("find"),
-    query: z.string().min(1),
-    limit: z.number().int().positive().max(50).default(10),
-  }),
+  StructuredFindSchema,
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
   RefPrimitiveSchema.extend({ kind: z.literal("focus") }),
@@ -391,10 +407,12 @@ export type SessionRequest = z.infer<typeof SessionRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
-    ? Omit<Action, "strictState" | "padding"> & { strictState?: boolean } & (Action extends {
+    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states"> & { strictState?: boolean } & (Action extends {
           kind: "shot";
         }
           ? { padding?: number }
+          : unknown) & (Action extends { kind: "find" }
+          ? { scope?: "visible" | "viewport" | "document"; nameMode?: "exact" | "contains"; states?: ("enabled" | "disabled" | "checked" | "unchecked" | "expanded" | "collapsed" | "selected")[] }
           : unknown)
     : never
   : never;

@@ -1,7 +1,22 @@
 import type { Page } from "playwright";
 
+import {
+  actionTargetMetadata,
+  resolveActionTarget,
+  type ActionTargetMetadata,
+  type ActionTargetOptions,
+  type ResolvedActionTarget,
+} from "./actionability.js";
 import { AgentProtocolError } from "./agent-protocol.js";
-import { attemptErrorReason, boundedWaitEvents, emptyWaitEvents, mergeWaitEvents, trustedInputError as attemptError, withAttemptJournal } from "./action-journal.js";
+import {
+  attemptErrorReason,
+  boundedWaitEvents,
+  emptyWaitEvents,
+  mergeWaitEvents,
+  trustedInputError as attemptError,
+  unchangedAttempt,
+  withAttemptJournal,
+} from "./action-journal.js";
 import { executePrimitive, type PrimitiveSummary } from "./actions/primitives.js";
 import { BrowserManager } from "./browser-manager.js";
 import {
@@ -20,6 +35,7 @@ import {
   type RetryPolicy,
 } from "./retry-policy.js";
 import { pageLeases } from "./sessions.js";
+import { findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
   capturedWaitEvents,
@@ -30,9 +46,7 @@ import {
 
 export type InteractiveElement = PerceptionElement;
 
-export interface InteractiveMatch extends InteractiveElement {
-  score: number;
-}
+export type InteractiveMatch = TargetMatch;
 
 export interface InteractiveResult {
   action: InteractiveRequest["action"]["kind"];
@@ -43,6 +57,7 @@ export interface InteractiveResult {
   snapshot?: string;
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
+  ambiguity?: TargetAmbiguity;
   documentId?: string;
   stateId?: string;
   tree?: string;
@@ -52,14 +67,24 @@ export interface InteractiveResult {
   truncation?: PagePerception["truncation"];
   clicked?: {
     ref: string | null;
+    actualRef?: string | null;
+    originalRef?: string | null;
     method: "mouse" | "locator";
     point: { x: number; y: number };
     resolvedBy?: "self" | "descendant" | "ancestor";
+    actual?: { role: string; name: string; tag: string };
+    box?: { x: number; y: number; width: number; height: number };
+    scroll?: {
+      scrolled: boolean;
+      before: { x: number; y: number };
+      after: { x: number; y: number };
+    };
   };
   typed?: {
     ref: string | null;
     characters: number;
-  };
+  } & Partial<ActionTargetMetadata>;
+  targets?: ActionTargetMetadata[];
   confirmation?: {
     confirmed: boolean;
     expected: string | null;
@@ -107,22 +132,7 @@ const DEFAULT_READ_LIMIT = 100;
 const DEFAULT_FIND_LIMIT = 10;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
 const MAX_ERROR_CONTEXT_LENGTH = 500;
-const REF_PATTERN = /^R\d+$/;
 const CLICK_SETTLE_MS = 100;
-const STOP_WORDS = new Set([
-  "a",
-  "au",
-  "aux",
-  "dans",
-  "de",
-  "des",
-  "du",
-  "le",
-  "la",
-  "les",
-  "of",
-  "the",
-]);
 
 function summarizeErrorContext(value: string): string {
   if (value.length <= MAX_ERROR_CONTEXT_LENGTH) return value;
@@ -138,133 +148,14 @@ function normalizeText(value: string): string {
     .trim();
 }
 
-function queryTokens(query: string): string[] {
-  return normalizeText(query)
-    .split(" ")
-    .filter((token) => token.length > 0 && !STOP_WORDS.has(token));
-}
-
-function scoreElement(element: InteractiveElement, query: string): number {
-  if (!element.visible) {
-    return -1;
-  }
-
-  const normalizedQuery = normalizeText(query);
-  const name = normalizeText(element.name);
-  const role = normalizeText(element.role);
-  const landmark = normalizeText(element.landmark);
-  let score = 0;
-
-  if (name === normalizedQuery) {
-    score += 100;
-  } else if (name.length > 0 && normalizedQuery.includes(name)) {
-    score += 40;
-  }
-
-  for (const token of queryTokens(query)) {
-    if (name.split(" ").includes(token)) {
-      score += 12;
-    } else if (name.includes(token)) {
-      score += 8;
-    }
-    if (role.includes(token)) {
-      score += 5;
-    }
-    if (landmark.includes(token)) {
-      score += 9;
-    }
-  }
-
-  return score;
-}
-
-async function resolveRef(page: Page, ref: string) {
-  if (!REF_PATTERN.test(ref)) {
-    throw new Error(`Invalid element ref "${ref}"`);
-  }
-
-  let selector = `[data-dev-browser-ref="${ref}"]`;
-  let temporary = false;
-  let original = page.locator(selector).first();
-  if ((await original.count()) === 0) {
-    temporary = await page.evaluate((requestedRef) => {
-      const state = (
-        window as Window & {
-          __devBrowserPerceptionState?: { refs: WeakMap<Element, string> };
-        }
-      ).__devBrowserPerceptionState;
-      if (!state) return false;
-      const element = Array.from(document.querySelectorAll("*")).find(
-        (candidate) => state.refs.get(candidate) === requestedRef
-      );
-      if (!element) return false;
-      element.setAttribute("data-dev-browser-action-ref", requestedRef);
-      return true;
-    }, ref);
-    if (temporary) {
-      selector = `[data-dev-browser-action-ref="${ref}"]`;
-      original = page.locator(selector).first();
-    }
-  }
-  if ((await original.count()) === 0) {
-    const boundedRef = summarizeErrorContext(ref);
-    throw new AgentProtocolError(
-      "STALE_REF",
-      `Element ref "${boundedRef}" is stale or missing; run read again`,
-      true,
-      { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
-    );
-  }
-  const cleanup = async () => {
-    if (temporary) {
-      await page
-        .locator(selector)
-        .evaluateAll((elements) =>
-          elements.forEach((element) => element.removeAttribute("data-dev-browser-action-ref"))
-        );
-    }
-  };
-
-  let locator = original;
-  let resolvedBy: "self" | "descendant" | "ancestor" = "self";
-  const role = await original.evaluate((element) => {
-    const explicit = element.getAttribute("role");
-    if (explicit) return explicit;
-    return element.tagName.toLowerCase() === "a" ? "link" : "";
+async function resolveRef(page: Page, ref: string, options: Partial<ActionTargetOptions> = {}) {
+  return resolveActionTarget(page, ref, {
+    timeoutMs: options.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+    scroll: options.scroll ?? false,
+    hitTest: options.hitTest ?? false,
+    applicability: options.applicability ?? "pointer",
+    pageName: options.pageName,
   });
-  if (role === "link") {
-    const descendant = original
-      .locator(
-        "button,[role='button'],input[type='button'],input[type='submit'],input[type='reset']"
-      )
-      .first();
-    if ((await descendant.count()) > 0 && (await descendant.boundingBox())) {
-      locator = descendant;
-      resolvedBy = "descendant";
-    }
-  }
-
-  const box = await locator.boundingBox();
-  if (!box || box.width <= 0 || box.height <= 0) {
-    const ancestor = original
-      .locator(
-        "xpath=ancestor::*[self::button or self::a[@href] or @role='button' or @role='link'][1]"
-      )
-      .first();
-    const ancestorBox = (await ancestor.count()) > 0 ? await ancestor.boundingBox() : null;
-    if (!ancestorBox || ancestorBox.width <= 0 || ancestorBox.height <= 0) {
-      const boundedRef = summarizeErrorContext(ref);
-      throw new AgentProtocolError(
-        "TARGET_HIDDEN",
-        `Element ref "${boundedRef}" is not visible; run read again`,
-        true,
-        { details: { ref: boundedRef, refLength: ref.length }, nextCommands: ["dev-browser read"] }
-      );
-    }
-    return { box: ancestorBox, locator: ancestor, resolvedBy: "ancestor" as const, cleanup };
-  }
-
-  return { box, locator, resolvedBy, cleanup };
 }
 
 async function readConfirmationText(page: Page): Promise<string> {
@@ -488,7 +379,11 @@ export async function executeInteractiveAction(
   const { action } = request;
 
   if (action.kind === "paste" && (request.shot || request.annotate)) {
-    throw new AgentProtocolError("UNSUPPORTED_CONTEXT", "Paste cannot create screenshots or annotations", false);
+    throw new AgentProtocolError(
+      "UNSUPPORTED_CONTEXT",
+      "Paste cannot create screenshots or annotations",
+      false
+    );
   }
 
   if (action.kind === "pages") {
@@ -511,18 +406,31 @@ export async function executeInteractiveAction(
     pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
   };
 
-  if (protocolVersion === 2 && (action.kind === "type" || (action.kind === "shot" && action.ref))) {
+  const validateDecisionRefs = async (refs: Array<string | undefined>) => {
+    if (protocolVersion !== 2) return;
     const previousLatestStateId = getLatestStateId(page);
     const latest = await perceive(page, {}, false);
-    result.warnings = validateObservedDecision(
-      page,
-      request.page,
-      action,
-      "ref" in action ? action.ref : undefined,
-      latest,
-      previousLatestStateId
-    );
-    discardValidationState(page, latest.stateId, previousLatestStateId);
+    try {
+      for (const ref of refs) {
+        result.warnings = [
+          ...(result.warnings ?? []),
+          ...validateObservedDecision(
+            page,
+            request.page,
+            action,
+            ref,
+            latest,
+            previousLatestStateId
+          ),
+        ];
+      }
+    } finally {
+      discardValidationState(page, latest.stateId, previousLatestStateId);
+    }
+  };
+
+  if (protocolVersion === 2 && (action.kind === "type" || (action.kind === "shot" && action.ref))) {
+    await validateDecisionRefs(["ref" in action ? action.ref : undefined]);
   }
 
   switch (action.kind) {
@@ -584,12 +492,24 @@ export async function executeInteractiveAction(
     case "find": {
       const perception = await perceive(page, {}, protocolVersion === 1);
       applyPerception(result, perception, protocolVersion, protocolVersion === 1);
-      result.matches = perception.elements
-        .filter((element) => element.actionable)
-        .map((element) => ({ ...element, score: scoreElement(element, action.query) }))
-        .filter((element) => element.score > 0)
-        .sort((left, right) => right.score - left.score)
-        .slice(0, action.limit ?? DEFAULT_FIND_LIMIT);
+      const targeted = findTargets(
+        perception.elements.filter((element) => element.actionable),
+        {
+          query: action.query,
+          role: action.role,
+          name: action.name,
+          nameMode: action.nameMode,
+          within: action.within,
+          near: action.near,
+          frame: action.frame,
+          scope: action.scope ?? "visible",
+          states: action.states ?? [],
+          index: action.index,
+        },
+        action.limit ?? DEFAULT_FIND_LIMIT
+      );
+      result.matches = targeted.matches;
+      result.ambiguity = targeted.ambiguity;
       break;
     }
 
@@ -599,19 +519,7 @@ export async function executeInteractiveAction(
       }
       const before = await pageSignal(page);
       const revalidateClick = async () => {
-        if (protocolVersion !== 2) return;
-        const previousLatestStateId = getLatestStateId(page);
-        const latest = await perceive(page, {}, false);
-        const warnings = validateObservedDecision(
-          page,
-          request.page,
-          action,
-          "ref" in action ? action.ref : undefined,
-          latest,
-          previousLatestStateId
-        );
-        discardValidationState(page, latest.stateId, previousLatestStateId);
-        result.warnings = [...(result.warnings ?? []), ...warnings];
+        await validateDecisionRefs(["ref" in action ? action.ref : undefined]);
       };
       const prepareClickInput = async () => {
         await hooks.beforeTrustedInput?.();
@@ -619,7 +527,17 @@ export async function executeInteractiveAction(
       };
       const clickOnce = async () => {
         if ("ref" in action) {
-          const { box, locator, resolvedBy, cleanup } = await resolveRef(page, action.ref);
+          // Validate the observed decision before resolving the live element.
+          // The validation is repeated immediately before trusted input below.
+          await revalidateClick();
+          const resolved = await resolveRef(page, action.ref, {
+            pageName: request.page,
+            timeoutMs: request.timeoutMs,
+            scroll: true,
+            hitTest: true,
+            applicability: "pointer",
+          });
+          const { box, locator, resolvedBy, cleanup } = resolved;
           const point = {
             x: box.x + box.width / 2,
             y: box.y + box.height / 2,
@@ -637,13 +555,25 @@ export async function executeInteractiveAction(
           } finally {
             await cleanup();
           }
-          result.clicked = { ref: action.ref, method: action.method, point, resolvedBy };
+          result.clicked = {
+            ref: resolved.actualRef,
+            actualRef: resolved.actualRef,
+            originalRef: resolved.originalRef,
+            method: action.method,
+            point,
+            resolvedBy,
+            actual: resolved.actual,
+            box: resolved.box,
+            scroll: resolved.scroll,
+          };
+          result.targets = [actionTargetMetadata(resolved, action.method)];
         } else {
           await prepareClickInput();
           pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
           await page.mouse.click(action.x, action.y);
           result.clicked = {
             ref: null,
+            originalRef: null,
             method: "mouse",
             point: { x: action.x, y: action.y },
             resolvedBy: "self",
@@ -771,24 +701,64 @@ export async function executeInteractiveAction(
     }
 
     case "type": {
+      const journal: AttemptJournalEntry[] = [];
+      let resolvedTypeTarget: ResolvedActionTarget | undefined;
+      const typeEntry = (
+        method: AttemptJournalEntry["inputMethod"],
+        reason: string,
+        startedAt: string
+      ): AttemptJournalEntry => ({
+        attempt: journal.length + 1,
+        startedAt,
+        inputMethod: method,
+        sideEffects: emptyWaitEvents(),
+        change: unchangedAttempt(),
+        retryDecision: "stop",
+        reason,
+      });
+      const dispatchTypeInput = async (
+        method: "mouse" | "keyboard",
+        input: () => Promise<void>
+      ) => {
+        const startedAt = new Date().toISOString();
+        try {
+          await hooks.beforeTrustedInput?.();
+          await validateDecisionRefs([action.ref]);
+          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+          await input();
+          journal.push(typeEntry(method, "action-complete", startedAt));
+        } catch (error) {
+          const typed = attemptError(error, page);
+          journal.push(typeEntry(method, attemptErrorReason(typed), startedAt));
+          throw withAttemptJournal(typed, journal);
+        }
+      };
       const dispatchType = async () => {
         if (action.ref) {
-          const { box, cleanup } = await resolveRef(page, action.ref);
+          const resolved = await resolveRef(page, action.ref, {
+            pageName: request.page,
+            timeoutMs: request.timeoutMs,
+            scroll: true,
+            hitTest: true,
+            applicability: "type",
+          });
+          resolvedTypeTarget = resolved;
+          const { box, cleanup } = resolved;
           try {
-            await authorizeTrustedMutation();
-            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+            await dispatchTypeInput("mouse", () =>
+              page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+            );
           } finally {
             await cleanup();
           }
         }
         if (action.clear) {
-          await authorizeTrustedMutation();
-          await page.keyboard.press("ControlOrMeta+A");
-          await authorizeTrustedMutation();
-          await page.keyboard.press("Backspace");
+          await dispatchTypeInput("keyboard", () => page.keyboard.press("ControlOrMeta+A"));
+          await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
         }
-        await authorizeTrustedMutation();
-        await page.keyboard.type(action.text, { delay: action.delayMs });
+        await dispatchTypeInput("keyboard", () =>
+          page.keyboard.type(action.text, { delay: action.delayMs })
+        );
       };
       if (action.wait) {
         const waited = await runWithWait(
@@ -800,7 +770,16 @@ export async function executeInteractiveAction(
         result.waitResult = waited.waitResult;
         applyPerception(result, waited.state, protocolVersion);
       } else await dispatchType();
-      result.typed = { ref: action.ref ?? null, characters: Array.from(action.text).length };
+      const typeTarget = resolvedTypeTarget
+        ? actionTargetMetadata(resolvedTypeTarget, "keyboard")
+        : undefined;
+      result.typed = {
+        ref: typeTarget?.actualRef ?? null,
+        characters: Array.from(action.text).length,
+        ...typeTarget,
+      };
+      result.targets = typeTarget ? [typeTarget] : undefined;
+      result.attemptJournal = journal;
       if (!result.stateId)
         applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
@@ -815,27 +794,50 @@ export async function executeInteractiveAction(
     case "uncheck":
     case "hover":
     case "drag": {
-      const dispatch = async () => executePrimitive({
-        page,
-        action,
-        timeoutMs: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
-        resolve: async (ref) => resolveRef(page, ref),
-        authorize: async (refs) => {
-          await hooks.beforeTrustedInput?.();
-          if (protocolVersion === 2) {
-            const previousLatestStateId = getLatestStateId(page);
-            const latest = await perceive(page, {}, false);
-            for (const ref of refs.length > 0 ? refs : [undefined]) {
-              result.warnings = [
-                ...(result.warnings ?? []),
-                ...validateObservedDecision(page, request.page, action, ref, latest, previousLatestStateId),
-              ];
-            }
-            discardValidationState(page, latest.stateId, previousLatestStateId);
-          }
-          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
-        },
-      });
+      const primitiveRefs =
+        action.kind === "drag"
+          ? [action.from, action.to]
+          : action.kind === "scroll"
+            ? [action.ref]
+            : [action.ref];
+      const dispatch = async () => {
+        await validateDecisionRefs(primitiveRefs);
+        return executePrimitive({
+          page,
+          action,
+          timeoutMs: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+          resolve: async (ref, role) => {
+            const applicability =
+              action.kind === "focus"
+                ? "focus"
+                : action.kind === "press"
+                  ? "keyboard"
+                  : action.kind === "paste"
+                    ? "paste"
+                    : action.kind === "select"
+                      ? "select"
+                      : action.kind === "check" || action.kind === "uncheck"
+                        ? "check"
+                        : action.kind === "drag"
+                          ? role === "source"
+                            ? "drag-source"
+                            : "drop-target"
+                          : "pointer";
+            return resolveRef(page, ref, {
+              pageName: request.page,
+              timeoutMs: request.timeoutMs,
+              scroll: action.kind !== "scroll",
+              hitTest: action.kind === "hover" || action.kind === "drag",
+              applicability,
+            });
+          },
+          authorize: async (refs) => {
+            await hooks.beforeTrustedInput?.();
+            await validateDecisionRefs(refs.length > 0 ? refs : [undefined]);
+            pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+          },
+        });
+      };
       let summary: PrimitiveSummary;
       if (action.wait) {
         let dispatched: PrimitiveSummary | undefined;
@@ -844,23 +846,37 @@ export async function executeInteractiveAction(
             page,
             { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
             action.wait,
-            async () => { dispatched = await dispatch(); }
+            async () => {
+              dispatched = await dispatch();
+            }
           );
           summary = dispatched!;
           const lastAttempt = summary.attemptJournal?.at(-1);
-          if (lastAttempt) lastAttempt.sideEffects = mergeWaitEvents(lastAttempt.sideEffects, boundedWaitEvents(waited.waitResult.events));
+          if (lastAttempt)
+            lastAttempt.sideEffects = mergeWaitEvents(
+              lastAttempt.sideEffects,
+              boundedWaitEvents(waited.waitResult.events)
+            );
           result.waitResult = waited.waitResult;
           applyPerception(result, waited.state, protocolVersion);
         } catch (error) {
           const journal = dispatched?.attemptJournal;
           const lastAttempt = journal?.at(-1);
           if (!journal || !lastAttempt) throw error;
-          lastAttempt.sideEffects = mergeWaitEvents(lastAttempt.sideEffects, timeoutEvents(attemptError(error, page)));
+          lastAttempt.sideEffects = mergeWaitEvents(
+            lastAttempt.sideEffects,
+            timeoutEvents(attemptError(error, page))
+          );
           throw withAttemptJournal(attemptError(error, page), journal);
         }
       } else summary = await dispatch();
       Object.assign(result, summary);
-      if (!result.stateId) applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
+      if (!result.stateId)
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          protocolVersion
+        );
       break;
     }
 
@@ -894,12 +910,17 @@ export async function executeInteractiveAction(
   if (request.shot || request.annotate || action.kind === "shot") {
     const name =
       request.shot && request.shot !== "auto" ? request.shot : automaticScreenshotName(action.kind);
+    let focusedShotTarget: ActionTargetMetadata | undefined;
     if (action.kind === "shot" && action.ref) {
-      const resolved = await resolveRef(page, action.ref);
+      const resolved = await resolveRef(page, action.ref, {
+        pageName: request.page,
+        timeoutMs: request.timeoutMs,
+        scroll: true,
+        applicability: "pointer",
+      });
       try {
-        await resolved.locator.scrollIntoViewIfNeeded({
-          timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
-        });
+        focusedShotTarget = actionTargetMetadata(resolved, "screenshot");
+        result.targets = [focusedShotTarget];
       } finally {
         await resolved.cleanup();
       }
@@ -907,7 +928,7 @@ export async function executeInteractiveAction(
     const visualPerception = await perceive(page, { full: request.fullPage }, false);
     const focusElement =
       action.kind === "shot" && action.ref
-        ? visualPerception.elements.find((element) => element.ref === action.ref)
+        ? visualPerception.elements.find((element) => element.ref === focusedShotTarget?.actualRef)
         : undefined;
     if (action.kind === "shot" && action.ref && !focusElement) {
       throw new AgentProtocolError(
