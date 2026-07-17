@@ -44,20 +44,21 @@ pub fn agent_schema() -> Value {
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
             "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
+            "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
                 "navigate": { "required": ["url"], "optional": ["wait"] },
-                "back": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
-                "forward": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
-                "reload": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
+                "back": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
+                "forward": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
+                "reload": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
                 "read": { "required": [], "optional": ["limit:1..500", "depth:1..50"] },
                 "observe": { "required": [], "optional": ["full:boolean", "delta:boolean", "track:string", "maxNodes:1..1000", "maxChars:1..100000", "depth:1..50", "breadth:1..500", "continuation:string"] },
-                "find": { "required": [], "optional": ["query", "role", "name", "nameMode:exact|contains", "within", "near", "frame", "scope:visible|viewport|document", "states[]", "index", "limit:1..50"] },
+                "find": { "atLeastOne": ["query", "role", "name", "within", "near", "frame", "states[]"], "optional": ["nameMode:exact|contains (requires name)", "scope:visible|viewport|document", "index:0..999", "limit:1..50"] },
                 "click": { "oneOf": [["ref"], ["x>=0", "y>=0"]], "optional": ["method:mouse|locator (coordinates require mouse)", "retry:never|safe|once", "fromState", "strictState", "expectText", "waitForText", "confirmToken", "wait"] },
                 "focus": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "press": { "required": ["ref", "key:1..64 safe key chars"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "paste": { "required": ["ref", "text"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "scroll": { "oneOf": [["ref"], ["deltaX|deltaY:-100000..100000"], ["direction:up|down|left|right", "pages:1..50"], ["until:text:...|role:...", "maxSteps:1..50"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "scroll": { "oneOf": [["ref"], ["deltaX|deltaY:-100000..100000"], ["direction:up|down|left|right", "pages:1..50"], ["until:text:...|role:...", "maxSteps:1..50"]], "optional": ["fromState", "strictState", "confirmToken (ref form only; requires fromState)", "wait"] },
                 "select": { "required": ["ref"], "oneOf": [["value"], ["label"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "check": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "uncheck": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
@@ -65,8 +66,8 @@ pub fn agent_schema() -> Value {
                 "drag": { "required": ["from", "to"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "type": { "required": ["text"], "optional": ["ref", "clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
                 "upload": { "required": ["ref", "file"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState", "confirmToken"] },
-                "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState", "confirmToken"] }
+                "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState"] },
+                "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState"] }
             }
         },
         "waitGrammar": {
@@ -164,6 +165,10 @@ mod tests {
         assert_eq!(
             schema["interactiveRequest"]["actionGrammar"]["type"]["required"],
             json!(["text"])
+        );
+        assert_eq!(
+            schema["interactiveRequest"]["actionGrammar"]["find"]["atLeastOne"],
+            json!(["query", "role", "name", "within", "near", "frame", "states[]"])
         );
         let wait = &schema["waitGrammar"]["conditions"];
         assert!(wait["ref"]["required"][1]
