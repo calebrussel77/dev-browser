@@ -2,6 +2,8 @@ mod connection;
 mod daemon;
 mod interactive;
 mod skill;
+#[path = "wait-grammar.rs"]
+mod wait_grammar;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use connection::{connect_to_daemon, read_line, send_message};
@@ -21,6 +23,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wait_grammar::WaitArgs;
 
 const CLI_LONG_ABOUT: &str = r###"Dev Browser is a CLI for controlling local or external browsers with JavaScript scripts.
 Scripts run in a sandboxed QuickJS runtime (not Node.js). Top-level `await` is
@@ -369,6 +372,8 @@ enum Command {
         expect_text: Option<String>,
         #[arg(long, value_name = "TEXT")]
         wait_for: Option<String>,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
     #[command(
         about = "Focus and type through trusted Playwright keyboard input",
@@ -385,6 +390,8 @@ enum Command {
         clear: bool,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
         delay: u16,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
     #[command(
         about = "Read and verify the current confirmation or dialog text",
@@ -574,6 +581,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             method,
             expect_text,
             wait_for,
+            wait,
         }) => {
             if xy.is_some() && matches!(method, ClickMethod::Locator) {
                 return Err(io::Error::new(
@@ -599,6 +607,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(wait_for) = wait_for {
                 action["waitForText"] = Value::String(wait_for.clone());
             }
+            if let Some(spec) = wait
+                .build_spec(wait_for.as_deref())
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+            {
+                action["wait"] = spec;
+            }
             run_page_action(&cli, output, action)
         }
         Some(Command::Type {
@@ -607,6 +621,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             text,
             clear,
             delay,
+            wait,
         }) => {
             let mut action = json!({
                 "kind": "type",
@@ -616,6 +631,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
             });
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
+            }
+            if let Some(spec) = wait
+                .build_spec(None)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+            {
+                action["wait"] = spec;
             }
             run_page_action(&cli, output, action)
         }
@@ -1230,6 +1251,66 @@ mod tests {
                 ..
             }) if track == "checkout" && output.annotate && output.full_page
         ));
+    }
+
+    #[test]
+    fn parses_every_wait_flag_on_trusted_actions() {
+        let flags = [
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--wait-mode",
+            "any",
+            "--wait-timeout",
+            "1200",
+            "--wait-text",
+            "visible,body,contains,Saved",
+            "--wait-url",
+            "glob,**/done",
+            "--wait-ref",
+            "R7,attributeChanged,aria-expanded,true",
+            "--wait-dialog",
+            "opened",
+            "--wait-toast",
+            "closed",
+            "--wait-popup",
+            "--wait-download",
+            "--wait-file-chooser",
+            "--wait-navigation",
+            "document",
+            "--wait-response",
+            "contains,/api,POST,200",
+            "--wait-failed-request",
+            "contains,/failure,GET",
+            "--wait-network-idle",
+            "250",
+        ];
+        let parsed = Cli::try_parse_from(flags).unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Click { ref wait, .. }) if wait.build_spec(None).unwrap().unwrap()["conditions"].as_array().unwrap().len() == 12)
+        );
+
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "type",
+            "--text",
+            "x",
+            "--wait-mode",
+            "sometimes",
+            "--wait-popup"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R1",
+            "--wait-timeout",
+            "120001",
+            "--wait-popup"
+        ])
+        .is_err());
     }
 
     #[test]

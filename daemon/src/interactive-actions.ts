@@ -8,11 +8,12 @@ import {
   type PagePerception,
   type PerceptionElement,
 } from "./perception/collector.js";
-import type { InteractiveRequest } from "./protocol.js";
+import type { InteractiveRequest, WaitSpec } from "./protocol.js";
 import { discardValidationState, getLatestStateId } from "./page-state.js";
 import { validateObservedDecision } from "./ref-state.js";
 import { pageLeases } from "./sessions.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
+import { runWithWait, type WaitResult } from "./wait-engine.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -70,6 +71,7 @@ export interface InteractiveResult {
   attempts?: number;
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
+  waitResult?: WaitResult;
 }
 
 export interface ActionExecutionHooks {
@@ -382,6 +384,29 @@ async function waitForVisibleText(
   return await visibleTextContains(page, expected);
 }
 
+function actionWaitSpec(
+  action: InteractiveRequest["action"],
+  timeoutMs?: number
+): WaitSpec | undefined {
+  if ("wait" in action && action.wait) return action.wait;
+  if (action.kind === "click" && action.waitForText) {
+    return {
+      mode: "all",
+      timeoutMs: Math.min(timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000),
+      conditions: [
+        {
+          kind: "text",
+          state: "visible",
+          scope: "body",
+          match: "contains",
+          value: action.waitForText,
+        },
+      ],
+    };
+  }
+  return undefined;
+}
+
 export async function executeInteractiveAction(
   manager: BrowserManager,
   request: InteractiveRequest,
@@ -409,10 +434,7 @@ export async function executeInteractiveAction(
     pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
   };
 
-  if (
-    protocolVersion === 2 &&
-    (action.kind === "type" || (action.kind === "shot" && action.ref))
-  ) {
+  if (protocolVersion === 2 && (action.kind === "type" || (action.kind === "shot" && action.ref))) {
     const previousLatestStateId = getLatestStateId(page);
     const latest = await perceive(page, {}, false);
     result.warnings = validateObservedDecision(
@@ -428,12 +450,29 @@ export async function executeInteractiveAction(
 
   switch (action.kind) {
     case "navigate":
-      await authorizeTrustedMutation();
-      await page.goto(action.url, {
-        timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
-        waitUntil: "domcontentloaded",
-      });
-      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      if (action.wait) {
+        const waited = await runWithWait(
+          page,
+          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+          action.wait,
+          async () => {
+            await authorizeTrustedMutation();
+            await page.goto(action.url, {
+              timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+              waitUntil: "domcontentloaded",
+            });
+          }
+        );
+        result.waitResult = waited.waitResult;
+        applyPerception(result, waited.state, protocolVersion);
+      } else {
+        await authorizeTrustedMutation();
+        await page.goto(action.url, {
+          timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+          waitUntil: "domcontentloaded",
+        });
+        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      }
       break;
 
     case "observe": {
@@ -495,10 +534,7 @@ export async function executeInteractiveAction(
             previousLatestStateId
           );
           discardValidationState(page, latest.stateId, previousLatestStateId);
-          result.warnings = [
-            ...(result.warnings ?? []),
-            ...warnings,
-          ];
+          result.warnings = [...(result.warnings ?? []), ...warnings];
         }
         if ("ref" in action) {
           const { box, locator, resolvedBy, cleanup } = await resolveRef(page, action.ref);
@@ -530,76 +566,104 @@ export async function executeInteractiveAction(
         }
       };
 
+      const wait = actionWaitSpec(action, request.timeoutMs);
       let attempts = 1;
-      await clickOnce();
-      await page.waitForTimeout(CLICK_SETTLE_MS);
-      let after = await pageSignal(page);
-      let change = compareSignals(before, after);
-      let waitSatisfied = action.waitForText
-        ? await waitForVisibleText(
-            page,
-            action.waitForText,
-            Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
-          )
-        : null;
-
-      if (action.waitForText && !waitSatisfied && !change.any && !action.expectText) {
-        attempts = 2;
+      const dispatchWithLegacyCompatibility = action.waitForText
+        ? async () => {
+            await clickOnce();
+            await page.waitForTimeout(CLICK_SETTLE_MS);
+            let satisfied = await waitForVisibleText(
+              page,
+              action.waitForText!,
+              Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
+            );
+            const firstChange = compareSignals(before, await pageSignal(page));
+            if (!satisfied && !firstChange.any && !action.expectText) {
+              attempts = 2;
+              await clickOnce();
+              await page.waitForTimeout(CLICK_SETTLE_MS);
+              satisfied = await waitForVisibleText(
+                page,
+                action.waitForText!,
+                Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
+              );
+            }
+            if (!satisfied) {
+              const value = summarizeErrorContext(action.waitForText!);
+              throw new AgentProtocolError(
+                "WAIT_TIMEOUT",
+                `--wait-for text "${value}" was not observed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
+                true,
+                {
+                  details: {
+                    attempts,
+                    waitForText: value,
+                    waitForTextLength: action.waitForText!.length,
+                  },
+                  nextCommands: ["dev-browser observe --delta"],
+                }
+              );
+            }
+          }
+        : clickOnce;
+      let after: PageSignal;
+      if (wait) {
+        const waited = await runWithWait(
+          page,
+          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+          wait,
+          dispatchWithLegacyCompatibility
+        );
+        result.waitResult = waited.waitResult;
+        applyPerception(result, waited.state, protocolVersion);
+        after = await pageSignal(page);
+      } else {
         await clickOnce();
         await page.waitForTimeout(CLICK_SETTLE_MS);
-        waitSatisfied = await waitForVisibleText(
-          page,
-          action.waitForText,
-          Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
-        );
         after = await pageSignal(page);
-        change = compareSignals(before, after);
       }
-
-      if (action.waitForText && !waitSatisfied) {
-        const boundedWaitForText = summarizeErrorContext(action.waitForText);
-        throw new AgentProtocolError(
-          "WAIT_TIMEOUT",
-          `--wait-for text "${boundedWaitForText}" was not observed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
-          true,
-          {
-            details: {
-              attempts,
-              waitForText: boundedWaitForText,
-              waitForTextLength: action.waitForText.length,
-            },
-          }
-        );
-      }
-
-      result.change = change;
+      result.change = compareSignals(before, after);
       result.attempts = attempts;
       result.waitForText = action.waitForText ?? null;
-      result.waitSatisfied = waitSatisfied;
-      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      result.waitSatisfied = action.waitForText ? true : null;
+      if (!result.stateId)
+        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
     }
 
     case "type": {
-      if (action.ref) {
-        const { box, cleanup } = await resolveRef(page, action.ref);
-        try {
-          await authorizeTrustedMutation();
-          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-        } finally {
-          await cleanup();
+      const dispatchType = async () => {
+        if (action.ref) {
+          const { box, cleanup } = await resolveRef(page, action.ref);
+          try {
+            await authorizeTrustedMutation();
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          } finally {
+            await cleanup();
+          }
         }
-      }
-      if (action.clear) {
+        if (action.clear) {
+          await authorizeTrustedMutation();
+          await page.keyboard.press("ControlOrMeta+A");
+          await authorizeTrustedMutation();
+          await page.keyboard.press("Backspace");
+        }
         await authorizeTrustedMutation();
-        await page.keyboard.press("ControlOrMeta+A");
-        await authorizeTrustedMutation();
-        await page.keyboard.press("Backspace");
-      }
-      await authorizeTrustedMutation();
-      await page.keyboard.type(action.text, { delay: action.delayMs });
+        await page.keyboard.type(action.text, { delay: action.delayMs });
+      };
+      if (action.wait) {
+        const waited = await runWithWait(
+          page,
+          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+          action.wait,
+          dispatchType
+        );
+        result.waitResult = waited.waitResult;
+        applyPerception(result, waited.state, protocolVersion);
+      } else await dispatchType();
       result.typed = { ref: action.ref ?? null, characters: Array.from(action.text).length };
-      applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      if (!result.stateId)
+        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
       break;
     }
 

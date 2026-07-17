@@ -6,9 +6,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { agentErrorExitCode, toAgentError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
+import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
 import { pageLeases } from "./sessions.js";
-import { removeDirectoryWithRetries } from "./test-cleanup.js";
 
 const browserName = "interactive-actions";
 
@@ -97,8 +97,7 @@ describe.sequential("interactive Playwright actions", () => {
   }, 180_000);
 
   afterAll(async () => {
-    await manager.stopAll();
-    await removeDirectoryWithRetries(browserRootDir);
+    await stopBrowserManagerAndRemoveDirectory(manager, browserRootDir);
   }, 180_000);
 
   it("returns stable refs, coordinates, visibility, and distinct landmarks", async () => {
@@ -278,10 +277,24 @@ describe.sequential("interactive Playwright actions", () => {
 
     const result = await executeInteractiveAction(
       manager,
-      request({ kind: "click", ref: opener!.ref, method: "mouse" })
+      request({
+        kind: "click",
+        ref: opener!.ref,
+        method: "mouse",
+        wait: {
+          mode: "all",
+          timeoutMs: 1_000,
+          conditions: [{ kind: "dialog", state: "opened" }],
+        },
+      })
     );
 
     expect(result.change).toEqual(expect.objectContaining({ any: true, dialog: true }));
+    expect(result.waitResult).toMatchObject({
+      mode: "all",
+      timedOut: [],
+      passed: [{ kind: "dialog", state: "opened" }],
+    });
     expect(result.snapshot).toContain("Dynamic modal opened");
     expect(result.elements).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "Dynamic modal opened" })])
@@ -595,62 +608,136 @@ describe.sequential("interactive Playwright actions", () => {
 
   it("rejects stale v2 decisions before trusted input and allows unrelated attributes", async () => {
     const page = await manager.getPage(browserName, "profile");
-    await page.setContent(`<button id="target" aria-label="Save">Save</button><p id="noise">one</p><script>window.inputs=0;document.querySelector('#target').onclick=()=>window.inputs++</script>`);
-    const observe = async () => executeInteractiveAction(manager, {
-      ...request({ kind: "observe", full: false, delta: false, track: "agent-a", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }),
-      protocolVersion: 2,
-    });
+    await page.setContent(
+      `<button id="target" aria-label="Save">Save</button><p id="noise">one</p><script>window.inputs=0;document.querySelector('#target').onclick=()=>window.inputs++</script>`
+    );
+    const observe = async () =>
+      executeInteractiveAction(manager, {
+        ...request({
+          kind: "observe",
+          full: false,
+          delta: false,
+          track: "agent-a",
+          maxNodes: 100,
+          maxChars: 12000,
+          depth: 12,
+          breadth: 50,
+        }),
+        protocolVersion: 2,
+      });
     const observed = await observe();
     const ref = elements(observed).find((element) => element.name === "Save")!.ref;
 
-    await page.locator("#noise").evaluate((node) => { node.textContent = "two"; });
-    await expect(executeInteractiveAction(manager, {
-      ...request({ kind: "click", ref, method: "mouse", fromState: observed.stateId!, strictState: true }), protocolVersion: 2,
-    })).rejects.toMatchObject({ code: "STALE_STATE" });
+    await page.locator("#noise").evaluate((node) => {
+      node.textContent = "two";
+    });
+    await expect(
+      executeInteractiveAction(manager, {
+        ...request({
+          kind: "click",
+          ref,
+          method: "mouse",
+          fromState: observed.stateId!,
+          strictState: true,
+        }),
+        protocolVersion: 2,
+      })
+    ).rejects.toMatchObject({ code: "STALE_STATE" });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
 
     const refreshed = await observe();
     await page.locator("#target").evaluate((node) => node.setAttribute("aria-label", "Delete"));
-    await expect(executeInteractiveAction(manager, {
-      ...request({ kind: "click", ref, method: "mouse", fromState: refreshed.stateId! }), protocolVersion: 2,
-    })).rejects.toMatchObject({ code: "STALE_REF", details: { latest: expect.any(Object) } });
+    await expect(
+      executeInteractiveAction(manager, {
+        ...request({ kind: "click", ref, method: "mouse", fromState: refreshed.stateId! }),
+        protocolVersion: 2,
+      })
+    ).rejects.toMatchObject({ code: "STALE_REF", details: { latest: expect.any(Object) } });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
 
     const again = await observe();
     const deleteRef = elements(again).find((element) => element.name === "Delete")!.ref;
-    await page.locator("#noise").evaluate((node) => node.setAttribute("data-animation-counter", "999"));
+    await page
+      .locator("#noise")
+      .evaluate((node) => node.setAttribute("data-animation-counter", "999"));
     await executeInteractiveAction(manager, {
-      ...request({ kind: "click", ref: deleteRef, method: "mouse", fromState: again.stateId! }), protocolVersion: 2,
+      ...request({ kind: "click", ref: deleteRef, method: "mouse", fromState: again.stateId! }),
+      protocolVersion: 2,
     });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
     const unversioned = await executeInteractiveAction(manager, {
-      ...request({ kind: "click", ref: deleteRef, method: "mouse" }), protocolVersion: 2,
+      ...request({ kind: "click", ref: deleteRef, method: "mouse" }),
+      protocolVersion: 2,
     });
     expect(unversioned.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
   });
 
   it("rejects removal, remount, navigation, and interleaved agent decisions", async () => {
     const page = await manager.getPage(browserName, "profile");
-    const observe = async () => executeInteractiveAction(manager, {
-      ...request({ kind: "observe", full: false, delta: false, track: "agents", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }), protocolVersion: 2,
-    });
-    await page.setContent(`<button id="target" aria-expanded="false">Act</button><script>window.inputs=0;document.querySelector('#target').onclick=e=>{window.inputs++;e.currentTarget.setAttribute('aria-expanded','true')}</script>`);
+    const observe = async () =>
+      executeInteractiveAction(manager, {
+        ...request({
+          kind: "observe",
+          full: false,
+          delta: false,
+          track: "agents",
+          maxNodes: 100,
+          maxChars: 12000,
+          depth: 12,
+          breadth: 50,
+        }),
+        protocolVersion: 2,
+      });
+    await page.setContent(
+      `<button id="target" aria-expanded="false">Act</button><script>window.inputs=0;document.querySelector('#target').onclick=e=>{window.inputs++;e.currentTarget.setAttribute('aria-expanded','true')}</script>`
+    );
     const a = await observe();
     const ref = elements(a).find((element) => element.name === "Act")!.ref;
     await page.locator("#target").evaluate((node) => node.replaceWith(node.cloneNode(true)));
-    await expect(executeInteractiveAction(manager, { ...request({ kind: "click", ref, method: "mouse", fromState: a.stateId! }), protocolVersion: 2 })).rejects.toMatchObject({ code: "STALE_REF" });
+    await expect(
+      executeInteractiveAction(manager, {
+        ...request({ kind: "click", ref, method: "mouse", fromState: a.stateId! }),
+        protocolVersion: 2,
+      })
+    ).rejects.toMatchObject({ code: "STALE_REF" });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
 
     const b = await observe();
     const replacementRef = elements(b).find((element) => element.name === "Act")!.ref;
-    await page.locator("#target").evaluate((node) => { node.addEventListener("click", (event) => { (window as unknown as { inputs: number }).inputs++; (event.currentTarget as Element).setAttribute("aria-expanded", "true"); }); });
-    await executeInteractiveAction(manager, { ...request({ kind: "click", ref: replacementRef, method: "mouse", fromState: b.stateId! }), protocolVersion: 2 });
-    await expect(executeInteractiveAction(manager, { ...request({ kind: "click", ref: replacementRef, method: "mouse", fromState: b.stateId! }), protocolVersion: 2 })).rejects.toMatchObject({ code: "STALE_REF" });
+    await page.locator("#target").evaluate((node) => {
+      node.addEventListener("click", (event) => {
+        (window as unknown as { inputs: number }).inputs++;
+        (event.currentTarget as Element).setAttribute("aria-expanded", "true");
+      });
+    });
+    await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: replacementRef, method: "mouse", fromState: b.stateId! }),
+      protocolVersion: 2,
+    });
+    await expect(
+      executeInteractiveAction(manager, {
+        ...request({ kind: "click", ref: replacementRef, method: "mouse", fromState: b.stateId! }),
+        protocolVersion: 2,
+      })
+    ).rejects.toMatchObject({ code: "STALE_REF" });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
 
     const beforeNavigation = await observe();
-    await page.goto("data:text/html,<button id=target>Act</button><script>window.inputs=0;target.onclick=()=>window.inputs++</script>");
-    await expect(executeInteractiveAction(manager, { ...request({ kind: "click", x: 10, y: 10, method: "mouse", fromState: beforeNavigation.stateId! }), protocolVersion: 2 })).rejects.toMatchObject({ code: "STALE_STATE" });
+    await page.goto(
+      "data:text/html,<button id=target>Act</button><script>window.inputs=0;target.onclick=()=>window.inputs++</script>"
+    );
+    await expect(
+      executeInteractiveAction(manager, {
+        ...request({
+          kind: "click",
+          x: 10,
+          y: 10,
+          method: "mouse",
+          fromState: beforeNavigation.stateId!,
+        }),
+        protocolVersion: 2,
+      })
+    ).rejects.toMatchObject({ code: "STALE_STATE" });
     expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
   });
 
@@ -659,12 +746,40 @@ describe.sequential("interactive Playwright actions", () => {
     await page.setContent(`<button>Lease target</button>`);
     const lease = pageLeases.open(browserName, "profile", 300);
     try {
-      await expect(executeInteractiveAction(manager, { ...request({ kind: "click", x: 10, y: 10, method: "mouse" }), protocolVersion: 2 })).rejects.toSatisfy((error: unknown) => {
+      await expect(
+        executeInteractiveAction(manager, {
+          ...request({ kind: "click", x: 10, y: 10, method: "mouse" }),
+          protocolVersion: 2,
+        })
+      ).rejects.toSatisfy((error: unknown) => {
         const serialized = JSON.stringify(error);
-        return (error as { code?: string }).code === "LEASE_CONFLICT" && !serialized.includes(lease.sessionId);
+        return (
+          (error as { code?: string }).code === "LEASE_CONFLICT" &&
+          !serialized.includes(lease.sessionId)
+        );
       });
-      await expect(executeInteractiveAction(manager, { ...request({ kind: "observe", full: false, delta: false, track: "lease", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }), protocolVersion: 2 })).resolves.toMatchObject({ action: "observe" });
-      await expect(executeInteractiveAction(manager, { ...request({ kind: "click", x: 10, y: 10, method: "mouse" }), protocolVersion: 2, session: lease.sessionId })).resolves.toMatchObject({ clicked: expect.any(Object) });
+      await expect(
+        executeInteractiveAction(manager, {
+          ...request({
+            kind: "observe",
+            full: false,
+            delta: false,
+            track: "lease",
+            maxNodes: 100,
+            maxChars: 12000,
+            depth: 12,
+            breadth: 50,
+          }),
+          protocolVersion: 2,
+        })
+      ).resolves.toMatchObject({ action: "observe" });
+      await expect(
+        executeInteractiveAction(manager, {
+          ...request({ kind: "click", x: 10, y: 10, method: "mouse" }),
+          protocolVersion: 2,
+          session: lease.sessionId,
+        })
+      ).resolves.toMatchObject({ clicked: expect.any(Object) });
     } finally {
       pageLeases.close(lease.sessionId);
     }
@@ -675,16 +790,25 @@ describe.sequential("interactive Playwright actions", () => {
     const race = async (action: Parameters<typeof executeInteractiveAction>[1]["action"]) => {
       let lease: ReturnType<typeof pageLeases.open> | undefined;
       try {
-        await expect(executeInteractiveAction(manager, request(action), {
-          beforeTrustedInput: () => { lease = pageLeases.open(browserName, "profile", 300); },
-        })).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+        await expect(
+          executeInteractiveAction(manager, request(action), {
+            beforeTrustedInput: () => {
+              lease = pageLeases.open(browserName, "profile", 300);
+            },
+          })
+        ).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
       } finally {
         if (lease) pageLeases.close(lease.sessionId);
       }
     };
 
-    await page.setContent(`<button id="target">Target</button><input id="field"><script>window.inputs=0;target.onclick=()=>window.inputs++</script>`);
-    const read = await executeInteractiveAction(manager, request({ kind: "read", limit: 100, depth: 12 }));
+    await page.setContent(
+      `<button id="target">Target</button><input id="field"><script>window.inputs=0;target.onclick=()=>window.inputs++</script>`
+    );
+    const read = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
     const ref = elements(read).find((element) => element.name === "Target")!.ref;
     await race({ kind: "click", x: 10, y: 10, method: "mouse" });
     await race({ kind: "click", ref, method: "locator" });
@@ -697,30 +821,51 @@ describe.sequential("interactive Playwright actions", () => {
     const expiring = pageLeases.open(browserName, "profile", 1);
     let replacement: ReturnType<typeof pageLeases.open> | undefined;
     try {
-      await expect(executeInteractiveAction(
-        manager,
-        { ...request({ kind: "click", x: 10, y: 10, method: "mouse" }), session: expiring.sessionId },
-        { beforeTrustedInput: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 1_050));
-          replacement = pageLeases.open(browserName, "profile", 300);
-        } }
-      )).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      await expect(
+        executeInteractiveAction(
+          manager,
+          {
+            ...request({ kind: "click", x: 10, y: 10, method: "mouse" }),
+            session: expiring.sessionId,
+          },
+          {
+            beforeTrustedInput: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 1_050));
+              replacement = pageLeases.open(browserName, "profile", 300);
+            },
+          }
+        )
+      ).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
       expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
     } finally {
       if (replacement) pageLeases.close(replacement.sessionId);
     }
 
-    await page.setContent(`<button id="retry">Retry</button><script>window.inputs=0;retry.onclick=()=>window.inputs++</script>`);
-    const retryRead = await executeInteractiveAction(manager, request({ kind: "read", limit: 100, depth: 12 }));
+    await page.setContent(
+      `<button id="retry">Retry</button><script>window.inputs=0;retry.onclick=()=>window.inputs++</script>`
+    );
+    const retryRead = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
     const retryRef = elements(retryRead).find((element) => element.name === "Retry")!.ref;
     let dispatch = 0;
     let reacquired: ReturnType<typeof pageLeases.open> | undefined;
     try {
-      await expect(executeInteractiveAction(
-        manager,
-        request({ kind: "click", ref: retryRef, method: "mouse", waitForText: "never appears" }, { timeoutMs: 50 }),
-        { beforeTrustedInput: () => { if (++dispatch === 2) reacquired = pageLeases.open(browserName, "profile", 300); } }
-      )).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      await expect(
+        executeInteractiveAction(
+          manager,
+          request(
+            { kind: "click", ref: retryRef, method: "mouse", waitForText: "never appears" },
+            { timeoutMs: 50 }
+          ),
+          {
+            beforeTrustedInput: () => {
+              if (++dispatch === 2) reacquired = pageLeases.open(browserName, "profile", 300);
+            },
+          }
+        )
+      ).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
       expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
     } finally {
       if (reacquired) pageLeases.close(reacquired.sessionId);

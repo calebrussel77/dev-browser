@@ -3,6 +3,62 @@ import { describe, expect, it } from "vitest";
 import { parseRequest } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("parses every typed wait condition and rejects unsafe or oversized matchers", () => {
+    const conditions = [
+      { kind: "text", state: "visible", scope: "body", match: "contains", value: "Saved" },
+      { kind: "url", match: "glob", value: "**/checkout/*" },
+      { kind: "ref", ref: "R7", state: "visible" },
+      { kind: "ref", ref: "R8", state: "valueChanged", expected: "done" },
+      {
+        kind: "ref",
+        ref: "R9",
+        state: "attributeChanged",
+        attribute: "aria-expanded",
+        expected: "true",
+      },
+      { kind: "ref", ref: "R10", state: "stateChanged", attribute: "checked", expected: "true" },
+      { kind: "dialog", state: "opened" },
+      { kind: "toast", state: "closed" },
+      { kind: "popup" },
+      { kind: "download" },
+      { kind: "fileChooser" },
+      { kind: "navigation", state: "document" },
+      { kind: "response", match: "contains", value: "/api/", method: "POST", status: 200 },
+      { kind: "failedRequest", match: "safe-regex", value: "/api/fail$", method: "GET" },
+      { kind: "networkIdle", specialized: true, idleMs: 250 },
+    ];
+    const parsed = parseRequest(
+      JSON.stringify({
+        id: "wait-all",
+        type: "interactive",
+        protocolVersion: 2,
+        action: { kind: "click", ref: "R7", wait: { mode: "all", timeoutMs: 1200, conditions } },
+      })
+    );
+    expect(parsed).toMatchObject({
+      success: true,
+      request: { action: { wait: { mode: "all", conditions } } },
+    });
+
+    for (const condition of [
+      { kind: "text", state: "visible", scope: "body", match: "safe-regex", value: "(a+)+$" },
+      { kind: "url", match: "contains", value: "x".repeat(2001) },
+    ]) {
+      expect(
+        parseRequest(
+          JSON.stringify({
+            id: "bad-wait",
+            type: "interactive",
+            action: {
+              kind: "click",
+              ref: "R1",
+              wait: { mode: "any", timeoutMs: 10, conditions: [condition] },
+            },
+          })
+        )
+      ).toMatchObject({ success: false });
+    }
+  });
   it("defaults omitted protocol versions to legacy v1 and accepts v2", () => {
     for (const [protocolVersion, expected] of [
       [undefined, 1],
@@ -162,7 +218,24 @@ describe("interactive request protocol", () => {
       expect(result).toMatchObject({
         success: true,
         request: {
-          action: { kind: "click", ref: "R12", method, waitForText: "Invitation sent" },
+          action: {
+            kind: "click",
+            ref: "R12",
+            method,
+            waitForText: "Invitation sent",
+            wait: {
+              mode: "all",
+              conditions: [
+                {
+                  kind: "text",
+                  state: "visible",
+                  scope: "body",
+                  match: "contains",
+                  value: "Invitation sent",
+                },
+              ],
+            },
+          },
         },
       });
     }
@@ -254,32 +327,62 @@ describe("interactive request protocol", () => {
   });
 
   it("parses v2 state guards and page sessions", () => {
-    const guarded = parseRequest(JSON.stringify({
-      id: "guarded", type: "interactive", protocolVersion: 2, session: "opaque",
-      action: { kind: "click", ref: "R1", fromState: "doc-1:2", strictState: true },
-    }));
-    expect(guarded).toMatchObject({ success: true, request: { session: "opaque", action: {
-      fromState: "doc-1:2", strictState: true,
-    } } });
+    const guarded = parseRequest(
+      JSON.stringify({
+        id: "guarded",
+        type: "interactive",
+        protocolVersion: 2,
+        session: "opaque",
+        action: { kind: "click", ref: "R1", fromState: "doc-1:2", strictState: true },
+      })
+    );
+    expect(guarded).toMatchObject({
+      success: true,
+      request: {
+        session: "opaque",
+        action: {
+          fromState: "doc-1:2",
+          strictState: true,
+        },
+      },
+    });
 
     for (const request of [
       { id: "open", type: "session", action: "open", browser: "default", page: "main", ttl: 300 },
       { id: "renew", type: "session", action: "renew", session: "opaque", ttl: 60 },
       { id: "close", type: "session", action: "close", session: "opaque" },
-    ]) expect(parseRequest(JSON.stringify(request))).toMatchObject({ success: true });
+    ])
+      expect(parseRequest(JSON.stringify(request))).toMatchObject({ success: true });
   });
 
   it("rejects session TTLs outside 1 through 3600 seconds", () => {
     for (const ttl of [0, 3601]) {
-      expect(parseRequest(JSON.stringify({
-        id: `ttl-${ttl}`, type: "session", action: "open", browser: "default", page: "main", ttl,
-      }))).toMatchObject({ success: false });
+      expect(
+        parseRequest(
+          JSON.stringify({
+            id: `ttl-${ttl}`,
+            type: "session",
+            action: "open",
+            browser: "default",
+            page: "main",
+            ttl,
+          })
+        )
+      ).toMatchObject({ success: false });
     }
   });
 
   it("preserves an optional session on arbitrary script execution", () => {
-    expect(parseRequest(JSON.stringify({
-      id: "execute-owner", type: "execute", browser: "default", script: "await browser.listPages()", session: "opaque-owner",
-    }))).toMatchObject({ success: true, request: { type: "execute", session: "opaque-owner" } });
+    expect(
+      parseRequest(
+        JSON.stringify({
+          id: "execute-owner",
+          type: "execute",
+          browser: "default",
+          script: "await browser.listPages()",
+          session: "opaque-owner",
+        })
+      )
+    ).toMatchObject({ success: true, request: { type: "execute", session: "opaque-owner" } });
   });
 });

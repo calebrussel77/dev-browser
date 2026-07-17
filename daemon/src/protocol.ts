@@ -11,9 +11,140 @@ const RequestBaseSchema = z.object({
 });
 
 const StateGuardSchema = z.object({
-  fromState: z.string().regex(/^doc-\d+:\d+$/).optional(),
+  fromState: z
+    .string()
+    .regex(/^doc-\d+:\d+$/)
+    .optional(),
   strictState: z.boolean().default(false),
 });
+
+const WAIT_MATCH_MAX_LENGTH = 2_000;
+
+function isSafeRegex(value: string): boolean {
+  if (value.length > WAIT_MATCH_MAX_LENGTH) return false;
+  try {
+    new RegExp(value);
+  } catch {
+    return false;
+  }
+  return !(
+    /\\[1-9]/.test(value) ||
+    /\(\?[=!<]/.test(value) ||
+    /\)(?:\*|\+|\{\d)/.test(value) ||
+    /(?:\*|\+|\{\d+(?:,\d*)?\})[^)]*\)(?:\*|\+|\{)/.test(value) ||
+    /\([^)]*(?:\*|\+|\{\d+(?:,\d*)?\})[^)]*\)(?:\*|\+|\{)/.test(value)
+  );
+}
+
+const WaitValueSchema = z.string().min(1).max(WAIT_MATCH_MAX_LENGTH);
+const WaitMatchSchema = z.enum(["exact", "contains", "glob", "safe-regex"]);
+const MatchFieldsSchema = z
+  .object({
+    match: WaitMatchSchema,
+    value: WaitValueSchema,
+  })
+  .superRefine((value, context) => {
+    if (value.match === "safe-regex" && !isSafeRegex(value.value)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["value"],
+        message: "unsafe regular expression",
+      });
+    }
+  });
+
+const TextWaitConditionSchema = z
+  .object({
+    kind: z.literal("text"),
+    state: z.enum(["visible", "hidden"]),
+    scope: z.enum(["body", "dialog", "toast"]),
+  })
+  .and(MatchFieldsSchema);
+const UrlWaitConditionSchema = z.object({ kind: z.literal("url") }).and(MatchFieldsSchema);
+const RefWaitConditionSchema = z
+  .object({
+    kind: z.literal("ref"),
+    ref: z.string().regex(/^R\d+$/),
+    state: z.enum([
+      "attached",
+      "detached",
+      "visible",
+      "hidden",
+      "enabled",
+      "disabled",
+      "valueChanged",
+      "attributeChanged",
+      "stateChanged",
+    ]),
+    attribute: z.string().min(1).max(200).optional(),
+    expected: z.string().max(WAIT_MATCH_MAX_LENGTH).optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.state === "attributeChanged" && !value.attribute) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["attribute"],
+        message: "attribute is required",
+      });
+    }
+    if (value.state !== "attributeChanged" && value.state !== "stateChanged" && value.attribute) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["attribute"],
+        message: "attribute is only valid for changed state conditions",
+      });
+    }
+  });
+const SurfaceWaitConditionSchema = z.object({
+  kind: z.enum(["dialog", "toast"]),
+  state: z.enum(["opened", "closed"]),
+});
+const EventWaitConditionSchema = z.object({
+  kind: z.enum(["popup", "download", "fileChooser"]),
+});
+const NavigationWaitConditionSchema = z.object({
+  kind: z.literal("navigation"),
+  state: z.enum(["navigation", "document"]),
+});
+const ResponseWaitConditionSchema = z
+  .object({
+    kind: z.literal("response"),
+    method: z.string().min(1).max(20).optional(),
+    status: z.number().int().min(100).max(599).optional(),
+  })
+  .and(MatchFieldsSchema);
+const FailedRequestWaitConditionSchema = z
+  .object({
+    kind: z.literal("failedRequest"),
+    method: z.string().min(1).max(20).optional(),
+  })
+  .and(MatchFieldsSchema);
+const NetworkIdleWaitConditionSchema = z.object({
+  kind: z.literal("networkIdle"),
+  specialized: z.literal(true),
+  idleMs: z.number().int().min(1).max(30_000).default(500),
+});
+
+export const WaitConditionSchema = z.union([
+  TextWaitConditionSchema,
+  UrlWaitConditionSchema,
+  RefWaitConditionSchema,
+  SurfaceWaitConditionSchema,
+  EventWaitConditionSchema,
+  NavigationWaitConditionSchema,
+  ResponseWaitConditionSchema,
+  FailedRequestWaitConditionSchema,
+  NetworkIdleWaitConditionSchema,
+]);
+export const WaitSpecSchema = z.object({
+  mode: z.enum(["all", "any"]).default("all"),
+  timeoutMs: z.number().int().min(1).max(120_000),
+  conditions: z.array(WaitConditionSchema).min(1).max(20),
+});
+export type WaitCondition = z.infer<typeof WaitConditionSchema>;
+export type WaitSpec = z.infer<typeof WaitSpecSchema>;
+
+const WaitableActionSchema = z.object({ wait: WaitSpecSchema.optional() });
 
 const ExecuteRequestSchema = RequestBaseSchema.extend({
   type: z.literal("execute"),
@@ -26,21 +157,21 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
   session: z.string().min(1).max(500).optional(),
 });
 
-const InteractiveClickByRefSchema = StateGuardSchema.extend({
+const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
   kind: z.literal("click"),
   ref: z.string().regex(/^R\d+$/),
   method: z.enum(["mouse", "locator"]).default("mouse"),
   expectText: z.string().min(1).optional(),
-  waitForText: z.string().min(1).optional(),
+  waitForText: WaitValueSchema.optional(),
 });
 
-const InteractiveClickByCoordinatesSchema = StateGuardSchema.extend({
+const InteractiveClickByCoordinatesSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
   kind: z.literal("click"),
   x: z.number().finite().nonnegative(),
   y: z.number().finite().nonnegative(),
   method: z.literal("mouse").default("mouse"),
   expectText: z.string().min(1).optional(),
-  waitForText: z.string().min(1).optional(),
+  waitForText: WaitValueSchema.optional(),
 });
 
 const ObserveOptionsSchema = z.object({
@@ -61,7 +192,7 @@ const ObserveOptionsSchema = z.object({
 
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
-  z.object({
+  WaitableActionSchema.extend({
     kind: z.literal("navigate"),
     url: z.string().url(),
   }),
@@ -78,7 +209,7 @@ const InteractiveActionSchema = z.union([
   }),
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
-  StateGuardSchema.extend({
+  StateGuardSchema.merge(WaitableActionSchema).extend({
     kind: z.literal("type"),
     ref: z
       .string()
@@ -119,9 +250,24 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
 });
 
 const SessionRequestSchema = z.union([
-  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("open"), browser: z.string().min(1).default("default"), page: z.string().min(1), ttl: z.number().int().min(1).max(3600).default(300) }),
-  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("renew"), session: z.string().min(1).max(500), ttl: z.number().int().min(1).max(3600).default(300) }),
-  RequestBaseSchema.extend({ type: z.literal("session"), action: z.literal("close"), session: z.string().min(1).max(500) }),
+  RequestBaseSchema.extend({
+    type: z.literal("session"),
+    action: z.literal("open"),
+    browser: z.string().min(1).default("default"),
+    page: z.string().min(1),
+    ttl: z.number().int().min(1).max(3600).default(300),
+  }),
+  RequestBaseSchema.extend({
+    type: z.literal("session"),
+    action: z.literal("renew"),
+    session: z.string().min(1).max(500),
+    ttl: z.number().int().min(1).max(3600).default(300),
+  }),
+  RequestBaseSchema.extend({
+    type: z.literal("session"),
+    action: z.literal("close"),
+    session: z.string().min(1).max(500),
+  }),
 ]);
 
 const BrowsersRequestSchema = RequestBaseSchema.extend({
@@ -202,9 +348,11 @@ export type SessionRequest = z.infer<typeof SessionRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
-    ? Omit<Action, "strictState" | "padding"> &
-        { strictState?: boolean } &
-        (Action extends { kind: "shot" } ? { padding?: number } : unknown)
+    ? Omit<Action, "strictState" | "padding"> & { strictState?: boolean } & (Action extends {
+          kind: "shot";
+        }
+          ? { padding?: number }
+          : unknown)
     : never
   : never;
 export type InteractiveRequest = Omit<
@@ -279,6 +427,27 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
       success: false,
       error: describeZodError(result.error),
       id: extractId(parsed),
+    };
+  }
+
+  if (
+    result.data.type === "interactive" &&
+    result.data.action.kind === "click" &&
+    result.data.action.waitForText &&
+    !result.data.action.wait
+  ) {
+    result.data.action.wait = {
+      mode: "all",
+      timeoutMs: Math.min(result.data.timeoutMs ?? 10_000, 5_000),
+      conditions: [
+        {
+          kind: "text",
+          state: "visible",
+          scope: "body",
+          match: "contains",
+          value: result.data.action.waitForText,
+        },
+      ],
     };
   }
 
