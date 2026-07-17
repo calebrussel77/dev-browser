@@ -513,7 +513,10 @@ enum Command {
             help = "Scope observation to a landmark substring (find's within grammar), role:<role>, or name:<exact name>"
         )]
         within: Option<String>,
-        #[arg(long, help = "Return bounded normalized innerText instead of the element tree")]
+        #[arg(
+            long,
+            help = "Return bounded normalized innerText instead of the element tree"
+        )]
         text_only: bool,
     },
     #[command(
@@ -2549,14 +2552,9 @@ mod tests {
 
     #[test]
     fn parses_observe_content_scope_flags_and_rejects_combining_root_and_within() {
-        let parsed = Cli::try_parse_from([
-            "dev-browser",
-            "observe",
-            "--within",
-            "main",
-            "--text-only",
-        ])
-        .unwrap();
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "observe", "--within", "main", "--text-only"])
+                .unwrap();
         assert!(matches!(
             parsed.command,
             Some(Command::Observe { ref within, text_only: true, .. })
@@ -2582,15 +2580,10 @@ mod tests {
             Some(Command::Text { ref ref_id, .. }) if ref_id.as_deref() == Some("R42")
         ));
         assert!(Cli::try_parse_from(["dev-browser", "text"]).is_err());
-        assert!(Cli::try_parse_from([
-            "dev-browser",
-            "text",
-            "--ref",
-            "R1",
-            "--within",
-            "main"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["dev-browser", "text", "--ref", "R1", "--within", "main"])
+                .is_err()
+        );
 
         let assertion = Cli::try_parse_from([
             "dev-browser",

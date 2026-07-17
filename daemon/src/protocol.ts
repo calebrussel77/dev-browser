@@ -587,13 +587,14 @@ export type TraceRequest = z.infer<typeof TraceRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
-    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states"> & {
+    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states" | "textOnly"> & {
         strictState?: boolean;
       } & (Action extends {
           kind: "shot";
         }
           ? { padding?: number }
           : unknown) &
+        (Action extends { kind: "observe" } ? { textOnly?: boolean } : unknown) &
         (Action extends { kind: "find" }
           ? {
               scope?: "visible" | "viewport" | "document";
