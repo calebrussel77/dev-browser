@@ -1029,9 +1029,11 @@ export async function executeInteractiveAction(
       } finally {
         await container.cleanup();
       }
-      result.matches = targeted?.matches ?? [];
-      result.ambiguity =
-        targeted?.ambiguity ?? { ambiguous: false, topScore: null, scoreGap: null, reason: "no-match" };
+      // The loop always completes at least one perception + findTargets pass
+      // before any break (errors propagate before reaching here), so both
+      // `targeted` and `lastPerception` are guaranteed to be assigned.
+      result.matches = targeted!.matches;
+      result.ambiguity = targeted!.ambiguity;
       result.scrollMetrics = {
         steps,
         uniqueItems: seen.size,
@@ -1039,7 +1041,7 @@ export async function executeInteractiveAction(
         exhausted,
         positions,
       };
-      if (lastPerception) applyPerception(result, lastPerception, protocolVersion, protocolVersion === 1);
+      applyPerception(result, lastPerception!, protocolVersion, protocolVersion === 1);
       break;
     }
 

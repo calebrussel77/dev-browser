@@ -50,8 +50,19 @@ export async function scrollContainerByViewport(
   page: Page,
   container: ResolvedActionTarget
 ): Promise<{ deltaY: number }> {
-  const clientHeight = await container.locator.evaluate((element) => (element as HTMLElement).clientHeight);
-  const deltaY = Math.max(1, clientHeight);
+  // Re-read live geometry before every wheel: when the container is already
+  // at its maximum scrollTop another wheel would chain to the window (scroll
+  // the page underneath), so skip the trusted input entirely in that case.
+  const geometry = await container.locator.evaluate((element) => {
+    const scrollable = element as HTMLElement;
+    return {
+      clientHeight: scrollable.clientHeight,
+      scrollTop: scrollable.scrollTop,
+      scrollHeight: scrollable.scrollHeight,
+    };
+  });
+  if (geometry.scrollTop >= geometry.scrollHeight - geometry.clientHeight - 0.5) return { deltaY: 0 };
+  const deltaY = Math.max(1, geometry.clientHeight);
   await page.mouse.move(container.box.x + container.box.width / 2, container.box.y + container.box.height / 2);
   await page.mouse.wheel(0, deltaY);
   await settleScroll(page);
@@ -70,16 +81,26 @@ async function scrollUntil(
     const matched = container
       ? await container.locator.evaluate((element, { kind, expected }) => {
           const normalized = expected.trim().toLowerCase();
-          const intersectsViewport = (candidate: Element) => {
+          // The container clips its own content: a candidate counts as
+          // visible only when its rect intersects the container's visible
+          // (client) area, not merely the window viewport — a small
+          // container inside a large window must not match rows that are
+          // still scrolled out of its clipped region.
+          const containerRect = element.getBoundingClientRect();
+          const visibleLeft = containerRect.left + element.clientLeft;
+          const visibleTop = containerRect.top + element.clientTop;
+          const visibleRight = visibleLeft + element.clientWidth;
+          const visibleBottom = visibleTop + element.clientHeight;
+          const intersectsContainerViewport = (candidate: Element) => {
             const rect = candidate.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+            return rect.width > 0 && rect.height > 0 && rect.bottom > visibleTop && rect.top < visibleBottom && rect.right > visibleLeft && rect.left < visibleRight;
           };
           if (kind === "text") return Array.from(element.querySelectorAll("*")).some((candidate) => {
-            if (!intersectsViewport(candidate)) return false;
+            if (!intersectsContainerViewport(candidate)) return false;
             const ownText = Array.from(candidate.childNodes).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || "").join(" ").trim().toLowerCase();
             return ownText === normalized;
           });
-          return Array.from(element.querySelectorAll("[role]")).some((candidate) => candidate.getAttribute("role")?.trim().toLowerCase() === normalized && intersectsViewport(candidate));
+          return Array.from(element.querySelectorAll("[role]")).some((candidate) => candidate.getAttribute("role")?.trim().toLowerCase() === normalized && intersectsContainerViewport(candidate));
         }, { kind, expected })
       : await page.evaluate(({ kind, expected }) => {
           const normalized = expected.trim().toLowerCase();
@@ -96,9 +117,17 @@ async function scrollUntil(
         }, { kind, expected });
     if (matched) return { steps: step, matched: true };
     if (step < maxSteps) {
+      // Container branch: re-read live geometry each step and stop when the
+      // container is already at its maximum scrollTop — another wheel there
+      // would chain to the window and scroll the page underneath.
       const deltaY = container
-        ? await container.locator.evaluate((element) => Math.max(1, (element as HTMLElement).clientHeight))
+        ? await container.locator.evaluate((element) => {
+            const scrollable = element as HTMLElement;
+            if (scrollable.scrollTop >= scrollable.scrollHeight - scrollable.clientHeight - 0.5) return 0;
+            return Math.max(1, scrollable.clientHeight);
+          })
         : await page.evaluate(() => Math.max(1, innerHeight));
+      if (container && deltaY === 0) return { steps: step, matched: false };
       await wheel(deltaY);
       await settleScroll(page);
     }

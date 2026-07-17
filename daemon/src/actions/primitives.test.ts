@@ -131,7 +131,8 @@ describe.sequential("trusted interaction primitives", () => {
     await page.setContent(
       `<div data-testid="scroll-container" role="region" aria-label="Container" style="height:200px;width:300px;overflow-y:auto;position:relative">
         <div style="height:1300px;position:relative"><p style="position:absolute;top:1000px">Deep container item</p></div>
-      </div>`
+      </div>
+      <div style="height:2000px">Tall page content below the container</div>`
     );
     const container = await ref("Container");
     expect(container.element.actionable).toBe(true);
@@ -149,6 +150,20 @@ describe.sequential("trusted interaction primitives", () => {
       .locator('[data-testid="scroll-container"]')
       .evaluate((element) => element.scrollTop);
     expect(scrollTop).toBeGreaterThan(0);
+    // When matched fires, the target must actually intersect the container's
+    // clipped visible area — not merely the (taller) window viewport. A
+    // window-bound check would report matched one step early here because
+    // the 200px container sits inside a 400px window.
+    const intersectsContainer = await page
+      .locator('[data-testid="scroll-container"]')
+      .evaluate((element) => {
+        const containerRect = element.getBoundingClientRect();
+        const visibleTop = containerRect.top + element.clientTop;
+        const visibleBottom = visibleTop + element.clientHeight;
+        const target = element.querySelector("p")!.getBoundingClientRect();
+        return target.bottom > visibleTop && target.top < visibleBottom;
+      });
+    expect(intersectsContainer).toBe(true);
 
     // Bounded: an unreachable target still stops at maxSteps without matching.
     await page.evaluate(() => {
@@ -162,6 +177,23 @@ describe.sequential("trusted interaction primitives", () => {
       fromState: (await ref("Container")).stateId,
     });
     expect(bounded.scroll).toMatchObject({ matched: false, steps: 2 });
+
+    // Overscroll guard: with a generous budget the scan stops as soon as the
+    // container reaches its maximum scrollTop instead of wheeling further —
+    // the page underneath must never scroll (no wheel chaining to window).
+    await page.evaluate(() => {
+      document.querySelector('[data-testid="scroll-container"]')!.scrollTop = 0;
+    });
+    const exhausted = await run({
+      kind: "scroll",
+      ref: container.ref,
+      until: "text:Never appears",
+      maxSteps: 20,
+      fromState: (await ref("Container")).stateId,
+    });
+    expect(exhausted.scroll!.matched).toBe(false);
+    expect(exhausted.scroll!.steps).toBeLessThan(20);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
   });
 
   it("selects and checks with final safe state while rejecting disabled and readonly controls", async () => {
@@ -406,6 +438,11 @@ describe.sequential("find --scroll-container bounded auto-scroll over a virtuali
 
   it("detects exhaustion when two consecutive steps add nothing and the scroll position stops changing", async () => {
     const container = await containerRef();
+    const page = await manager.getPage(browser, "main");
+    // The container resolve may legitimately scroll the window once to bring
+    // the container into view; capture that baseline, then require that the
+    // scan itself never scrolls the page underneath (no wheel chaining once
+    // the container is at its maximum scrollTop).
     const result = await run({
       kind: "find",
       role: "listitem",
@@ -417,5 +454,15 @@ describe.sequential("find --scroll-container bounded auto-scroll over a virtuali
     expect(result.scrollMetrics!.uniqueItems).toBe(60);
     const positions = result.scrollMetrics!.positions;
     expect(positions.at(-1)).toBe(positions.at(-2));
+    const scrollYAfterFirstScan = await page.evaluate(() => window.scrollY);
+    const again = await run({
+      kind: "find",
+      role: "listitem",
+      limit: 10,
+      scrollContainer: await containerRef(),
+      maxSteps: 12,
+    });
+    expect(again.scrollMetrics!.exhausted).toBe(true);
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollYAfterFirstScan);
   });
 });
