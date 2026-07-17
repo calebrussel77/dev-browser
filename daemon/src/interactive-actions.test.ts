@@ -174,6 +174,27 @@ describe.sequential("interactive Playwright actions", () => {
     expect(observe.elements).toEqual(read.elements);
   });
 
+  it("keeps text/assert responses scope bounded instead of re-collecting the full unscoped tree", async () => {
+    const text = await executeInteractiveAction(
+      manager,
+      request({ kind: "text", within: "main", maxChars: 20_000 })
+    );
+    const assertResult = await executeInteractiveAction(
+      manager,
+      request({ kind: "assert", within: "main", text: "Naminsita Bakayoko", match: "contains" })
+    );
+
+    for (const result of [text, assertResult]) {
+      expect(result.coordinateSpace).toBeDefined();
+      expect(result.coordinateSpace?.viewport.width).toBeGreaterThan(0);
+      expect(result.coordinateSpace?.viewport.height).toBeGreaterThan(0);
+      expect(result.tree).toBeUndefined();
+      expect(result.elements).toBeUndefined();
+    }
+    expect(text.textContent).toContain("Naminsita Bakayoko");
+    expect(assertResult.asserted).toBe(true);
+  });
+
   it("find ranks the duplicate button in the requested landmark", async () => {
     const result = await executeInteractiveAction(
       manager,

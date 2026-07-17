@@ -490,6 +490,41 @@ function applyPerception(
   }
 }
 
+/**
+ * Populates `coordinateSpace` directly from the viewport/DPR/scroll without
+ * running a full, unscoped `collectPageState` walk. Used by actions (`text`,
+ * `assert`) that already resolved their own scoped content and must not have
+ * the shared finalizer re-collect the entire page tree just to fill in this
+ * field.
+ */
+async function coordinateSpaceOnly(
+  page: Page,
+  protocolVersion: 1 | 2
+): Promise<NonNullable<InteractiveResult["coordinateSpace"]>> {
+  const info = await page.evaluate(() => ({
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    devicePixelRatio,
+    scrollX,
+    scrollY,
+  }));
+  const viewport = page.viewportSize() ?? { width: info.innerWidth, height: info.innerHeight };
+  return protocolVersion === 2
+    ? {
+        unit: "css-px",
+        screenshotScale: "css",
+        viewport,
+        devicePixelRatio: info.devicePixelRatio,
+        scroll: { x: info.scrollX, y: info.scrollY },
+      }
+    : {
+        unit: "css-px",
+        screenshotScale: "css",
+        viewport,
+        devicePixelRatio: info.devicePixelRatio,
+      };
+}
+
 interface PageSignal {
   url: string;
   snapshot: string;
@@ -1723,12 +1758,19 @@ export async function executeInteractiveAction(
   result.url = page.url();
   result.title = await page.title();
   if (!result.coordinateSpace) {
-    applyPerception(
-      result,
-      await perceive(page, {}, protocolVersion === 1),
-      protocolVersion,
-      action.kind !== "find" || protocolVersion === 1
-    );
+    if (action.kind === "text" || action.kind === "assert") {
+      // These actions already resolved their own scoped content above; avoid
+      // re-collecting the full unscoped tree/elements just to populate
+      // coordinateSpace (see coordinateSpaceOnly's doc comment).
+      result.coordinateSpace = await coordinateSpaceOnly(page, protocolVersion);
+    } else {
+      applyPerception(
+        result,
+        await perceive(page, {}, protocolVersion === 1),
+        protocolVersion,
+        action.kind !== "find" || protocolVersion === 1
+      );
+    }
   }
 
   if (request.shot || request.annotate || action.kind === "shot") {
