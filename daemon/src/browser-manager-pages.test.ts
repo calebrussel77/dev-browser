@@ -1,4 +1,5 @@
 import { mkdtemp } from "node:fs/promises";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,6 +12,30 @@ const browserName = "browser-manager-pages";
 
 function createDataUrl(title: string, body: string): string {
   return `data:text/html,${encodeURIComponent(`<title>${title}</title>${body}`)}`;
+}
+
+/** Finds a loopback TCP port that is free at the moment of the call, then
+ * releases it immediately so a subsequent connection attempt reliably fails
+ * with ECONNREFUSED instead of racing a still-bound listener. */
+async function findUnusedLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      server.close((closeError) => {
+        if (closeError) {
+          reject(closeError);
+          return;
+        }
+        if (!address || typeof address === "string") {
+          reject(new Error("Could not determine an unused loopback port"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+  });
 }
 
 describe.sequential("BrowserManager page discovery", () => {
@@ -137,4 +162,25 @@ describe.sequential("BrowserManager page discovery", () => {
     expect(anonymousPage.isClosed()).toBe(true);
     expect(manager.listBrowsers()).toEqual([]);
   }, 120_000);
+
+  it("connectBrowser reports an actionable ECONNREFUSED diagnostic when nothing is listening", async () => {
+    const port = await findUnusedLoopbackPort();
+    const endpoint = `http://127.0.0.1:${port}`;
+
+    let thrown: unknown;
+    try {
+      await manager.connectBrowser(`${browserName}-econnrefused`, endpoint);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+
+    // The original CDP resolution failure must survive in the diagnostic...
+    expect(message).toMatch(/ECONNREFUSED/);
+    expect(message).toContain(endpoint);
+    // ...alongside a listener-specific recovery hint naming the actual port.
+    expect(message).toMatch(new RegExp(`--remote-debugging-port=${port}\\b`));
+  }, 30_000);
 });
