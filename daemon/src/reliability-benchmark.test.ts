@@ -1,6 +1,8 @@
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { runInNewContext } from "node:vm";
+import { setFlagsFromString } from "node:v8";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -89,12 +91,16 @@ describe.sequential("maintained agent reliability benchmark", () => {
       action: { kind: "observe" as const, full: false, delta, track, maxNodes: 1_000, maxChars: 100_000, depth: 12, breadth: 500 },
     });
 
+    setFlagsFromString("--expose_gc");
+    const collectGarbage = runInNewContext("gc") as () => void;
+    collectGarbage();
     const heapBefore = process.memoryUsage().heapUsed;
     const observeStarted = performance.now();
     const full = await observe(false);
     const observeLatencyMs = performance.now() - observeStarted;
     const firstState = full.stateId!;
     for (let index = 0; index < 24; index += 1) await observe(false, `memory-${index % 2}`);
+    collectGarbage();
     const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
 
     await collectPageState(page, { delta: false, track: "delta-measure", maxNodes: 1_000, maxChars: 100_000, depth: 12, breadth: 500 });
