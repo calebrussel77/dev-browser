@@ -41,6 +41,56 @@ pub fn agent_schema() -> Value {
             "refLength": 32,
             "confirmationTokenSeconds": 30
         },
+        "interactiveRequest": {
+            "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
+            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
+            "actionGrammar": {
+                "pages": { "required": [], "optional": [] },
+                "navigate": { "required": ["url"], "optional": ["wait"] },
+                "back": { "required": [], "optional": ["wait"] },
+                "forward": { "required": [], "optional": ["wait"] },
+                "reload": { "required": [], "optional": ["wait"] },
+                "read": { "required": [], "optional": ["limit:1..500", "depth:1..50"] },
+                "observe": { "required": [], "optional": ["full:boolean", "delta:boolean", "track:string", "maxNodes:1..1000", "maxChars:1..100000", "depth:1..50", "breadth:1..500", "continuation:string"] },
+                "find": { "required": [], "optional": ["query", "role", "name", "nameMode:exact|contains", "within", "near", "frame", "scope:visible|viewport|document", "states[]", "index", "limit:1..50"] },
+                "click": { "oneOf": [["ref"], ["x", "y"]], "optional": ["method:mouse|locator", "retry:never|safe|once", "fromState", "strictState", "expectText", "confirmToken", "wait"] },
+                "focus": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken"] },
+                "press": { "required": ["key"], "optional": ["ref", "fromState", "strictState", "confirmToken", "wait"] },
+                "paste": { "required": ["ref", "text"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "scroll": { "oneOf": [["ref"], ["deltaX|deltaY"], ["direction", "pages"], ["until"]], "optional": ["maxSteps", "fromState", "strictState", "wait"] },
+                "select": { "required": ["ref"], "oneOf": [["value"], ["label"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "check": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "uncheck": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "hover": { "required": ["ref"], "optional": ["fromState", "strictState", "wait"] },
+                "drag": { "required": ["from", "to"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "type": { "required": ["ref", "text"], "optional": ["clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
+                "upload": { "required": ["ref", "file"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState"] },
+                "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState"] }
+            }
+        },
+        "waitGrammar": {
+            "spec": { "mode": "all|any", "timeoutMs": "1..120000", "conditions": "1..20 condition objects" },
+            "conditions": {
+                "text": { "required": ["state:visible|hidden", "scope", "match:exact|contains|glob|safe-regex", "value"] },
+                "url": { "required": ["match:exact|contains|glob|safe-regex", "value"] },
+                "ref": { "required": ["ref", "state:visible|hidden|enabled|disabled|checked|unchecked|focused|valueChanged|attributeChanged|stateChanged"], "optional": ["attribute", "expected"] },
+                "dialog": { "required": ["state:opened|closed"] },
+                "toast": { "required": ["state:opened|closed"] },
+                "popup": { "required": [] }, "download": { "required": [] }, "fileChooser": { "required": [] },
+                "navigation": { "required": ["state:url|document|same-document"] },
+                "response": { "required": ["match", "value"], "optional": ["method", "status"] },
+                "failedRequest": { "required": ["match", "value"], "optional": ["method"] },
+                "networkIdle": { "required": ["specialized:true"], "optional": ["idleMs:0..10000"] }
+            }
+        },
+        "responseGrammar": {
+            "successRequired": ["protocolVersion:2", "ok:true", "requestId", "browser", "page", "action"],
+            "commonOptional": ["documentId", "stateId", "url", "title", "tree", "elements", "coordinateSpace", "warnings", "trace"],
+            "actionFields": { "observe": ["delta", "truncation", "artifacts"], "find": ["matches", "ambiguity"], "click": ["clicked", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
+            "failureRequired": ["protocolVersion:2", "ok:false", "requestId", "error.code", "error.message", "error.recoverable"],
+            "failureOptional": ["browser", "page", "action", "error.details", "error.nextCommands"]
+        },
         "diagnostics": {
             "exitStatus": { "healthyOrWarnings": 0, "invalidUsage": 2, "runtimeFailure": 6 },
             "codes": ["DAEMON_NOT_RUNNING", "DAEMON_VERSION_MISMATCH", "DAEMON_HANDSHAKE_UNSUPPORTED", "DAEMON_START_FAILED", "CDP_DISCOVERY_OR_ATTACH_FAILED", "CDP_NO_TARGETS", "RENDERER_ATTACH_FAILED"]
