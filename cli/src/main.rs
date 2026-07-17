@@ -263,6 +263,27 @@ impl ClickMethod {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum RetryPolicy {
+    Never,
+    Safe,
+    Once,
+}
+
+impl RetryPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Safe => "safe",
+            Self::Once => "once",
+        }
+    }
+}
+
+fn apply_retry_policy(action: &mut Value, retry: RetryPolicy) {
+    action["retry"] = Value::String(retry.as_str().to_string());
+}
+
 #[derive(Subcommand)]
 enum Command {
     #[command(
@@ -347,7 +368,7 @@ enum Command {
     },
     #[command(
         about = "Click through trusted Playwright mouse or locator input",
-        long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). --wait-for TEXT polls for expected UI and retries once only when the first click caused no observable change. --expect-text guards irreversible actions and disables retry. Screenshot pixels and --xy coordinates both use CSS pixels."
+        long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). Retries default to never; --retry safe permits one retry only with strong evidence that no side effect or page change began, while --retry once is explicit but remains blocked for guarded or irreversible actions. Screenshot pixels and --xy coordinates both use CSS pixels."
     )]
     Click {
         #[command(flatten)]
@@ -368,6 +389,8 @@ enum Command {
         xy: Option<Coordinates>,
         #[arg(long, value_enum, default_value = "mouse")]
         method: ClickMethod,
+        #[arg(long, value_enum, default_value = "never")]
+        retry: RetryPolicy,
         #[arg(long, value_name = "TEXT")]
         expect_text: Option<String>,
         #[arg(long, value_name = "TEXT")]
@@ -579,6 +602,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             ref_id,
             xy,
             method,
+            retry,
             expect_text,
             wait_for,
             wait,
@@ -594,6 +618,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 "kind": "click",
                 "method": method.as_str(),
             });
+            apply_retry_policy(&mut action, *retry);
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
             }
@@ -1095,8 +1120,8 @@ fn format_duration_ms(duration_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_execute_request, cli_error_exit_code, stream_responses, Cli, Command, ResultMode,
-        SessionCommand,
+        apply_retry_policy, build_execute_request, cli_error_exit_code, stream_responses, Cli,
+        Command, ResultMode, SessionCommand,
     };
     use clap::Parser;
     use std::io::Cursor;
@@ -1309,6 +1334,36 @@ mod tests {
             "--wait-timeout",
             "120001",
             "--wait-popup"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_and_serializes_every_click_retry_policy() {
+        for policy in ["never", "safe", "once"] {
+            let parsed = Cli::try_parse_from([
+                "dev-browser",
+                "click",
+                "--ref",
+                "R2",
+                "--retry",
+                policy,
+            ])
+            .unwrap();
+            let Some(Command::Click { retry, .. }) = parsed.command else {
+                panic!("expected click command");
+            };
+            let mut action = serde_json::json!({ "kind": "click" });
+            apply_retry_policy(&mut action, retry);
+            assert_eq!(action["retry"], policy);
+        }
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--retry",
+            "always"
         ])
         .is_err());
     }

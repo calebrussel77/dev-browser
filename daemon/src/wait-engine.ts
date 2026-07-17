@@ -1,4 +1,13 @@
-import type { CDPSession, Download, FileChooser, Frame, Page, Request, Response } from "playwright";
+import type {
+  CDPSession,
+  Dialog,
+  Download,
+  FileChooser,
+  Frame,
+  Page,
+  Request,
+  Response,
+} from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
 import type { WaitCondition, WaitSpec } from "./protocol.js";
@@ -13,6 +22,11 @@ type ConditionObservation = {
 };
 
 export interface WaitEvents {
+  requests: Array<{ url: string; method: string }>;
+  mutations: Array<{ type: string; target: string; attribute?: string }>;
+  focusChanges: Array<{ type: string; target: string }>;
+  valueChanges: Array<{ type: string; target: string; property?: string }>;
+  dialogs: Array<{ type: string; message: string }>;
   popup: Array<{
     targetId?: string;
     url: string;
@@ -26,6 +40,8 @@ export interface WaitEvents {
   responses: Array<{ url: string; method: string; status: number }>;
   failedRequests: Array<{ url: string; method: string; failure: string | null }>;
 }
+
+type TransientCapture = Pick<WaitEvents, "mutations" | "focusChanges" | "valueChanges">;
 
 export interface WaitResult {
   mode: WaitSpec["mode"];
@@ -42,6 +58,14 @@ export interface WaitStateContext<State> {
     popup: Page,
     signal: AbortSignal
   ) => Promise<{ targetId?: string; url?: string; title?: string }>;
+}
+
+const capturedEventsByError = new WeakMap<object, WaitEvents>();
+
+export function capturedWaitEvents(error: unknown): WaitEvents | undefined {
+  return error !== null && (typeof error === "object" || typeof error === "function")
+    ? capturedEventsByError.get(error as object)
+    : undefined;
 }
 
 const POPUP_METADATA_TIMEOUT_MS = 500;
@@ -249,21 +273,248 @@ async function scopedText(page: Page, scope: "body" | "dialog" | "toast"): Promi
     };
     return Array.from(document.querySelectorAll(selector))
       .filter(visible)
-      .map((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim());
+      .map((element) =>
+        ((element as HTMLElement).innerText ?? element.textContent ?? "")
+          .replace(/\s+/g, " ")
+          .trim()
+      );
   }, scope);
+}
+
+async function installTransientCapture(page: Page, ownerToken: string): Promise<void> {
+  const installed = await page.evaluate((token) => {
+    type SetterRestoration = {
+      prototype: object;
+      property: string;
+      descriptor: PropertyDescriptor;
+      setter: (this: unknown, value: unknown) => void;
+    };
+    type CaptureManager = {
+      version: 1;
+      ownerToken: string;
+      captures: Map<string, TransientCapture>;
+      observer: MutationObserver | null;
+      setterRestorations: SetterRestoration[];
+      cleanupToken(token: string): void;
+      rollback(): void;
+    };
+    const captureWindow = window as Window & {
+      __devBrowserWaitCaptureManager?: CaptureManager;
+    };
+    const existing = captureWindow.__devBrowserWaitCaptureManager;
+    if (existing) {
+      if (existing.version !== 1 || !(existing.captures instanceof Map))
+        return { ok: false as const, reason: "A page-owned wait capture manager is incompatible" };
+      existing.captures.set(token, { mutations: [], focusChanges: [], valueChanges: [] });
+      return { ok: true as const };
+    }
+
+    const manager: CaptureManager = {
+      version: 1,
+      ownerToken: token,
+      captures: new Map([[token, { mutations: [], focusChanges: [], valueChanges: [] }]]),
+      observer: null,
+      setterRestorations: [],
+      cleanupToken: () => {},
+      rollback: () => {},
+    };
+    captureWindow.__devBrowserWaitCaptureManager = manager;
+    const pushBounded = <T>(items: T[], item: T) => {
+      if (items.length < 50) items.push(item);
+    };
+    const broadcast = <Key extends keyof TransientCapture>(
+      key: Key,
+      item: TransientCapture[Key][number]
+    ) => {
+      for (const capture of manager.captures.values()) pushBounded(capture[key], item as never);
+    };
+    const describe = (target: EventTarget | Node | null): string => {
+      if (!(target instanceof Element)) return target?.constructor.name ?? "unknown";
+      return `${target.tagName.toLowerCase()}${target.id ? `#${target.id}` : ""}${
+        target.getAttribute("role") ? `[role=${target.getAttribute("role")}]` : ""
+      }`.slice(0, 160);
+    };
+    const internalAttribute = (name: string | null) =>
+      Boolean(name && /^data-dev-browser-(?:ref|action-ref|visual-overlay)$/.test(name));
+    const internalNode = (node: Node) =>
+      node instanceof Element &&
+      (node.hasAttribute("data-dev-browser-visual-overlay") ||
+        node.matches("[data-dev-browser-visual-overlay] *"));
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.type === "attributes" && internalAttribute(record.attributeName)) continue;
+        if (
+          record.type === "childList" &&
+          [...record.addedNodes, ...record.removedNodes].every(internalNode)
+        )
+          continue;
+        broadcast("mutations", {
+          type: record.type,
+          target: describe(record.target),
+          ...(record.attributeName ? { attribute: record.attributeName } : {}),
+        });
+      }
+    });
+    const onFocus = (event: Event) =>
+      broadcast("focusChanges", { type: event.type, target: describe(event.target) });
+    const onValue = (event: Event) =>
+      broadcast("valueChanges", { type: event.type, target: describe(event.target) });
+    const restoreSetters = () => {
+      for (const restoration of [...manager.setterRestorations].reverse()) {
+        const current = Object.getOwnPropertyDescriptor(
+          restoration.prototype,
+          restoration.property
+        );
+        if (
+          current?.set === restoration.setter &&
+          (current.set as typeof current.set & { __devBrowserWaitOwner?: string })
+            .__devBrowserWaitOwner === manager.ownerToken
+        )
+          Object.defineProperty(
+            restoration.prototype,
+            restoration.property,
+            restoration.descriptor
+          );
+      }
+    };
+    const rollback = () => {
+      manager.observer?.disconnect();
+      document.removeEventListener("focusin", onFocus, true);
+      document.removeEventListener("blur", onFocus, true);
+      document.removeEventListener("input", onValue, true);
+      document.removeEventListener("change", onValue, true);
+      restoreSetters();
+      manager.captures.clear();
+      if (captureWindow.__devBrowserWaitCaptureManager === manager)
+        delete captureWindow.__devBrowserWaitCaptureManager;
+    };
+    manager.rollback = rollback;
+    manager.cleanupToken = (captureToken) => {
+      manager.captures.delete(captureToken);
+      if (manager.captures.size === 0) rollback();
+    };
+    const interceptSetter = (prototype: object, property: string) => {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+      if (!descriptor?.get || !descriptor.set || descriptor.configurable !== true)
+        throw new Error(`Native setter ${property} is unavailable for safe capture`);
+      const nativeGetter = descriptor.get;
+      const nativeSetter = descriptor.set;
+      const ownedSetter = function (this: unknown, value: unknown) {
+        const before = Reflect.apply(nativeGetter, this, []);
+        Reflect.apply(nativeSetter, this, [value]);
+        const after = Reflect.apply(nativeGetter, this, []);
+        if (before !== after)
+          broadcast("valueChanges", {
+            type: "property",
+            target: describe(this as EventTarget),
+            property,
+          });
+      };
+      Object.defineProperty(ownedSetter, "__devBrowserWaitOwner", {
+        value: manager.ownerToken,
+      });
+      manager.setterRestorations.push({
+        prototype,
+        property,
+        descriptor,
+        setter: ownedSetter,
+      });
+      Object.defineProperty(prototype, property, { ...descriptor, set: ownedSetter });
+    };
+    try {
+      for (const [prototype, properties] of [
+        [HTMLInputElement.prototype, ["value", "checked"]],
+        [HTMLTextAreaElement.prototype, ["value"]],
+        [HTMLSelectElement.prototype, ["value", "selectedIndex"]],
+        [HTMLOptionElement.prototype, ["selected"]],
+      ] as Array<[object, string[]]>)
+        for (const property of properties) interceptSetter(prototype, property);
+      manager.observer = observer;
+      observer.observe(document, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+      document.addEventListener("focusin", onFocus, true);
+      document.addEventListener("blur", onFocus, true);
+      document.addEventListener("input", onValue, true);
+      document.addEventListener("change", onValue, true);
+      return { ok: true as const };
+    } catch (error) {
+      rollback();
+      return {
+        ok: false as const,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }, ownerToken);
+  if (!installed.ok)
+    throw new AgentProtocolError(
+      "UNSUPPORTED_CONTEXT",
+      `Safe value capture unavailable: ${bounded(installed.reason)}`,
+      false
+    );
+}
+
+async function drainTransientCapture(
+  page: Page,
+  events: WaitEvents,
+  ownerToken: string
+): Promise<void> {
+  const captured = await page
+    .evaluate((token) => {
+      const manager = (
+        window as Window & {
+          __devBrowserWaitCaptureManager?: {
+            captures: Map<string, TransientCapture>;
+          };
+        }
+      ).__devBrowserWaitCaptureManager;
+      const capture = manager?.captures.get(token);
+      if (!capture) return null;
+      return {
+        mutations: capture.mutations.splice(0),
+        focusChanges: capture.focusChanges.splice(0),
+        valueChanges: capture.valueChanges.splice(0),
+      };
+    }, ownerToken)
+    .catch(() => null);
+  if (!captured) return;
+  events.mutations.push(...captured.mutations);
+  events.focusChanges.push(...captured.focusChanges);
+  events.valueChanges.push(...captured.valueChanges);
+}
+
+async function cleanupTransientCapture(page: Page, ownerToken: string): Promise<void> {
+  await page
+    .evaluate((token) => {
+      const manager = (
+        window as Window & {
+          __devBrowserWaitCaptureManager?: { cleanupToken(token: string): void };
+        }
+      ).__devBrowserWaitCaptureManager;
+      manager?.cleanupToken(token);
+    }, ownerToken)
+    .catch(() => {});
 }
 
 export async function runWithWait<State>(
   page: Page,
   stateContext: WaitStateContext<State>,
   spec: WaitSpec,
-  dispatch: () => void | Promise<void>
+  dispatch: () => unknown | Promise<unknown>
 ): Promise<{ waitResult: WaitResult; state: State }> {
   if (page.isClosed())
     throw new AgentProtocolError("PAGE_CLOSED", "Page closed before wait dispatch", true);
   const started = Date.now();
   const initial = await domSnapshot(page);
   const events: WaitEvents = {
+    requests: [],
+    mutations: [],
+    focusChanges: [],
+    valueChanges: [],
+    dialogs: [],
     popup: [],
     download: [],
     fileChooser: [],
@@ -312,6 +563,10 @@ export async function runWithWait<State>(
     );
   const onFileChooser = (chooser: FileChooser) =>
     events.fileChooser.push({ multiple: chooser.isMultiple() });
+  const onDialog = (dialog: Dialog) => {
+    events.dialogs.push({ type: dialog.type(), message: bounded(dialog.message()) });
+    track(dialog.dismiss().catch(() => {}));
+  };
   const onNavigation = (frame: Frame) =>
     events.navigation.push({ url: safeUrl(frame.url()), document: frame === page.mainFrame() });
   const onResponse = (response: Response) => {
@@ -323,9 +578,10 @@ export async function runWithWait<State>(
     rawResponses.push(raw);
     events.responses.push({ ...raw, url: safeUrl(raw.url) });
   };
-  const onRequest = () => {
+  const onRequest = (request: Request) => {
     inFlight += 1;
     lastNetworkActivity = Date.now();
+    events.requests.push({ url: safeUrl(request.url()), method: request.method() });
   };
   const onRequestDone = () => {
     inFlight = Math.max(0, inFlight - 1);
@@ -348,6 +604,7 @@ export async function runWithWait<State>(
   listen("popup", onPopup as never);
   listen("download", onDownload as never);
   listen("filechooser", onFileChooser as never);
+  listen("dialog", onDialog as never);
   listen("framenavigated", onNavigation as never);
   listen("response", onResponse as never);
   listen("request", onRequest as never);
@@ -470,7 +727,9 @@ export async function runWithWait<State>(
     };
   };
 
+  const captureOwnerToken = `wait-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
+    await installTransientCapture(page, captureOwnerToken);
     await dispatch();
     let observations: ConditionObservation[] = [];
     while (true) {
@@ -480,6 +739,7 @@ export async function runWithWait<State>(
           "Page closed while waiting for action conditions",
           true
         );
+      await drainTransientCapture(page, events, captureOwnerToken);
       observations = await Promise.all(spec.conditions.map(observe));
       const complete =
         spec.mode === "all"
@@ -535,7 +795,14 @@ export async function runWithWait<State>(
         )
       );
     }
+  } catch (error) {
+    await drainTransientCapture(page, events, captureOwnerToken);
+    if (error !== null && (typeof error === "object" || typeof error === "function"))
+      capturedEventsByError.set(error as object, events);
+    throw error;
   } finally {
+    await drainTransientCapture(page, events, captureOwnerToken);
+    await cleanupTransientCapture(page, captureOwnerToken);
     for (const cleanup of cleanups.splice(0)) cleanup();
     await Promise.allSettled([...pendingMetadata]);
   }

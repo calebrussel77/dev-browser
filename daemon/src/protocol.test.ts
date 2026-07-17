@@ -259,6 +259,41 @@ describe("interactive request protocol", () => {
     });
   });
 
+  it("defaults v2 clicks to never and parses every retry policy", () => {
+    for (const retry of ["never", "safe", "once"] as const) {
+      const result = parseRequest(
+        JSON.stringify({
+          id: `interactive-click-${retry}`,
+          type: "interactive",
+          protocolVersion: 2,
+          action: { kind: "click", ref: "R12", retry },
+        })
+      );
+      expect(result).toMatchObject({ success: true, request: { action: { retry } } });
+    }
+
+    expect(
+      parseRequest(
+        JSON.stringify({
+          id: "interactive-click-default",
+          type: "interactive",
+          protocolVersion: 2,
+          action: { kind: "click", ref: "R12" },
+        })
+      )
+    ).toMatchObject({ success: true, request: { action: { retry: "never" } } });
+    expect(
+      parseRequest(
+        JSON.stringify({
+          id: "interactive-click-invalid-retry",
+          type: "interactive",
+          protocolVersion: 2,
+          action: { kind: "click", ref: "R12", retry: "always" },
+        })
+      )
+    ).toMatchObject({ success: false });
+  });
+
   it("parses trusted keyboard typing", () => {
     const result = parseRequest(
       JSON.stringify({

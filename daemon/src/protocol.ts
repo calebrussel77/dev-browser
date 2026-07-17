@@ -145,6 +145,7 @@ export type WaitCondition = z.infer<typeof WaitConditionSchema>;
 export type WaitSpec = z.infer<typeof WaitSpecSchema>;
 
 const WaitableActionSchema = z.object({ wait: WaitSpecSchema.optional() });
+const RetryPolicySchema = z.enum(["never", "safe", "once"]);
 
 const ExecuteRequestSchema = RequestBaseSchema.extend({
   type: z.literal("execute"),
@@ -163,6 +164,7 @@ const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema)
   method: z.enum(["mouse", "locator"]).default("mouse"),
   expectText: z.string().min(1).optional(),
   waitForText: WaitValueSchema.optional(),
+  retry: RetryPolicySchema.optional(),
 });
 
 const InteractiveClickByCoordinatesSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
@@ -172,6 +174,7 @@ const InteractiveClickByCoordinatesSchema = StateGuardSchema.merge(WaitableActio
   method: z.literal("mouse").default("mouse"),
   expectText: z.string().min(1).optional(),
   waitForText: WaitValueSchema.optional(),
+  retry: RetryPolicySchema.optional(),
 });
 
 const ObserveOptionsSchema = z.object({
@@ -449,6 +452,15 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
         },
       ],
     };
+  }
+
+  if (
+    result.data.type === "interactive" &&
+    result.data.protocolVersion === 2 &&
+    result.data.action.kind === "click" &&
+    !result.data.action.retry
+  ) {
+    result.data.action.retry = "never";
   }
 
   return {

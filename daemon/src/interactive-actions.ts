@@ -11,9 +11,20 @@ import {
 import type { InteractiveRequest, WaitSpec } from "./protocol.js";
 import { discardValidationState, getLatestStateId } from "./page-state.js";
 import { validateObservedDecision } from "./ref-state.js";
+import {
+  retryDecision,
+  type AttemptChange,
+  type AttemptJournalEntry,
+  type RetryPolicy,
+} from "./retry-policy.js";
 import { pageLeases } from "./sessions.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
-import { runWithWait, type WaitResult } from "./wait-engine.js";
+import {
+  capturedWaitEvents,
+  runWithWait,
+  type WaitEvents,
+  type WaitResult,
+} from "./wait-engine.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -67,8 +78,12 @@ export interface InteractiveResult {
     snapshot: boolean;
     dialog: boolean;
     ariaExpanded: boolean;
+    dom: boolean;
+    focus: boolean;
+    value: boolean;
   };
   attempts?: number;
+  attemptJournal?: AttemptJournalEntry[];
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
   waitResult?: WaitResult;
@@ -322,6 +337,9 @@ interface PageSignal {
   snapshot: string;
   dialogs: string[];
   ariaExpanded: string[];
+  dom: string;
+  focus: string;
+  values: string[];
 }
 
 async function pageSignal(page: Page): Promise<PageSignal> {
@@ -346,42 +364,46 @@ async function pageSignal(page: Page): Promise<PageSignal> {
           (element) =>
             `${element.getAttribute("data-dev-browser-ref") ?? element.id}:${element.getAttribute("aria-expanded")}`
         ),
+      dom: document.documentElement.outerHTML.replace(
+        / data-dev-browser-(?:ref|action-ref)="[^"]*"/g,
+        ""
+      ),
+      focus: (() => {
+        const element = document.activeElement;
+        if (!element || element === document.body) return "";
+        return `${element.tagName}:${element.id}:${element.getAttribute("name") ?? ""}:${element.getAttribute("aria-label") ?? ""}`;
+      })(),
+      values: Array.from(
+        document.querySelectorAll("input,textarea,select,[contenteditable=true]")
+      ).map((element, index) => {
+        const field = element as HTMLInputElement;
+        return `${index}:${"value" in field ? field.value : (element.textContent ?? "")}`;
+      }),
     };
   });
   return { url: page.url(), snapshot: await snapshot(page), ...state };
 }
 
-function compareSignals(
-  before: PageSignal,
-  after: PageSignal
-): NonNullable<InteractiveResult["change"]> {
+function compareSignals(before: PageSignal, after: PageSignal): AttemptChange {
   const change = {
     url: before.url !== after.url,
     snapshot: before.snapshot !== after.snapshot,
     dialog: JSON.stringify(before.dialogs) !== JSON.stringify(after.dialogs),
     ariaExpanded: JSON.stringify(before.ariaExpanded) !== JSON.stringify(after.ariaExpanded),
+    dom: before.dom !== after.dom,
+    focus: before.focus !== after.focus,
+    value: JSON.stringify(before.values) !== JSON.stringify(after.values),
     any: false,
   };
-  change.any = change.url || change.snapshot || change.dialog || change.ariaExpanded;
+  change.any =
+    change.url ||
+    change.snapshot ||
+    change.dialog ||
+    change.ariaExpanded ||
+    change.dom ||
+    change.focus ||
+    change.value;
   return change;
-}
-
-async function visibleTextContains(page: Page, expected: string): Promise<boolean> {
-  const actual = normalizeText(await page.locator("body").innerText());
-  return actual.includes(normalizeText(expected));
-}
-
-async function waitForVisibleText(
-  page: Page,
-  expected: string,
-  timeoutMs: number
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  do {
-    if (await visibleTextContains(page, expected)) return true;
-    await page.waitForTimeout(Math.min(100, Math.max(1, deadline - Date.now())));
-  } while (Date.now() < deadline);
-  return await visibleTextContains(page, expected);
 }
 
 function actionWaitSpec(
@@ -405,6 +427,113 @@ function actionWaitSpec(
     };
   }
   return undefined;
+}
+
+function emptyWaitEvents(): WaitEvents {
+  return {
+    requests: [],
+    mutations: [],
+    focusChanges: [],
+    valueChanges: [],
+    dialogs: [],
+    popup: [],
+    download: [],
+    fileChooser: [],
+    navigation: [],
+    responses: [],
+    failedRequests: [],
+  };
+}
+
+function boundedWaitEvents(events: WaitEvents): WaitEvents {
+  return Object.fromEntries(
+    Object.entries(events).map(([key, entries]) => [key, entries.slice(0, 2)])
+  ) as unknown as WaitEvents;
+}
+
+function timeoutEvents(error: AgentProtocolError): WaitEvents {
+  const events = (error.details as { events?: WaitEvents } | undefined)?.events;
+  return boundedWaitEvents(events ?? capturedWaitEvents(error) ?? emptyWaitEvents());
+}
+
+function attemptError(error: unknown, page: Page): AgentProtocolError {
+  if (error instanceof AgentProtocolError) return error;
+  if (page.isClosed())
+    return new AgentProtocolError("PAGE_CLOSED", "Page closed during trusted input", true);
+  const message = error instanceof Error ? error.message : String(error);
+  return new AgentProtocolError(
+    "RENDERER_UNRESPONSIVE",
+    summarizeErrorContext(message || "Trusted input failed"),
+    false
+  );
+}
+
+function attemptErrorReason(error: AgentProtocolError): string {
+  if (error.code === "LEASE_CONFLICT") return "lease-conflict";
+  if (error.code === "STALE_REF" || error.code === "STALE_STATE")
+    return "state-revalidation-failed";
+  if (error.code === "PAGE_CLOSED") return "page-closed";
+  return "trusted-input-error";
+}
+
+function withAttemptJournal(
+  error: AgentProtocolError,
+  journal: AttemptJournalEntry[]
+): AgentProtocolError {
+  const details =
+    error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? (error.details as Record<string, unknown>)
+      : {};
+  const { events: _duplicateEvents, ...detailsWithoutEvents } = details;
+  const journalDetails = { attempts: journal.length, attemptJournal: journal };
+  try {
+    return new AgentProtocolError(error.code, error.message, error.recoverable, {
+      details: { ...detailsWithoutEvents, ...journalDetails },
+      nextCommands: error.nextCommands,
+    });
+  } catch {
+    return new AgentProtocolError(error.code, error.message, error.recoverable, {
+      details: journalDetails,
+      nextCommands: error.nextCommands,
+    });
+  }
+}
+
+async function hasIrreversibleClickIntent(
+  page: Page,
+  action: Extract<InteractiveRequest["action"], { kind: "click" }>
+): Promise<boolean> {
+  const descriptor = await page.evaluate((target) => {
+    let element: Element | null = null;
+    if ("ref" in target) {
+      const state = (
+        window as Window & { __devBrowserPerceptionState?: { refs: WeakMap<Element, string> } }
+      ).__devBrowserPerceptionState;
+      element =
+        Array.from(document.querySelectorAll("*")).find(
+          (candidate) =>
+            candidate.getAttribute("data-dev-browser-ref") === target.ref ||
+            state?.refs.get(candidate) === target.ref
+        ) ?? null;
+    } else {
+      element = document.elementFromPoint(target.x, target.y);
+    }
+    if (!element) return "";
+    const input = element as HTMLInputElement;
+    return [
+      element.textContent,
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      element.getAttribute("role"),
+      element.closest("form") || element.hasAttribute("type") ? input.type : "",
+      input.value,
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }, action);
+  return /\b(delete|remove|destroy|erase|submit|send|confirm|approve|pay|purchase|publish|post|supprimer|effacer|envoyer|confirmer|payer|publier)\b/i.test(
+    descriptor
+  );
 }
 
 export async function executeInteractiveAction(
@@ -521,21 +650,26 @@ export async function executeInteractiveAction(
         await requireExpectedText(page, action.expectText);
       }
       const before = await pageSignal(page);
+      const revalidateClick = async () => {
+        if (protocolVersion !== 2) return;
+        const previousLatestStateId = getLatestStateId(page);
+        const latest = await perceive(page, {}, false);
+        const warnings = validateObservedDecision(
+          page,
+          request.page,
+          action,
+          "ref" in action ? action.ref : undefined,
+          latest,
+          previousLatestStateId
+        );
+        discardValidationState(page, latest.stateId, previousLatestStateId);
+        result.warnings = [...(result.warnings ?? []), ...warnings];
+      };
+      const prepareClickInput = async () => {
+        await hooks.beforeTrustedInput?.();
+        await revalidateClick();
+      };
       const clickOnce = async () => {
-        if (protocolVersion === 2) {
-          const previousLatestStateId = getLatestStateId(page);
-          const latest = await perceive(page, {}, false);
-          const warnings = validateObservedDecision(
-            page,
-            request.page,
-            action,
-            "ref" in action ? action.ref : undefined,
-            latest,
-            previousLatestStateId
-          );
-          discardValidationState(page, latest.stateId, previousLatestStateId);
-          result.warnings = [...(result.warnings ?? []), ...warnings];
-        }
         if ("ref" in action) {
           const { box, locator, resolvedBy, cleanup } = await resolveRef(page, action.ref);
           const point = {
@@ -544,10 +678,12 @@ export async function executeInteractiveAction(
           };
           try {
             if (action.method === "locator") {
-              await authorizeTrustedMutation();
+              await prepareClickInput();
+              pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
               await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
             } else {
-              await authorizeTrustedMutation();
+              await prepareClickInput();
+              pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
               await page.mouse.click(point.x, point.y);
             }
           } finally {
@@ -555,7 +691,8 @@ export async function executeInteractiveAction(
           }
           result.clicked = { ref: action.ref, method: action.method, point, resolvedBy };
         } else {
-          await authorizeTrustedMutation();
+          await prepareClickInput();
+          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
           await page.mouse.click(action.x, action.y);
           result.clicked = {
             ref: null,
@@ -567,63 +704,117 @@ export async function executeInteractiveAction(
       };
 
       const wait = actionWaitSpec(action, request.timeoutMs);
-      let attempts = 1;
-      const dispatchWithLegacyCompatibility = action.waitForText
-        ? async () => {
-            await clickOnce();
-            await page.waitForTimeout(CLICK_SETTLE_MS);
-            let satisfied = await waitForVisibleText(
-              page,
-              action.waitForText!,
-              Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
-            );
-            const firstChange = compareSignals(before, await pageSignal(page));
-            if (!satisfied && !firstChange.any && !action.expectText) {
-              attempts = 2;
-              await clickOnce();
-              await page.waitForTimeout(CLICK_SETTLE_MS);
-              satisfied = await waitForVisibleText(
-                page,
-                action.waitForText!,
-                Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 5_000)
-              );
-            }
-            if (!satisfied) {
-              const value = summarizeErrorContext(action.waitForText!);
-              throw new AgentProtocolError(
-                "WAIT_TIMEOUT",
-                `--wait-for text "${value}" was not observed after ${attempts} attempt${attempts === 1 ? "" : "s"}`,
-                true,
-                {
-                  details: {
-                    attempts,
-                    waitForText: value,
-                    waitForTextLength: action.waitForText!.length,
-                  },
-                  nextCommands: ["dev-browser observe --delta"],
-                }
-              );
-            }
+      const legacyCompatibility =
+        protocolVersion === 1 && action.waitForText !== undefined && action.retry === undefined;
+      const policy: RetryPolicy = action.retry ?? (legacyCompatibility ? "safe" : "never");
+      if (legacyCompatibility) {
+        result.warnings = [
+          ...(result.warnings ?? []),
+          "Legacy v1 --wait-for retry compatibility is active; migrate to protocol v2 with an explicit retry policy",
+        ];
+      }
+      const irreversibleIntent = await hasIrreversibleClickIntent(page, action);
+      if (irreversibleIntent) {
+        result.warnings = [
+          ...(result.warnings ?? []),
+          "Click target appears to have submission or destructive intent; explicit once retry is disabled",
+        ];
+      }
+
+      const journal: AttemptJournalEntry[] = [];
+      let after = before;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const startedAt = new Date().toISOString();
+        let attemptBefore = after;
+        try {
+          attemptBefore = await pageSignal(page);
+          const monitoringWait: WaitSpec = wait ?? {
+            mode: "all",
+            timeoutMs: CLICK_SETTLE_MS,
+            conditions: [{ kind: "networkIdle", specialized: true, idleMs: 25 }],
+          };
+          const waited = await runWithWait(
+            page,
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            monitoringWait,
+            clickOnce
+          );
+          after = await pageSignal(page);
+          journal.push({
+            attempt,
+            startedAt,
+            inputMethod: action.method,
+            sideEffects: waited.waitResult.events,
+            change: compareSignals(attemptBefore, after),
+            retryDecision: "stop",
+            reason: wait ? "wait-satisfied" : "action-complete",
+          });
+          result.waitResult = wait ? waited.waitResult : undefined;
+          applyPerception(result, waited.state, protocolVersion);
+          break;
+        } catch (error) {
+          const sideEffects = boundedWaitEvents(
+            capturedWaitEvents(error) ??
+              (error instanceof AgentProtocolError ? timeoutEvents(error) : emptyWaitEvents())
+          );
+          const typedError = attemptError(error, page);
+          after = await pageSignal(page).catch(() => attemptBefore);
+          const change = compareSignals(attemptBefore, after);
+          if (!wait && typedError.code === "WAIT_TIMEOUT") {
+            journal.push({
+              attempt,
+              startedAt,
+              inputMethod: action.method,
+              sideEffects,
+              change,
+              retryDecision: "stop",
+              reason: "action-complete",
+            });
+            break;
           }
-        : clickOnce;
-      let after: PageSignal;
-      if (wait) {
-        const waited = await runWithWait(
-          page,
-          { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
-          wait,
-          dispatchWithLegacyCompatibility
-        );
-        result.waitResult = waited.waitResult;
-        applyPerception(result, waited.state, protocolVersion);
-        after = await pageSignal(page);
-      } else {
-        await clickOnce();
-        await page.waitForTimeout(CLICK_SETTLE_MS);
-        after = await pageSignal(page);
+          if (typedError.code !== "WAIT_TIMEOUT") {
+            journal.push({
+              attempt,
+              startedAt,
+              inputMethod: action.method,
+              sideEffects,
+              change,
+              retryDecision: "stop",
+              reason: attemptErrorReason(typedError),
+            });
+            throw withAttemptJournal(typedError, journal);
+          }
+          const decision = retryDecision({
+            policy,
+            attempt,
+            guarded: Boolean(action.expectText),
+            irreversibleIntent,
+            sideEffects,
+            change,
+          });
+          journal.push({
+            attempt,
+            startedAt,
+            inputMethod: action.method,
+            sideEffects,
+            change,
+            ...decision,
+          });
+          if (decision.retryDecision === "retry") continue;
+          throw withAttemptJournal(
+            new AgentProtocolError(
+              typedError.code,
+              `${typedError.message} after ${journal.length} attempt${journal.length === 1 ? "" : "s"}`,
+              typedError.recoverable,
+              { details: typedError.details, nextCommands: typedError.nextCommands }
+            ),
+            journal
+          );
+        }
       }
       result.change = compareSignals(before, after);
-      result.attempts = attempts;
+      result.attempts = journal.length;
+      result.attemptJournal = journal;
       result.waitForText = action.waitForText ?? null;
       result.waitSatisfied = action.waitForText ? true : null;
       if (!result.stateId)

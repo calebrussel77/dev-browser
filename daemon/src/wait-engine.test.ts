@@ -7,11 +7,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
+import { retryDecision } from "./retry-policy.js";
 import {
   startAgentReliabilityFixture,
   type AgentReliabilityFixture,
 } from "./test-fixtures/agent-reliability-fixture.js";
-import { runWithWait } from "./wait-engine.js";
+import { capturedWaitEvents, runWithWait } from "./wait-engine.js";
 
 describe.sequential("typed event-driven wait engine", () => {
   let root = "";
@@ -157,6 +158,74 @@ describe.sequential("typed event-driven wait engine", () => {
     await page.setContent("<p>ready</p>");
     const emitter = page as typeof page & { listenerCount(event: string): number };
     const baseline = emitter.listenerCount("response");
+    const dialogBaseline = emitter.listenerCount("dialog");
+    const expectCaptureCleaned = async () =>
+      expect(
+        await page.evaluate(
+          () =>
+            !(
+              "__devBrowserWaitCaptureManager" in
+              (window as Window & { __devBrowserWaitCaptureManager?: unknown })
+            )
+        )
+      ).toBe(true);
+    await page.evaluate(() => {
+      (
+        window as Window & {
+          __testNativeDescriptors?: Array<[object, string, PropertyDescriptor | undefined]>;
+        }
+      ).__testNativeDescriptors = [
+        [
+          HTMLInputElement.prototype,
+          "value",
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value"),
+        ],
+        [
+          HTMLInputElement.prototype,
+          "checked",
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked"),
+        ],
+        [
+          HTMLTextAreaElement.prototype,
+          "value",
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value"),
+        ],
+        [
+          HTMLSelectElement.prototype,
+          "value",
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value"),
+        ],
+        [
+          HTMLSelectElement.prototype,
+          "selectedIndex",
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex"),
+        ],
+        [
+          HTMLOptionElement.prototype,
+          "selected",
+          Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, "selected"),
+        ],
+      ];
+    });
+    const expectNativeDescriptorsRestored = async () =>
+      expect(
+        await page.evaluate(() => {
+          const baselines = (
+            window as Window & {
+              __testNativeDescriptors?: Array<[object, string, PropertyDescriptor | undefined]>;
+            }
+          ).__testNativeDescriptors!;
+          return baselines.every(([prototype, property, expected]) => {
+            const actual = Object.getOwnPropertyDescriptor(prototype, property);
+            return (
+              actual?.get === expected?.get &&
+              actual?.set === expected?.set &&
+              actual?.enumerable === expected?.enumerable &&
+              actual?.configurable === expected?.configurable
+            );
+          });
+        })
+      ).toBe(true);
     const success = await runWithWait(
       page,
       { collect: async () => null },
@@ -168,11 +237,24 @@ describe.sequential("typed event-driven wait engine", () => {
           { kind: "popup" },
         ],
       },
-      async () => {}
+      async () => {
+        await page.evaluate(() => {
+          document.body.setAttribute("data-dev-browser-action-ref", "R-internal");
+          document.body.removeAttribute("data-dev-browser-action-ref");
+          const overlay = document.createElement("div");
+          overlay.setAttribute("data-dev-browser-visual-overlay", "internal");
+          document.body.append(overlay);
+          overlay.remove();
+        });
+      }
     );
     expect(success.waitResult.passed).toHaveLength(1);
     expect(success.waitResult.timedOut).toHaveLength(1);
+    expect(success.waitResult.events.mutations).toEqual([]);
     expect(emitter.listenerCount("response")).toBe(baseline);
+    expect(emitter.listenerCount("dialog")).toBe(dialogBaseline);
+    await expectCaptureCleaned();
+    await expectNativeDescriptorsRestored();
 
     let timeout: AgentProtocolError | undefined;
     try {
@@ -188,6 +270,9 @@ describe.sequential("typed event-driven wait engine", () => {
     expect(timeout).toMatchObject({ code: "WAIT_TIMEOUT", recoverable: true });
     expect(timeout?.details).toMatchObject({ passed: [], timedOut: [expect.any(Object)] });
     expect(emitter.listenerCount("response")).toBe(baseline);
+    expect(emitter.listenerCount("dialog")).toBe(dialogBaseline);
+    await expectCaptureCleaned();
+    await expectNativeDescriptorsRestored();
 
     await expect(
       runWithWait(
@@ -200,6 +285,162 @@ describe.sequential("typed event-driven wait engine", () => {
       )
     ).rejects.toThrow("dispatch failed");
     expect(emitter.listenerCount("response")).toBe(baseline);
+    expect(emitter.listenerCount("dialog")).toBe(dialogBaseline);
+    await expectCaptureCleaned();
+    await expectNativeDescriptorsRestored();
+  });
+
+  it("multiplexes concurrent waits without draining or cleaning another token", async () => {
+    const page = await manager.getPage("wait", "concurrent-capture");
+    await page.setContent(`<input id="field">`);
+    const originalSetter = await page.evaluateHandle(
+      () => Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set
+    );
+    let arrivals = 0;
+    let releaseBoth!: () => void;
+    const bothInstalled = new Promise<void>((resolve) => (releaseBoth = resolve));
+    const arrive = async () => {
+      arrivals += 1;
+      if (arrivals === 2) releaseBoth();
+      await bothInstalled;
+    };
+    let firstChanged!: () => void;
+    let secondChanged!: () => void;
+    const firstDone = new Promise<void>((resolve) => (firstChanged = resolve));
+    const secondDone = new Promise<void>((resolve) => (secondChanged = resolve));
+    const wait = (dispatch: () => Promise<void>) =>
+      runWithWait(
+        page,
+        { collect: async () => null },
+        { mode: "all", timeoutMs: 500, conditions: [{ kind: "popup" }] },
+        dispatch
+      ).catch((error) => error as AgentProtocolError);
+
+    const first = wait(async () => {
+      await arrive();
+      await page.evaluate(() => {
+        const field = document.querySelector<HTMLInputElement>("#field")!;
+        field.value = "first";
+        field.value = "";
+      });
+      firstChanged();
+      await secondDone;
+    });
+    const second = wait(async () => {
+      await arrive();
+      await firstDone;
+      await page.evaluate(() => {
+        const field = document.querySelector<HTMLInputElement>("#field")!;
+        field.value = "second";
+        field.value = "";
+      });
+      secondChanged();
+    });
+    const [firstError, secondError] = await Promise.all([first, second]);
+    for (const error of [firstError, secondError]) {
+      expect(error).toMatchObject({ code: "WAIT_TIMEOUT" });
+      const sideEffects = capturedWaitEvents(error)!;
+      expect(sideEffects.valueChanges).toHaveLength(4);
+      expect(
+        retryDecision({
+          policy: "safe",
+          attempt: 1,
+          guarded: false,
+          irreversibleIntent: false,
+          sideEffects,
+          change: {
+            any: false,
+            url: false,
+            snapshot: false,
+            dialog: false,
+            ariaExpanded: false,
+            dom: false,
+            focus: false,
+            value: false,
+          },
+        })
+      ).toEqual({ retryDecision: "stop", reason: "value-side-effect" });
+    }
+    expect(
+      await page.evaluate(
+        () =>
+          !(
+            "__devBrowserWaitCaptureManager" in
+            (window as Window & { __devBrowserWaitCaptureManager?: unknown })
+          )
+      )
+    ).toBe(true);
+    const restoredSetter = await page.evaluateHandle(
+      () => Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set
+    );
+    expect(await originalSetter.evaluate((setter, other) => setter === other, restoredSetter)).toBe(
+      true
+    );
+    await originalSetter.dispose();
+    await restoredSetter.dispose();
+  });
+
+  it("rolls back every installed setter when transactional capture installation fails", async () => {
+    const page = await manager.getPage("wait", "capture-rollback");
+    await page.setContent(`<input><textarea></textarea>`);
+    await page.evaluate(() => {
+      const captureWindow = window as Window & {
+        __rollbackBaselines?: Record<string, PropertyDescriptor>;
+      };
+      captureWindow.__rollbackBaselines = {
+        inputValue: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!,
+        inputChecked: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")!,
+      };
+      const textareaValue = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value"
+      )!;
+      Object.defineProperty(HTMLTextAreaElement.prototype, "value", {
+        ...textareaValue,
+        configurable: false,
+      });
+    });
+    let dispatched = false;
+    await expect(
+      runWithWait(
+        page,
+        { collect: async () => null },
+        { mode: "all", timeoutMs: 100, conditions: [{ kind: "popup" }] },
+        () => {
+          dispatched = true;
+        }
+      )
+    ).rejects.toMatchObject({ code: "UNSUPPORTED_CONTEXT" });
+    expect(dispatched).toBe(false);
+    expect(
+      await page.evaluate(() => {
+        const captureWindow = window as Window & {
+          __rollbackBaselines?: Record<string, PropertyDescriptor>;
+          __devBrowserWaitCaptureManager?: unknown;
+        };
+        const same = (
+          actual: PropertyDescriptor | undefined,
+          expected: PropertyDescriptor | undefined
+        ) =>
+          expected !== undefined &&
+          actual?.get === expected.get &&
+          actual?.set === expected.set &&
+          actual?.enumerable === expected.enumerable &&
+          actual?.configurable === expected.configurable;
+        return (
+          same(
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value"),
+            captureWindow.__rollbackBaselines!.inputValue
+          ) &&
+          same(
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked"),
+            captureWindow.__rollbackBaselines!.inputChecked
+          ) &&
+          !("__devBrowserWaitCaptureManager" in captureWindow)
+        );
+      })
+    ).toBe(true);
+    await page.close();
   });
 
   it(

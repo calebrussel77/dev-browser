@@ -9,6 +9,10 @@ import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
 import { pageLeases } from "./sessions.js";
+import {
+  startAgentReliabilityFixture,
+  type AgentReliabilityFixture,
+} from "./test-fixtures/agent-reliability-fixture.js";
 
 const browserName = "interactive-actions";
 
@@ -36,11 +40,13 @@ function elements(result: InteractiveResult) {
 describe.sequential("interactive Playwright actions", () => {
   let browserRootDir = "";
   let manager: BrowserManager;
+  let fixture: AgentReliabilityFixture;
 
   beforeAll(async () => {
     browserRootDir = await mkdtemp(path.join(os.tmpdir(), "dev-browser-interactive-"));
     manager = new BrowserManager(path.join(browserRootDir, "browsers"));
     await manager.ensureBrowser(browserName, { headless: true });
+    fixture = await startAgentReliabilityFixture();
 
     const page = await manager.getPage(browserName, "profile");
     await page.setContent(`
@@ -98,6 +104,7 @@ describe.sequential("interactive Playwright actions", () => {
 
   afterAll(async () => {
     await stopBrowserManagerAndRemoveDirectory(manager, browserRootDir);
+    await fixture.close();
   }, 180_000);
 
   it("returns stable refs, coordinates, visibility, and distinct landmarks", async () => {
@@ -313,6 +320,8 @@ describe.sequential("interactive Playwright actions", () => {
       request({ kind: "read", limit: 100, depth: 12 })
     );
     const retry = elements(read).find((element) => element.name === "Retry action");
+    const page = await manager.getPage(browserName, "profile");
+    await page.locator("#retry-button").focus();
 
     const result = await executeInteractiveAction(
       manager,
@@ -330,7 +339,252 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.attempts).toBe(2);
     expect(result.waitSatisfied).toBe(true);
     expect(result.snapshot).toContain("Retry success");
+    expect(result.warnings).toContainEqual(
+      expect.stringContaining("Legacy v1 --wait-for retry compatibility")
+    );
   });
+
+  it(
+    "never duplicates POST side effects and journals safe, once, and guarded decisions",
+    { timeout: 30_000 },
+    async () => {
+      const page = await manager.getPage(browserName, "profile");
+      const initialContent = await page.content();
+      await page.goto(fixture.mainUrl);
+
+      const install = async (mode: "post" | "noop") => {
+        await page.setContent(`
+        <p>Confirmation token</p><button id="action">Action</button><p id="output"></p>
+        <script>
+          window.inputs = 0;
+          action.onclick = () => {
+            window.inputs++;
+            if (${JSON.stringify(mode)} === "post") {
+              fetch("/api/submit", { method: "POST", body: "accepted" });
+              setTimeout(() => document.body.insertAdjacentHTML("beforeend", "<p>late UI</p>"), 10000);
+            } else if (window.inputs === 2) {
+              output.textContent = atob("U1VDQ0VTUw==");
+            }
+          };
+        </script>
+      `);
+        const observed = await executeInteractiveAction(manager, {
+          ...request({ kind: "read", limit: 100, depth: 12 }),
+          protocolVersion: 2,
+        });
+        const ref = elements(observed).find((element) => element.name === "Action")!.ref;
+        return ref;
+      };
+      const run = async (
+        ref: string,
+        retry: "never" | "safe" | "once" | undefined,
+        expectText?: string
+      ) => {
+        let caught: unknown;
+        try {
+          await executeInteractiveAction(manager, {
+            ...request(
+              {
+                kind: "click",
+                ref,
+                method: "mouse",
+                waitForText: "SUCCESS",
+                ...(retry ? { retry } : {}),
+                ...(expectText ? { expectText } : {}),
+              },
+              { timeoutMs: 100 }
+            ),
+            protocolVersion: 2,
+          });
+        } catch (error) {
+          caught = error;
+        }
+        return caught as { details: { attemptJournal: Array<Record<string, unknown>> } };
+      };
+
+      for (const retry of [undefined, "safe"] as const) {
+        let requests = 0;
+        const onRequest = (request: { method(): string; url(): string }) => {
+          if (request.method() === "POST" && request.url().includes("/api/submit")) requests++;
+        };
+        page.on("request", onRequest);
+        const ref = await install("post");
+        const error = await run(ref, retry);
+        page.off("request", onRequest);
+        expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
+        expect(requests).toBe(1);
+        expect(error.details.attemptJournal).toHaveLength(1);
+        expect(error.details.attemptJournal[0]).toMatchObject({
+          attempt: 1,
+          retryDecision: "stop",
+          reason: retry === "safe" ? "safe-retry-side-effect-or-change" : "retry-policy-never",
+          sideEffects: { requests: [{ method: "POST" }] },
+        });
+      }
+
+      for (const retry of ["safe", "once"] as const) {
+        const ref = await install("noop");
+        await page.locator("#action").focus();
+        const result = await executeInteractiveAction(manager, {
+          ...request(
+            { kind: "click", ref, method: "mouse", waitForText: "SUCCESS", retry },
+            { timeoutMs: 100 }
+          ),
+          protocolVersion: 2,
+        });
+        expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(2);
+        expect(result.attemptJournal).toMatchObject([
+          {
+            attempt: 1,
+            retryDecision: "retry",
+            reason: retry === "safe" ? "safe-no-side-effect" : "explicit-once",
+          },
+          { attempt: 2, retryDecision: "stop", reason: "wait-satisfied" },
+        ]);
+      }
+
+      const guardedRef = await install("noop");
+      await page.locator("#action").focus();
+      const guarded = await run(guardedRef, "once", "Confirmation token");
+      expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
+      expect(guarded.details.attemptJournal[0]).toMatchObject({
+        retryDecision: "stop",
+        reason: "guarded-expect-text",
+      });
+
+      for (const [name, effect, expectedSideEffect, expectedReason] of [
+        [
+          "transient toast",
+          `const toast=document.createElement("div");toast.setAttribute("role","status");document.body.append(toast);toast.remove()`,
+          { mutations: expect.any(Array) },
+          "safe-retry-side-effect-or-change",
+        ],
+        [
+          "aria toggle back",
+          `action.setAttribute("aria-expanded","true");action.setAttribute("aria-expanded","false")`,
+          { mutations: expect.any(Array) },
+          "safe-retry-side-effect-or-change",
+        ],
+        [
+          "focus revert",
+          `field.focus();action.focus()`,
+          { focusChanges: expect.any(Array) },
+          "safe-retry-side-effect-or-change",
+        ],
+        [
+          "programmatic value revert",
+          `field.value="changed";field.value=""`,
+          { valueChanges: expect.any(Array) },
+          "value-side-effect",
+        ],
+        [
+          "programmatic checked revert",
+          `check.checked=true;check.checked=false`,
+          { valueChanges: expect.any(Array) },
+          "value-side-effect",
+        ],
+        [
+          "programmatic textarea value revert",
+          `notes.value="changed";notes.value=""`,
+          { valueChanges: expect.any(Array) },
+          "value-side-effect",
+        ],
+        [
+          "programmatic select revert",
+          `choice.value="b";choice.value="a";choice.selectedIndex=1;choice.selectedIndex=0;optionB.selected=true;optionA.selected=true`,
+          { valueChanges: expect.any(Array) },
+          "value-side-effect",
+        ],
+        [
+          "native alert",
+          `alert("transient native dialog")`,
+          { dialogs: expect.any(Array) },
+          "safe-retry-side-effect-or-change",
+        ],
+      ] as const) {
+        await page.setContent(`
+        <button id="action">Action</button><input id="field"><input id="check" type="checkbox"><textarea id="notes"></textarea>
+        <select id="choice"><option id="optionA" value="a">A</option><option id="optionB" value="b">B</option></select>
+        <script>window.inputs=0;action.onclick=()=>{window.inputs++;${effect}}</script>
+      `);
+        const observed = await executeInteractiveAction(manager, {
+          ...request({ kind: "read", limit: 100, depth: 12 }),
+          protocolVersion: 2,
+        });
+        const transientRef = elements(observed).find((element) => element.name === "Action")!.ref;
+        await page.locator("#action").focus();
+        const transientError = await run(transientRef, "safe");
+        expect(
+          await page.evaluate(() => (window as unknown as { inputs: number }).inputs),
+          name
+        ).toBe(1);
+        expect(transientError.details.attemptJournal).toHaveLength(1);
+        expect(transientError.details.attemptJournal[0]).toMatchObject({
+          retryDecision: "stop",
+          reason: expectedReason,
+          sideEffects: expectedSideEffect,
+        });
+      }
+
+      const stateRef = await install("noop");
+      const state = await executeInteractiveAction(manager, {
+        ...request({
+          kind: "observe",
+          full: false,
+          delta: false,
+          track: "retry-state",
+          maxNodes: 100,
+          maxChars: 12_000,
+          depth: 12,
+          breadth: 50,
+        }),
+        protocolVersion: 2,
+      });
+      await page.locator("#action").focus();
+      let dispatch = 0;
+      let stateError: unknown;
+      try {
+        await executeInteractiveAction(
+          manager,
+          {
+            ...request(
+              {
+                kind: "click",
+                ref: stateRef,
+                method: "mouse",
+                waitForText: "SUCCESS",
+                retry: "safe",
+                fromState: state.stateId!,
+              },
+              { timeoutMs: 100 }
+            ),
+            protocolVersion: 2,
+          },
+          {
+            beforeTrustedInput: async () => {
+              if (++dispatch === 2)
+                await page
+                  .locator("#action")
+                  .evaluate((node) => node.setAttribute("aria-label", "Changed"));
+            },
+          }
+        );
+      } catch (error) {
+        stateError = error;
+      }
+      expect(stateError).toMatchObject({
+        code: "STALE_REF",
+        details: {
+          attemptJournal: [
+            { attempt: 1, retryDecision: "retry", reason: "safe-no-side-effect" },
+            { attempt: 2, retryDecision: "stop", reason: "state-revalidation-failed" },
+          ],
+        },
+      });
+      expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
+      await page.setContent(initialContent);
+    }
+  );
 
   it("does not retry after aria-expanded changes or for guarded clicks", async () => {
     const read = await executeInteractiveAction(
@@ -835,7 +1089,12 @@ describe.sequential("interactive Playwright actions", () => {
             },
           }
         )
-      ).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      ).rejects.toMatchObject({
+        code: "LEASE_CONFLICT",
+        details: {
+          attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "lease-conflict" }],
+        },
+      });
       expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(0);
     } finally {
       if (replacement) pageLeases.close(replacement.sessionId);
@@ -849,6 +1108,7 @@ describe.sequential("interactive Playwright actions", () => {
       request({ kind: "read", limit: 100, depth: 12 })
     );
     const retryRef = elements(retryRead).find((element) => element.name === "Retry")!.ref;
+    await page.locator("#retry").focus();
     let dispatch = 0;
     let reacquired: ReturnType<typeof pageLeases.open> | undefined;
     try {
@@ -865,10 +1125,68 @@ describe.sequential("interactive Playwright actions", () => {
             },
           }
         )
-      ).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      ).rejects.toMatchObject({
+        code: "LEASE_CONFLICT",
+        details: {
+          attemptJournal: [
+            { attempt: 1, retryDecision: "retry", reason: "safe-no-side-effect" },
+            { attempt: 2, retryDecision: "stop", reason: "lease-conflict" },
+          ],
+        },
+      });
       expect(await page.evaluate(() => (window as unknown as { inputs: number }).inputs)).toBe(1);
     } finally {
       if (reacquired) pageLeases.close(reacquired.sessionId);
     }
+  });
+
+  it("journals trusted-input and page-closed failures", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.setContent(`
+      <button id="covered">Covered</button>
+      <div style="position:fixed;inset:0;z-index:999"></div>
+    `);
+    const read = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
+    const coveredRef = elements(read).find((element) => element.name === "Covered")!.ref;
+    await expect(
+      executeInteractiveAction(
+        manager,
+        request(
+          { kind: "click", ref: coveredRef, method: "locator", retry: "never" },
+          { timeoutMs: 100 }
+        )
+      )
+    ).rejects.toMatchObject({
+      code: "RENDERER_UNRESPONSIVE",
+      details: {
+        attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "trusted-input-error" }],
+      },
+    });
+
+    const closingPage = await manager.getPage(browserName, "journal-page-close");
+    await closingPage.setContent(`<button id="close-target">Close target</button>`);
+    const closingRead = await executeInteractiveAction(manager, {
+      ...request({ kind: "read", limit: 100, depth: 12 }),
+      page: "journal-page-close",
+    });
+    const closeRef = elements(closingRead).find((element) => element.name === "Close target")!.ref;
+    await expect(
+      executeInteractiveAction(
+        manager,
+        {
+          ...request({ kind: "click", ref: closeRef, method: "mouse", retry: "never" }),
+          page: "journal-page-close",
+        },
+        { beforeTrustedInput: () => closingPage.close() }
+      )
+    ).rejects.toMatchObject({
+      code: "PAGE_CLOSED",
+      details: {
+        attemptJournal: [{ attempt: 1, retryDecision: "stop", reason: "page-closed" }],
+      },
+    });
   });
 });

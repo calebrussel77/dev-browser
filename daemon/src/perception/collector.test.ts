@@ -14,7 +14,7 @@ describe.sequential("unified page perception", () => {
 
   afterAll(async () => {
     await browser?.close();
-  });
+  }, 30_000);
 
   it("keeps duplicate accessible names attached to distinct inline refs without DOM mutations", async () => {
     await page.setContent(`
