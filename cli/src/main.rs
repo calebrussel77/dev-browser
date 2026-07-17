@@ -1695,7 +1695,8 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
             | "TARGET_OBSCURED"
             | "TARGET_DISABLED"
             | "UNSUPPORTED_CONTEXT"
-            | "ASSERTION_FAILED",
+            | "ASSERTION_FAILED"
+            | "INPUT_VALUE_MISMATCH",
         ) => 3,
         Some("WAIT_TIMEOUT") => 4,
         Some("LEASE_CONFLICT") => 5,
@@ -1868,6 +1869,7 @@ mod tests {
             ("AMBIGUOUS_TARGET", 3),
             ("TARGET_DISABLED", 3),
             ("ASSERTION_FAILED", 3),
+            ("INPUT_VALUE_MISMATCH", 3),
             ("WAIT_TIMEOUT", 4),
             ("LEASE_CONFLICT", 5),
             ("CDP_ATTACH_FAILED", 6),

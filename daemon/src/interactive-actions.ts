@@ -58,6 +58,7 @@ import {
 } from "./wait-engine.js";
 import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
+import { enterExactText, type InputStrategy } from "./react-input.js";
 import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
 import { confirmationTokens, type ConfirmationScope } from "./confirmation-tokens.js";
 import { redactSensitive } from "./redaction.js";
@@ -115,6 +116,8 @@ export interface InteractiveResult {
     ref: string | null;
     characters: number;
   } & Partial<ActionTargetMetadata>;
+  inputStrategy?: InputStrategy;
+  verifiedValue?: string;
   targets?: ActionTargetMetadata[];
   confirmation?: {
     confirmed: boolean;
@@ -1338,6 +1341,8 @@ export async function executeInteractiveAction(
       const journal: AttemptJournalEntry[] = [];
       let resolvedTypeTarget: ResolvedActionTarget | undefined;
       let typeConfirmationConsumed = false;
+      let inputStrategy: InputStrategy | undefined;
+      let verifiedValue: string | undefined;
       const typeEntry = (
         method: AttemptJournalEntry["inputMethod"],
         reason: string,
@@ -1392,22 +1397,38 @@ export async function executeInteractiveAction(
             element instanceof HTMLInputElement &&
             (element.type === "password" || /password|secret|token|credential/i.test(element.autocomplete || element.name || element.id))
           ).catch(() => false)) sensitiveValues.push(action.text);
-          const { box, cleanup } = resolved;
+          const { box, locator, cleanup } = resolved;
           try {
             await dispatchTypeInput("mouse", () =>
               page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
             );
+            // React-safe, input-kind-specific entry runs while the locator's
+            // action-ref attribute is still attached (cleanup() below strips
+            // it, so this must stay inside the try before cleanup runs).
+            await dispatchTypeInput("keyboard", async () => {
+              const entry = await enterExactText({
+                page,
+                locator,
+                text: action.text,
+                clear: action.clear,
+                delayMs: action.delayMs,
+              });
+              inputStrategy = entry.strategy;
+              verifiedValue = entry.verifiedValue;
+            });
           } finally {
             await cleanup();
           }
+        } else {
+          if (action.clear) {
+            await dispatchTypeInput("keyboard", () => page.keyboard.press("ControlOrMeta+A"));
+            await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
+          }
+          await dispatchTypeInput("keyboard", () =>
+            page.keyboard.type(action.text, { delay: action.delayMs })
+          );
+          inputStrategy = "keyboard";
         }
-        if (action.clear) {
-          await dispatchTypeInput("keyboard", () => page.keyboard.press("ControlOrMeta+A"));
-          await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
-        }
-        await dispatchTypeInput("keyboard", () =>
-          page.keyboard.type(action.text, { delay: action.delayMs })
-        );
       };
       if (action.wait) {
         const waited = await runWithWait(
@@ -1427,6 +1448,8 @@ export async function executeInteractiveAction(
         characters: Array.from(action.text).length,
         ...typeTarget,
       };
+      result.inputStrategy = inputStrategy;
+      result.verifiedValue = verifiedValue;
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)

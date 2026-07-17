@@ -781,7 +781,9 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.targets).toEqual([
       expect.objectContaining({ actualRef: note!.ref, method: "keyboard" }),
     ]);
-    expect(result.attemptJournal).toHaveLength(4);
+    expect(result.inputStrategy).toBe("insert-text");
+    expect(result.verifiedValue).toBe("Hello Naminsita");
+    expect(result.attemptJournal).toHaveLength(2);
   });
 
   it("writes a screenshot and returns its absolute path", async () => {

@@ -25,7 +25,7 @@ pub fn agent_schema() -> Value {
             "leases": true
         },
         "errors": {
-            "actionability": { "exitStatus": 3, "codes": ["STALE_REF", "STALE_STATE", "AMBIGUOUS_TARGET", "TARGET_MISSING", "TARGET_HIDDEN", "TARGET_OBSCURED", "TARGET_DISABLED", "UNSUPPORTED_CONTEXT", "ASSERTION_FAILED"] },
+            "actionability": { "exitStatus": 3, "codes": ["STALE_REF", "STALE_STATE", "AMBIGUOUS_TARGET", "TARGET_MISSING", "TARGET_HIDDEN", "TARGET_OBSCURED", "TARGET_DISABLED", "UNSUPPORTED_CONTEXT", "ASSERTION_FAILED", "INPUT_VALUE_MISMATCH"] },
             "wait": { "exitStatus": 4, "codes": ["WAIT_TIMEOUT"] },
             "lease": { "exitStatus": 5, "codes": ["LEASE_CONFLICT"] },
             "runtime": { "exitStatus": 6, "codes": ["CDP_DISCOVERY_FAILED", "CDP_ATTACH_FAILED", "RENDERER_UNRESPONSIVE", "DAEMON_VERSION_MISMATCH", "PROTOCOL_VERSION_MISMATCH", "PAGE_CLOSED", "FRAME_DETACHED", "POPUP_OPENED"] },
@@ -90,7 +90,7 @@ pub fn agent_schema() -> Value {
         "responseGrammar": {
             "successRequired": ["protocolVersion:2", "ok:true", "requestId", "browser", "page", "action"],
             "commonOptional": ["documentId", "stateId", "url", "title", "tree", "elements", "coordinateSpace", "warnings", "trace"],
-            "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
+            "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "inputStrategy", "verifiedValue", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
             "failureRequired": ["protocolVersion:2", "ok:false", "requestId", "error.code", "error.message", "error.recoverable"],
             "failureOptional": ["browser", "page", "action", "error.details", "error.nextCommands"]
         },
