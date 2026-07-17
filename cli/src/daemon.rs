@@ -1,4 +1,5 @@
 use crate::connection::connect_to_daemon;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
@@ -9,8 +10,10 @@ use std::io::{self, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+use url::Url;
 
 use crate::connection::{read_line, send_message};
 
@@ -142,6 +145,357 @@ pub fn is_daemon_running() -> bool {
 
 pub fn current_daemon_pid() -> Option<i32> {
     daemon_pid()
+}
+
+pub fn doctor_report(
+    browser: &str,
+    connect: Option<&str>,
+    timeout_ms: u64,
+) -> Result<(serde_json::Value, i32), Box<dyn Error>> {
+    let command = find_daemon_command()?;
+    let expected = expected_runtime(&command)?;
+    let running_before = is_daemon_running();
+    let (mut runtime, mut codes, mut exit_code) = if running_before {
+        classify_runtime_probe(probe_daemon(&expected)?)
+    } else {
+        (
+            serde_json::json!({ "status": "stopped" }),
+            vec![
+                serde_json::json!({ "code": "DAEMON_NOT_RUNNING", "severity": "warning", "recovery": "Run any browser command to start it" }),
+            ],
+            0,
+        )
+    };
+
+    let mut connection =
+        serde_json::json!({ "requested": connect.is_some(), "status": "not-requested" });
+    if let Some(endpoint) = connect {
+        if let Err(error) = ensure_daemon() {
+            exit_code = 6;
+            codes.push(serde_json::json!({ "code": "DAEMON_START_FAILED", "severity": "error", "message": sanitize_diagnostic_message(&error.to_string()), "recovery": "dev-browser doctor --json" }));
+            connection = serde_json::json!({ "requested": true, "status": "daemon-failed" });
+        } else {
+            let refreshed = classify_runtime_probe(probe_daemon(&expected)?);
+            runtime = refreshed.0;
+            codes.retain(|item| {
+                !matches!(
+                    item.get("code").and_then(serde_json::Value::as_str),
+                    Some(
+                        "DAEMON_NOT_RUNNING"
+                            | "DAEMON_VERSION_MISMATCH"
+                            | "DAEMON_HANDSHAKE_UNSUPPORTED"
+                    )
+                )
+            });
+            codes.extend(refreshed.1);
+            exit_code = refreshed.2;
+            let pages_request = serde_json::json!({
+                "id": "doctor-pages", "type": "interactive", "protocolVersion": 2,
+                "browser": browser, "page": "main", "connect": endpoint,
+                "timeoutMs": timeout_ms, "action": { "kind": "pages" }
+            });
+            match exchange_result(pages_request) {
+                Ok(result) => {
+                    let pages = result
+                        .get("pages")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .take(20)
+                        .map(bounded_target)
+                        .collect::<Vec<_>>();
+                    let attach = if let Some(target) = pages
+                        .first()
+                        .and_then(|page| page.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let request = serde_json::json!({
+                            "id": "doctor-attach", "type": "interactive", "protocolVersion": 2,
+                            "browser": browser, "page": target, "connect": endpoint,
+                            "timeoutMs": timeout_ms, "action": { "kind": "read", "limit": 1, "depth": 1 }
+                        });
+                        match exchange_result(request) {
+                            Ok(_) => {
+                                serde_json::json!({ "status": "ok", "target": "first-selective-target" })
+                            }
+                            Err(error) => {
+                                exit_code = 6;
+                                codes.push(serde_json::json!({ "code": "RENDERER_ATTACH_FAILED", "severity": "error", "message": sanitize_diagnostic_message(&error.to_string()), "recovery": "Retry with --timeout 10 or a different target" }));
+                                serde_json::json!({ "status": "renderer-failed" })
+                            }
+                        }
+                    } else {
+                        codes.push(serde_json::json!({ "code": "CDP_NO_TARGETS", "severity": "warning", "recovery": "Open a normal Chrome tab and retry" }));
+                        serde_json::json!({ "status": "skipped", "reason": "no-targets" })
+                    };
+                    connection = serde_json::json!({
+                        "requested": true, "status": "browser-reachable", "transport": "CDP",
+                        "targetCount": pages.len(), "targets": pages, "attach": attach
+                    });
+                }
+                Err(error) => {
+                    exit_code = 6;
+                    codes.push(serde_json::json!({ "code": "CDP_DISCOVERY_OR_ATTACH_FAILED", "severity": "error", "message": sanitize_diagnostic_message(&error.to_string()), "recovery": "Enable Chrome remote debugging or pass the exact CDP URL" }));
+                    connection =
+                        serde_json::json!({ "requested": true, "status": "browser-failed" });
+                }
+            }
+        }
+    }
+
+    let extracted_hash = sha256_hex(&fs::read(&command.entry_path)?);
+    let report = serde_json::json!({
+        "schemaVersion": 1,
+        "ok": exit_code == 0,
+        "codes": codes,
+        "cli": { "version": expected.cli_version, "buildHash": expected.cli_build_hash },
+        "daemon": {
+            "running": is_daemon_running(), "pid": daemon_pid(), "endpoint": daemon_endpoint_label(),
+            "runtime": runtime, "version": DAEMON_RUNTIME_VERSION, "protocolVersion": DAEMON_PROTOCOL_VERSION,
+            "embeddedBundleHash": expected.embedded_daemon_hash,
+            "selectedEntryHash": expected.expected_daemon_hash,
+            "extractedHash": extracted_hash,
+            "hashParity": extracted_hash == expected.expected_daemon_hash
+        },
+        "playwright": {
+            "expectedVersion": PLAYWRIGHT_RUNTIME_VERSION,
+            "installedVersion": dependency_version(&command.current_dir, "playwright"),
+            "browserAvailable": playwright_browser_available(&command.current_dir)
+        },
+        "quickjs": {
+            "installedVersion": dependency_version(&command.current_dir, "quickjs-emscripten"),
+            "sandboxProtocolVersion": SANDBOX_PROTOCOL_VERSION
+        },
+        "chromeDiscovery": chrome_discovery_sources(),
+        "connection": connection
+    });
+    Ok((report, exit_code))
+}
+
+fn classify_runtime_probe(probe: RuntimeProbe) -> (serde_json::Value, Vec<serde_json::Value>, i32) {
+    match probe {
+        RuntimeProbe::Compatible => (serde_json::json!({ "status": "compatible" }), vec![], 0),
+        RuntimeProbe::Mismatch { reasons, .. } => (
+            serde_json::json!({ "status": "mismatch", "reasons": reasons }),
+            vec![
+                serde_json::json!({ "code": "DAEMON_VERSION_MISMATCH", "severity": "error", "recovery": "Retry a normal command to coordinate an idle restart" }),
+            ],
+            6,
+        ),
+        RuntimeProbe::Legacy(message) => (
+            serde_json::json!({ "status": "legacy", "message": sanitize_diagnostic_message(&message) }),
+            vec![
+                serde_json::json!({ "code": "DAEMON_HANDSHAKE_UNSUPPORTED", "severity": "error", "recovery": "Wait for active work, then run dev-browser stop" }),
+            ],
+            6,
+        ),
+    }
+}
+
+fn bounded_target(target: &serde_json::Value) -> serde_json::Value {
+    let mut secrets = Vec::new();
+    let url = target
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| sanitize_url(value, &mut secrets));
+    let bounded = |key: &str, limit: usize| {
+        target
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| {
+                redact_text(value, &secrets)
+                    .chars()
+                    .take(limit)
+                    .collect::<String>()
+            })
+    };
+    serde_json::json!({
+        "id": bounded("id", 200),
+        "url": url.map(|value| value.chars().take(500).collect::<String>()),
+        "title": bounded("title", 500),
+        "name": bounded("name", 200),
+    })
+}
+
+fn sanitize_diagnostic_message(message: &str) -> String {
+    redact_text(message, &[]).chars().take(4_000).collect()
+}
+
+fn sanitize_url(raw: &str, secrets: &mut Vec<String>) -> String {
+    if raw.starts_with("ws://") || raw.starts_with("wss://") {
+        return "ws://[redacted-endpoint]".to_string();
+    }
+    collect_raw_url_secrets(raw, secrets);
+    let Ok(mut url) = Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if !url.username().is_empty() {
+        add_secret(secrets, url.username());
+        let _ = url.set_username("[redacted]");
+    }
+    if let Some(password) = url.password().filter(|value| !value.is_empty()) {
+        let password = password.to_string();
+        add_secret(secrets, &password);
+        let _ = url.set_password(Some("[redacted]"));
+    }
+    let query = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if !query.is_empty() {
+        url.set_query(None);
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            if sensitive_parameter(&key) {
+                add_secret(secrets, &value);
+                pairs.append_pair(&key, "[redacted]");
+            } else {
+                pairs.append_pair(&key, &value);
+            }
+        }
+    }
+    if let Some(fragment) = url.fragment().map(str::to_string) {
+        let pairs = url::form_urlencoded::parse(fragment.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        if pairs.iter().any(|(key, _)| sensitive_parameter(key)) {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in pairs {
+                if sensitive_parameter(&key) {
+                    add_secret(secrets, &value);
+                    serializer.append_pair(&key, "[redacted]");
+                } else {
+                    serializer.append_pair(&key, &value);
+                }
+            }
+            url.set_fragment(Some(&serializer.finish()));
+        }
+    }
+    url.to_string()
+}
+
+fn redact_text(raw: &str, secrets: &[String]) -> String {
+    let mut discovered = secrets.to_vec();
+    let mut value = url_regex()
+        .replace_all(raw, |captures: &regex::Captures<'_>| {
+            sanitize_url(&captures[0], &mut discovered)
+        })
+        .into_owned();
+    for secret in &discovered {
+        if secret.len() >= 3 {
+            value = value.replace(secret, "[redacted]");
+            let encoded =
+                url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>();
+            value = value.replace(&encoded, "[redacted]");
+            value = value.replace(&encoded.to_ascii_lowercase(), "[redacted]");
+        }
+    }
+    value = bearer_regex()
+        .replace_all(&value, "$1 [redacted]")
+        .into_owned();
+    value = jwt_regex().replace_all(&value, "[redacted]").into_owned();
+    value = api_key_regex()
+        .replace_all(&value, "[redacted]")
+        .into_owned();
+    value = aws_key_regex()
+        .replace_all(&value, "[redacted]")
+        .into_owned();
+    value = cookie_regex()
+        .replace_all(&value, "$1=[redacted]")
+        .into_owned();
+    key_value_regex()
+        .replace_all(&value, "$1=[redacted]")
+        .into_owned()
+}
+
+fn sensitive_parameter(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "code"
+            | "key"
+            | "api_key"
+            | "secret"
+            | "password"
+            | "signature"
+            | "session"
+            | "credential"
+    )
+}
+
+fn decoded_component(value: &str) -> String {
+    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn add_secret(secrets: &mut Vec<String>, value: &str) {
+    for candidate in [value.to_string(), decoded_component(value)] {
+        if candidate.len() >= 3 && !secrets.contains(&candidate) && secrets.len() < 2_000 {
+            secrets.push(candidate.chars().take(8_000).collect());
+        }
+    }
+}
+
+fn collect_raw_url_secrets(raw: &str, secrets: &mut Vec<String>) {
+    for segment in raw.split(['?', '#']).skip(1) {
+        for pair in segment.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                if sensitive_parameter(&decoded_component(key)) {
+                    add_secret(secrets, value.trim_end_matches(')'));
+                }
+            }
+        }
+    }
+}
+
+fn compiled_regex(slot: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
+    slot.get_or_init(|| Regex::new(pattern).expect("valid diagnostic redaction regex"))
+}
+
+fn url_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(&VALUE, r#"(?i)(?:https?|wss?)://[^\s\"'<>]+"#)
+}
+fn bearer_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(&VALUE, r"(?i)\b(Bearer|Basic)\s+[^\s,;]+")
+}
+fn jwt_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(
+        &VALUE,
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    )
+}
+fn api_key_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(
+        &VALUE,
+        r"(?i)\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b",
+    )
+}
+fn aws_key_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(&VALUE, r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+}
+fn cookie_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(
+        &VALUE,
+        r"(?i)\b(cookie|set-cookie|authorization|proxy-authorization)\s*[:=]\s*[^\r\n|]+",
+    )
+}
+fn key_value_regex() -> &'static Regex {
+    static VALUE: OnceLock<Regex> = OnceLock::new();
+    compiled_regex(
+        &VALUE,
+        r"(?i)\b(token|access_token|refresh_token|id_token|code|key|secret|password|signature|session)\s*[:=]\s*[^\s,;|]+",
+    )
 }
 
 pub fn wait_for_daemon_exit(pid: i32, timeout: Duration) -> Result<(), Box<dyn Error>> {
@@ -309,6 +663,109 @@ fn dependency_installed(base_dir: &Path, package_name: &str) -> bool {
         .join(package_name)
         .join("package.json")
         .is_file()
+}
+
+fn dependency_version(base_dir: &Path, package_name: &str) -> Option<String> {
+    for ancestor in base_dir.ancestors() {
+        let package_json = ancestor
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json");
+        let Ok(contents) = fs::read_to_string(package_json) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(version) = manifest.get("version").and_then(serde_json::Value::as_str) {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+fn playwright_browser_available(base_dir: &Path) -> bool {
+    let mut roots = Vec::new();
+    if let Some(configured) = env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+        if configured != "0" {
+            roots.push(PathBuf::from(configured));
+        }
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        roots.push(local.join("ms-playwright"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".cache").join("ms-playwright"));
+    }
+    for ancestor in base_dir.ancestors() {
+        roots.push(
+            ancestor
+                .join("node_modules")
+                .join("playwright-core")
+                .join(".local-browsers"),
+        );
+    }
+    roots.into_iter().any(|root| {
+        fs::read_dir(root).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("chromium")
+            })
+        })
+    })
+}
+
+fn chrome_discovery_sources() -> Vec<serde_json::Value> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let candidates: Vec<(&str, PathBuf)> = if cfg!(windows) {
+        vec![
+            (
+                "chrome-devtools-active-port",
+                home.join("AppData/Local/Google/Chrome/User Data/DevToolsActivePort"),
+            ),
+            (
+                "chromium-devtools-active-port",
+                home.join("AppData/Local/Chromium/User Data/DevToolsActivePort"),
+            ),
+            (
+                "edge-devtools-active-port",
+                home.join("AppData/Local/Microsoft/Edge/User Data/DevToolsActivePort"),
+            ),
+        ]
+    } else if cfg!(target_os = "macos") {
+        vec![(
+            "chrome-devtools-active-port",
+            home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"),
+        )]
+    } else {
+        vec![
+            (
+                "chrome-devtools-active-port",
+                home.join(".config/google-chrome/DevToolsActivePort"),
+            ),
+            (
+                "chromium-devtools-active-port",
+                home.join(".config/chromium/DevToolsActivePort"),
+            ),
+        ]
+    };
+    candidates
+        .into_iter()
+        .map(|(source, path)| serde_json::json!({ "source": source, "available": path.is_file() }))
+        .collect()
+}
+
+fn daemon_endpoint_label() -> &'static str {
+    if cfg!(windows) {
+        "named-pipe"
+    } else {
+        "~/.dev-browser/daemon.sock"
+    }
 }
 
 fn npm_command() -> &'static str {
@@ -679,5 +1136,70 @@ mod tests {
             child_process_path(PathBuf::from(r"\\?\UNC\server\share\daemon.ts")),
             PathBuf::from(r"\\server\share\daemon.ts")
         );
+    }
+
+    #[test]
+    fn doctor_diagnostics_bound_targets_and_redact_websocket_endpoints() {
+        let secret = "doctor-secret-value";
+        let target = serde_json::json!({
+            "id": "x".repeat(500),
+            "url": format!("https://user:{secret}@example.test/path?access_token={secret}&safe=1"),
+            "title": format!("Account {secret}"),
+            "name": "n".repeat(500)
+        });
+        let bounded = bounded_target(&target);
+        assert_eq!(bounded["id"].as_str().unwrap().chars().count(), 200);
+        let serialized = serde_json::to_string(&bounded).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("user:"));
+        assert!(serialized.contains("access_token="));
+        assert!(serialized.contains("redacted"));
+        let message = sanitize_diagnostic_message(
+            "failed at ws://127.0.0.1:9222/devtools/browser/private-token with Bearer secret-token after timeout",
+        );
+        assert!(!message.contains("private-token"));
+        assert!(!message.contains("secret-token"));
+        assert!(message.contains("ws://[redacted-endpoint]"));
+    }
+
+    #[test]
+    fn doctor_redaction_matches_adversarial_daemon_policy_cases() {
+        let secret = "TOP_SECRET";
+        for target in [
+            serde_json::json!({ "url": "https://example.test", "title": format!("token={secret}") }),
+            serde_json::json!({ "url": format!("https://example.test/?access%5Ftoken={secret}"), "title": secret }),
+            serde_json::json!({ "url": format!("https://user:password-secret@example.test"), "title": "password-secret" }),
+        ] {
+            assert!(!serde_json::to_string(&bounded_target(&target))
+                .unwrap()
+                .contains(secret));
+        }
+        let messages = [
+            format!("failed (https://example.test/?access_token={secret})"),
+            format!("cookie: sid={secret}"),
+            "jwt eyJabcdefgh.abcdefghijk.abcdefghijk".to_string(),
+            "key ghp_abcdefghijklmnop".to_string(),
+        ];
+        for message in messages {
+            assert!(!sanitize_diagnostic_message(&message).contains(secret));
+            assert!(sanitize_diagnostic_message(&message).contains("[redacted]"));
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_mismatches_are_failures() {
+        let (runtime, codes, exit_code) = classify_runtime_probe(RuntimeProbe::Mismatch {
+            process_hash: "a".repeat(64),
+            reasons: vec!["daemon version".to_string()],
+        });
+        assert_eq!(runtime["status"], "mismatch");
+        assert_eq!(codes[0]["code"], "DAEMON_VERSION_MISMATCH");
+        assert_eq!(exit_code, 6);
+
+        let (runtime, codes, exit_code) =
+            classify_runtime_probe(RuntimeProbe::Legacy("legacy secret".to_string()));
+        assert_eq!(runtime["status"], "legacy");
+        assert_eq!(codes[0]["code"], "DAEMON_HANDSHAKE_UNSUPPORTED");
+        assert_eq!(exit_code, 6);
     }
 }

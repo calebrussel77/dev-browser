@@ -1,5 +1,6 @@
 mod connection;
 mod daemon;
+mod discovery;
 mod interactive;
 mod skill;
 #[path = "wait-grammar.rs"]
@@ -8,9 +9,10 @@ mod wait_grammar;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use connection::{connect_to_daemon, read_line, send_message};
 use daemon::{
-    current_daemon_pid, ensure_daemon, install_daemon_runtime, is_daemon_running,
+    current_daemon_pid, doctor_report, ensure_daemon, install_daemon_runtime, is_daemon_running,
     wait_for_daemon_exit,
 };
+use discovery::{agent_schema, compact_capabilities, focused_example};
 use interactive::{
     apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
     Coordinates, InteractiveRequestOptions, ObserveActionOptions,
@@ -49,6 +51,7 @@ fn parse_ref_id(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+#[allow(dead_code)]
 const CLI_LONG_ABOUT: &str = r###"Dev Browser is a CLI for controlling local or external browsers with JavaScript scripts.
 Scripts run in a sandboxed QuickJS runtime (not Node.js). Top-level `await` is
 available, along with a preconnected `browser` global and standard `console` output.
@@ -138,6 +141,7 @@ Pages returned by `browser.getPage()` and `browser.newPage()` are full Playwrigh
 Page objects — you get the same API (goto, click, fill, locator, evaluate, etc.):
   https://playwright.dev/docs/api/class-page"###;
 
+#[allow(dead_code)]
 const CLI_AFTER_LONG_HELP: &str = include_str!("../llm-guide.txt");
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
@@ -145,8 +149,9 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 #[derive(Parser)]
 #[command(name = "dev-browser")]
 #[command(about = "Control browsers with JavaScript automation scripts")]
-#[command(long_about = CLI_LONG_ABOUT)]
-#[command(after_long_help = CLI_AFTER_LONG_HELP)]
+#[command(
+    long_about = "Agent-friendly browser automation with persistent pages, trusted interactive actions, and sandboxed QuickJS scripts. Run `dev-browser schema --json` for the machine contract, `dev-browser capabilities --compact` for feature discovery, or `dev-browser examples COMMAND` for a focused recipe."
+)]
 #[command(subcommand_precedence_over_arg = true)]
 struct Cli {
     #[arg(
@@ -167,6 +172,7 @@ struct Cli {
 
     #[arg(
         long,
+        global = true,
         num_args = 0..=1,
         default_missing_value = "auto",
         value_name = "URL",
@@ -695,6 +701,26 @@ enum Command {
         #[arg(long, value_name = "SESSION_ID")]
         session: Option<String>,
     },
+    #[command(about = "Diagnose CLI, daemon, browser, and CDP runtime health")]
+    Doctor {
+        #[arg(long, help = "Emit a machine-readable diagnostic report")]
+        json: bool,
+    },
+    #[command(about = "Print the authoritative machine-readable agent contract")]
+    Schema {
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "List compact agent capabilities")]
+    Capabilities {
+        #[arg(long, help = "Emit compact one-line JSON")]
+        compact: bool,
+    },
+    #[command(about = "Print a focused copy/paste recipe for one command")]
+    Examples {
+        #[arg(value_name = "COMMAND")]
+        command: String,
+    },
     #[command(
         about = "Install Playwright browsers (Chromium)",
         long_about = "Install Playwright browsers (Chromium).\n\nDownloads the Chromium build used for daemon-managed browser instances."
@@ -1144,6 +1170,67 @@ fn run() -> Result<i32, Box<dyn Error>> {
         }
         Some(Command::Install) => {
             install_daemon_runtime()?;
+            Ok(0)
+        }
+        Some(Command::Doctor { json }) => {
+            let (report, exit_code) =
+                doctor_report(&cli.browser, cli.connect.as_deref(), timeout_ms(&cli)?)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "dev-browser doctor: {}",
+                    if report["ok"] == true {
+                        "ok"
+                    } else {
+                        "issues found"
+                    }
+                );
+                println!(
+                    "daemon: {}",
+                    report["daemon"]["runtime"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "playwright: {}",
+                    report["playwright"]["installedVersion"]
+                        .as_str()
+                        .unwrap_or("missing")
+                );
+                if let Some(codes) = report["codes"].as_array() {
+                    for item in codes {
+                        println!(
+                            "{}: {}",
+                            item["severity"].as_str().unwrap_or("info"),
+                            item["code"].as_str().unwrap_or("UNKNOWN")
+                        );
+                    }
+                }
+            }
+            Ok(exit_code)
+        }
+        Some(Command::Schema { json: _ }) => {
+            println!("{}", serde_json::to_string_pretty(&agent_schema())?);
+            Ok(0)
+        }
+        Some(Command::Capabilities { compact }) => {
+            let capabilities = compact_capabilities();
+            if *compact {
+                println!("{}", serde_json::to_string(&capabilities)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&capabilities)?);
+            }
+            Ok(0)
+        }
+        Some(Command::Examples { command }) => {
+            let example = focused_example(command).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("No focused example for `{command}`; run `dev-browser schema --json`"),
+                )
+            })?;
+            println!("{example}");
             Ok(0)
         }
         Some(Command::InstallSkill { claude, agents }) => {
@@ -2202,5 +2289,32 @@ mod tests {
             "1000"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_doctor_schema_capabilities_and_examples() {
+        let doctor = Cli::try_parse_from(["dev-browser", "doctor", "--connect", "--json"]).unwrap();
+        assert_eq!(doctor.connect.as_deref(), Some("auto"));
+        assert!(matches!(
+            doctor.command,
+            Some(Command::Doctor { json: true })
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "schema", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Schema { json: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "capabilities", "--compact"])
+                .unwrap()
+                .command,
+            Some(Command::Capabilities { compact: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "examples", "click"]).unwrap().command,
+            Some(Command::Examples { command }) if command == "click"
+        ));
     }
 }
