@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { collectPageState } from "./perception/collector.js";
 import { assertScopedText, isValidWithinScope, resolveContentScope } from "./scoped-content.js";
+import { findTargets, landmarkScopeMatches } from "./targeting.js";
 
 describe.sequential("scoped observation, subtree text, and context assertions", () => {
   let browser: Browser;
@@ -41,14 +42,85 @@ describe.sequential("scoped observation, subtree text, and context assertions", 
     `);
   }
 
-  it("validates the within grammar shared with find (main, aside, dialog, role:, name:)", () => {
+  it("accepts find's within grammar (any landmark substring) plus role:/name: extensions", () => {
+    // Base grammar is find's: any landmark-descriptor substring is valid.
     expect(isValidWithinScope("main")).toBe(true);
     expect(isValidWithinScope("aside")).toBe(true);
     expect(isValidWithinScope("dialog")).toBe(true);
+    expect(isValidWithinScope("nav")).toBe(true);
+    expect(isValidWithinScope("conversation-list")).toBe(true);
+    // Extensions.
     expect(isValidWithinScope("role:list")).toBe(true);
     expect(isValidWithinScope("name:Thread")).toBe(true);
-    expect(isValidWithinScope("nav")).toBe(false);
+    // Bounds.
     expect(isValidWithinScope("")).toBe(false);
+    expect(isValidWithinScope("role:")).toBe(false);
+    expect(isValidWithinScope("name:")).toBe(false);
+    expect(isValidWithinScope("x".repeat(501))).toBe(false);
+
+    // The Node-side matcher extracted from findTargets encodes the same
+    // semantic the in-page resolvers duplicate.
+    expect(landmarkScopeMatches("section#conversation-list", "conversation-list")).toBe(true);
+    expect(landmarkScopeMatches("nav#primary", "nav")).toBe(true);
+    expect(landmarkScopeMatches("div[role=dialog]", "dialog")).toBe(true);
+    expect(landmarkScopeMatches("main", "aside")).toBe(false);
+  });
+
+  it("resolves any landmark substring the way find's within filter matches it", async () => {
+    await page.setContent(`
+      <nav id="primary"><a href="#one">Nav link</a></nav>
+      <main>
+        <section id="records-pane">
+          <button>Record action</button>
+          <p>Record body</p>
+        </section>
+        <section id="other-pane"><button>Other action</button></section>
+      </main>
+    `);
+
+    // Bare tag landmark (previously rejected by the closed enum).
+    const navText = await resolveContentScope(page, { within: "nav" });
+    expect(navText.text).toContain("Nav link");
+
+    // Custom id-based landmark substring, matching find's normalize semantic.
+    const scoped = await collectPageState(page, {
+      track: "landmark-scope",
+      scope: { within: "records-pane" },
+    });
+    const scopedNames = scoped.elements
+      .filter((element) => element.actionable)
+      .map((element) => element.name)
+      .sort();
+    expect(scopedNames).toEqual(["Record action"]);
+
+    // Equivalence with find: the actionable elements inside the scope are
+    // exactly those find's within filter selects from a full observation.
+    const full = await collectPageState(page, { track: "landmark-full" });
+    const findFiltered = findTargets(
+      full.elements.filter((element) => element.actionable),
+      { within: "records-pane", scope: "document", states: [] },
+      50
+    ).matches.map((match) => match.name).sort();
+    expect(findFiltered).toEqual(scopedNames);
+  });
+
+  it("collapses nested landmark matches to the outermost container instead of reporting ambiguity", async () => {
+    await page.setContent(`
+      <aside id="outer">
+        <p>Outer text</p>
+        <aside id="inner"><p>Inner text</p></aside>
+      </aside>
+    `);
+
+    const result = await resolveContentScope(page, { within: "aside" });
+    expect(result.text).toContain("Outer text");
+    expect(result.text).toContain("Inner text");
+
+    const observed = await collectPageState(page, {
+      track: "nested-aside",
+      scope: { within: "aside" },
+    });
+    expect(observed.tree).toContain("Inner text");
   });
 
   it("scopes observation to main's subtree without spending the node budget outside it", async () => {
@@ -126,6 +198,65 @@ describe.sequential("scoped observation, subtree text, and context assertions", 
     expect(result.text).toContain("Line three");
     expect(result.text.includes("\n")).toBe(true);
     expect(result.scope).toMatchObject({ kind: "ref", value: ref });
+  });
+
+  it("resolves name: scopes with identical bounded-name semantics in observe and text paths", async () => {
+    // aria-label longer than the shared 180-char compact bound: both the
+    // observe path (realm-collector) and the text/assert path
+    // (scoped-content) must truncate identically, so the full label misses
+    // in both and the 180-char prefix matches in both.
+    const longLabel = "L".repeat(100) + "R".repeat(100);
+    const truncatedLabel = longLabel.slice(0, 180);
+    await page.setContent(
+      `<main><section aria-label="${longLabel}"><p>Bounded name body</p></section></main>`
+    );
+
+    await expect(
+      resolveContentScope(page, { within: `name:${longLabel}` })
+    ).rejects.toMatchObject({ code: "TARGET_MISSING" });
+    await expect(
+      collectPageState(page, { track: "long-name-observe", scope: { within: `name:${longLabel}` } })
+    ).rejects.toMatchObject({ code: "TARGET_MISSING" });
+
+    const textPath = await resolveContentScope(page, { within: `name:${truncatedLabel}` });
+    expect(textPath.text).toContain("Bounded name body");
+    const observePath = await collectPageState(page, {
+      track: "long-name-observe-2",
+      scope: { within: `name:${truncatedLabel}` },
+    });
+    expect(observePath.tree).toContain("Bounded name body");
+  });
+
+  it("scopes observation to a ref root, accepting both bare and F0-prefixed forms", async () => {
+    await page.setContent(`
+      <main>
+        <section id="pane" tabindex="0">
+          <button>Inside pane</button>
+        </section>
+        <button>Outside pane</button>
+      </main>
+    `);
+    const full = await collectPageState(page, { track: "root-ref-full" });
+    const paneRef = full.elements.find(
+      (element) => element.actionable && element.name === "Inside pane" && element.role === "section"
+    )?.ref;
+    expect(paneRef).toMatch(/^R\d+$/);
+
+    const bare = await collectPageState(page, { track: "root-ref-bare", scope: { ref: paneRef } });
+    expect(bare.elements.some((element) => element.name === "Inside pane")).toBe(true);
+    expect(bare.tree).not.toContain("Outside pane");
+    expect(bare.scope).toMatchObject({ kind: "ref", value: paneRef });
+
+    const prefixed = await collectPageState(page, {
+      track: "root-ref-prefixed",
+      scope: { ref: `F0:${paneRef}` },
+    });
+    expect(prefixed.elements.some((element) => element.name === "Inside pane")).toBe(true);
+    expect(prefixed.tree).not.toContain("Outside pane");
+
+    await expect(
+      collectPageState(page, { track: "root-ref-cross-frame", scope: { ref: "F3:R1" } })
+    ).rejects.toMatchObject({ code: "UNSUPPORTED_CONTEXT" });
   });
 
   it("asserts scoped text without mutating the page", async () => {

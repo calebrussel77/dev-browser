@@ -80,11 +80,30 @@ export function collectRealm({
     const html = element as HTMLElement;
     return `${element.tagName.toLowerCase()}${html.id ? `#${compact(html.id, 50)}` : ""}${html.dataset.testid ? `[data-testid=${compact(html.dataset.testid, 50)}]` : ""}`;
   };
+  // Scope resolution semantics MUST stay identical to resolveScopedText in
+  // daemon/src/scoped-content.ts and to landmarkScopeMatches in
+  // daemon/src/targeting.ts (find's within grammar as the base, plus the
+  // role:/name: extensions); DOM tests in scoped-content.test.ts cross-check.
+  const normalizeMatch = (value: string): string =>
+    value
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
   const accessibleScopeName = (element: Element): string => {
     const aria = element.getAttribute("aria-label");
     if (aria) return compact(aria);
     return boundedDescendantText(element, 500, 100).text;
   };
+  const scopeDescriptorFor = (element: Element): string => {
+    const tag = element.tagName.toLowerCase();
+    const id = element.id ? `#${compact(element.id, 50)}` : "";
+    const role = element.getAttribute("role");
+    return `${tag}${id}${role ? `[role=${role}]` : ""}`;
+  };
+  const scopeContainerSelector =
+    "main,aside,nav,header,footer,section,article,dialog,[role],[aria-label]";
   let scopeRoot: Element = document.documentElement ?? document.body;
   const scopeResult: RealmScopeResult = { requested: false, matched: true, ambiguous: false, count: 1 };
   if (scope && (scope.ref || scope.within)) {
@@ -97,19 +116,24 @@ export function collectRealm({
       const value = scope.within;
       const roleMatch = /^role:(.+)$/.exec(value);
       const nameMatch = /^name:(.+)$/.exec(value);
-      if (value === "main") scopeMatches = Array.from(document.querySelectorAll("main"));
-      else if (value === "aside") scopeMatches = Array.from(document.querySelectorAll("aside"));
-      else if (value === "dialog")
-        scopeMatches = Array.from(document.querySelectorAll('dialog,[role="dialog"]'));
-      else if (roleMatch)
+      if (roleMatch)
         scopeMatches = Array.from(
           document.querySelectorAll(`[role="${roleMatch[1]!.replace(/"/g, '\\"')}"]`)
         );
       else if (nameMatch) {
         const target = nameMatch[1]!.trim().toLowerCase();
-        scopeMatches = Array.from(
-          document.querySelectorAll("main,aside,nav,header,footer,section,article,dialog,[role],[aria-label]")
-        ).filter((element) => accessibleScopeName(element).toLowerCase() === target);
+        scopeMatches = Array.from(document.querySelectorAll(scopeContainerSelector))
+          .filter((element) => accessibleScopeName(element).toLowerCase() === target);
+      } else {
+        const needle = normalizeMatch(value);
+        const matched = needle
+          ? Array.from(document.querySelectorAll(scopeContainerSelector)).filter((element) =>
+              normalizeMatch(scopeDescriptorFor(element)).includes(needle)
+            )
+          : [];
+        scopeMatches = matched.filter(
+          (element) => !matched.some((other) => other !== element && other.contains(element))
+        );
       }
     }
     scopeResult.count = scopeMatches.length;

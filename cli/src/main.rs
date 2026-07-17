@@ -510,7 +510,7 @@ enum Command {
             long,
             value_name = "SCOPE",
             conflicts_with = "root_ref",
-            help = "Scope observation to main, aside, dialog, role:<role>, or name:<exact name>"
+            help = "Scope observation to a landmark substring (find's within grammar), role:<role>, or name:<exact name>"
         )]
         within: Option<String>,
         #[arg(long, help = "Return bounded normalized innerText instead of the element tree")]
@@ -518,7 +518,7 @@ enum Command {
     },
     #[command(
         about = "Read bounded normalized text from a ref or landmark scope",
-        long_about = "Return bounded, normalized innerText for a single ref or a within scope (main, aside, dialog, role:<role>, name:<exact name>), preserving line breaks and truncation metadata."
+        long_about = "Return bounded, normalized innerText for a single ref or a within scope (a landmark substring using find's within grammar, role:<role>, or name:<exact name>), preserving line breaks and truncation metadata."
     )]
     Text {
         #[command(flatten)]

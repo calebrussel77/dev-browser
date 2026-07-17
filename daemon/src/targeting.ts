@@ -33,13 +33,24 @@ export interface TargetAmbiguity {
   reason: string;
 }
 
-const normalize = (value: string) =>
+export const normalizeMatchText = (value: string): string =>
   value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+
+/**
+ * Find's `within` semantic: a case/diacritic/punctuation-insensitive
+ * substring match against a landmark descriptor. Scoped observation, text,
+ * and assert reuse this exact matching semantic for their scope roots.
+ */
+export function landmarkScopeMatches(landmark: string, within: string): boolean {
+  return normalizeMatchText(landmark).includes(normalizeMatchText(within));
+}
+
+const normalize = normalizeMatchText;
 const refOrder = (ref: string) => Number(ref.replace(/\D/g, "")) || Number.MAX_SAFE_INTEGER;
 
 function hasState(element: PerceptionElement, state: TargetState): boolean {
@@ -77,7 +88,7 @@ export function findTargets(
         score += mode === "exact" ? 100 : 60;
       }
       if (filters.within) {
-        if (!normalize(element.landmark).includes(normalize(filters.within))) return [];
+        if (!landmarkScopeMatches(element.landmark, filters.within)) return [];
         reasons.push(`within=${filters.within}`);
         score += 25;
       }

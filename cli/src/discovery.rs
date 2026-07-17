@@ -52,7 +52,7 @@ pub fn agent_schema() -> Value {
                 "forward": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
                 "reload": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
                 "read": { "required": [], "optional": ["limit:1..500", "depth:1..50"] },
-                "observe": { "required": [], "optional": ["full:boolean", "delta:boolean", "track:string", "maxNodes:1..1000", "maxChars:1..100000", "depth:1..50", "breadth:1..500", "continuation:string", "root:ref (mutually exclusive with within)", "within:main|aside|dialog|role:<role>|name:<exact name>", "textOnly:boolean"] },
+                "observe": { "required": [], "optional": ["full:boolean", "delta:boolean", "track:string", "maxNodes:1..1000", "maxChars:1..100000", "depth:1..50", "breadth:1..500", "continuation:string", "root:ref (mutually exclusive with within)", "within:landmark substring (find grammar)|role:<role>|name:<exact name>", "textOnly:boolean"] },
                 "find": { "atLeastOne": ["query", "role", "name", "within", "near", "frame", "states[]"], "optional": ["nameMode:exact|contains (requires name)", "scope:visible|viewport|document", "index:0..999", "limit:1..50"] },
                 "text": { "oneOf": [["ref"], ["within"]], "optional": ["maxChars:1..200000 (default 20000)"] },
                 "assert": { "oneOf": [["ref"], ["within"]], "required": ["text"], "optional": ["match:exact|contains (default contains)"] },

@@ -1,7 +1,7 @@
 import type { Frame, Page } from "playwright";
 
 import { AgentProtocolError } from "../agent-protocol.js";
-import { beginFrameGeneration, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
+import { beginFrameGeneration, parseScopedRef, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
 import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "../frame-geometry.js";
 import { recordPageState, type PerceptionDelta } from "../page-state.js";
 import { collectRealm } from "./realm-collector.js";
@@ -560,12 +560,30 @@ export async function collectPageState(
   const breadth = bounded(options.breadth, DEFAULTS.breadth, 500);
   const maxChars = bounded(options.maxChars, DEFAULTS.maxChars, 100_000);
   const scope = options.scope && (options.scope.ref || options.scope.within) ? options.scope : undefined;
+  // Refs arrive in scoped `F#:R#` (or bare `R#`) form; the realm registry is
+  // keyed by the local `R#` part, so parse before the in-page lookup.
+  let realmScope: { ref?: string; within?: string } | undefined = scope;
+  if (scope?.ref) {
+    const parsedRef = parseScopedRef(scope.ref);
+    if (!parsedRef)
+      throw new AgentProtocolError("TARGET_MISSING", `Scope ref "${scope.ref}" is invalid`, true, {
+        details: { ref: scope.ref },
+      });
+    if (parsedRef.frameId !== "F0")
+      throw new AgentProtocolError(
+        "UNSUPPORTED_CONTEXT",
+        `Scoped observation only supports top-document refs; "${scope.ref}" targets frame ${parsedRef.frameId}`,
+        false,
+        { details: { ref: scope.ref, frameId: parsedRef.frameId } }
+      );
+    realmScope = { ref: parsedRef.localRef };
+  }
   const initialTop = await page.mainFrame().evaluate(collectRealm, {
     full,
     legacyRefs: false,
     maxRecords: MAX_RECORDS_PER_OBSERVATION,
     maxWork: MAX_WORK_PER_FRAME,
-    scope,
+    scope: realmScope,
     textOnly: options.textOnly ?? false,
     textMaxChars: maxChars,
   });

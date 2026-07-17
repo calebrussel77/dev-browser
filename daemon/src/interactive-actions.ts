@@ -868,7 +868,7 @@ export async function executeInteractiveAction(
       if (action.within && !isValidWithinScope(action.within))
         throw new AgentProtocolError(
           "UNSUPPORTED_CONTEXT",
-          `Unsupported within scope "${action.within}"; use main, aside, dialog, role:<role>, or name:<exact name>`,
+          `Unsupported within scope "${action.within}"; use a landmark substring (find's within grammar), role:<role>, or name:<exact name>`,
           false
         );
       const perception = await perceive(
