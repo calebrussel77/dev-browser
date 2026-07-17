@@ -24,7 +24,9 @@ import {
   parseRequest,
   serialize,
   type ExecuteRequest,
+  type HandshakeRequest,
   type InteractiveRequest,
+  type RestartRequest,
   type SessionRequest,
   type Response,
 } from "./protocol.js";
@@ -32,6 +34,12 @@ import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 import { redactSensitive } from "./redaction.js";
+import {
+  buildRuntimeHandshake,
+  currentProcessHash,
+  EXPECTED_PLAYWRIGHT_VERSION,
+  OperationTracker,
+} from "./runtime-handshake.js";
 
 const BASE_DIR = getDevBrowserBaseDir();
 const SOCKET_PATH = getDaemonEndpoint();
@@ -44,8 +52,8 @@ const EMBEDDED_PACKAGE_JSON = JSON.stringify({
   private: true,
   type: "module",
   dependencies: {
-    playwright: "1.58.2",
-    "playwright-core": "1.58.2",
+    playwright: EXPECTED_PLAYWRIGHT_VERSION,
+    "playwright-core": EXPECTED_PLAYWRIGHT_VERSION,
     "quickjs-emscripten": "^0.32.0",
   },
 });
@@ -55,6 +63,7 @@ const startedAt = Date.now();
 const withBrowserLock = createKeyedLock<string>();
 const withInstallLock = createMutex();
 const clients = new Set<net.Socket>();
+const operations = new OperationTracker();
 
 let server: net.Server | null = null;
 let shuttingDown: Promise<void> | null = null;
@@ -305,8 +314,12 @@ async function handleSession(socket: net.Socket, request: SessionRequest): Promi
   } catch (error) {
     const failure = buildInteractiveFailure({ requestId: request.id, error });
     await writeMessage(socket, {
-      id: request.id, type: "error", message: failure.error.message,
-      exitCode: agentErrorExitCode(failure.error.code), error: failure.error, data: failure,
+      id: request.id,
+      type: "error",
+      message: failure.error.message,
+      exitCode: agentErrorExitCode(failure.error.code),
+      error: failure.error,
+      data: failure,
     });
   }
 }
@@ -435,83 +448,173 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
     return;
   }
 
-  switch (request.type) {
-    case "execute":
-      await handleExecute(socket, request);
-      return;
-
-    case "interactive":
-      await handleInteractive(socket, request);
-      return;
-
-    case "session":
-      await handleSession(socket, request);
-      return;
-
-    case "browsers":
-      await writeMessage(socket, {
-        id: request.id,
-        type: "result",
-        data: manager.listBrowsers(),
-      });
-      await writeMessage(socket, {
-        id: request.id,
-        type: "complete",
-        success: true,
-      });
-      return;
-
-    case "browser-stop":
-      await manager.stopBrowser(request.browser);
-      await writeMessage(socket, {
-        id: request.id,
-        type: "result",
-        data: { browser: request.browser, stopped: true },
-      });
-      await writeMessage(socket, {
-        id: request.id,
-        type: "complete",
-        success: true,
-      });
-      return;
-
-    case "status":
-      await writeMessage(socket, {
-        id: request.id,
-        type: "result",
-        data: {
-          pid: process.pid,
-          uptimeMs: Date.now() - startedAt,
-          browserCount: manager.browserCount(),
-          browsers: manager.listBrowsers(),
-          socketPath: SOCKET_PATH,
-        },
-      });
-      await writeMessage(socket, {
-        id: request.id,
-        type: "complete",
-        success: true,
-      });
-      return;
-
-    case "install":
-      await handleInstall(socket, request);
-      return;
-
-    case "stop":
-      await writeMessage(socket, {
-        id: request.id,
-        type: "result",
-        data: { stopping: true },
-      });
-      await writeMessage(socket, {
-        id: request.id,
-        type: "complete",
-        success: true,
-      });
-      void shutdown(0);
-      return;
+  if (request.type === "handshake") {
+    await handleHandshake(socket, request);
+    return;
   }
+
+  if (request.type === "restart") {
+    await handleRestart(socket, request);
+    return;
+  }
+
+  const tracksOperation = ["execute", "interactive", "session", "install", "browser-stop"].includes(
+    request.type
+  );
+  let finishOperation: (() => void) | undefined;
+  if (tracksOperation) {
+    try {
+      finishOperation = operations.begin();
+    } catch {
+      const error = new AgentProtocolError(
+        "DAEMON_VERSION_MISMATCH",
+        "Daemon restart is pending; retry after the daemon becomes available",
+        true,
+        { nextCommands: ["dev-browser status"] }
+      );
+      await writeMessage(socket, {
+        id: request.id,
+        type: "error",
+        message: error.message,
+        exitCode: agentErrorExitCode(error.code),
+        error: error.toAgentError(),
+      });
+      return;
+    }
+  }
+
+  try {
+    switch (request.type) {
+      case "execute":
+        await handleExecute(socket, request);
+        return;
+
+      case "interactive":
+        await handleInteractive(socket, request);
+        return;
+
+      case "session":
+        await handleSession(socket, request);
+        return;
+
+      case "browsers":
+        await writeMessage(socket, {
+          id: request.id,
+          type: "result",
+          data: manager.listBrowsers(),
+        });
+        await writeMessage(socket, {
+          id: request.id,
+          type: "complete",
+          success: true,
+        });
+        return;
+
+      case "browser-stop":
+        await manager.stopBrowser(request.browser);
+        await writeMessage(socket, {
+          id: request.id,
+          type: "result",
+          data: { browser: request.browser, stopped: true },
+        });
+        await writeMessage(socket, {
+          id: request.id,
+          type: "complete",
+          success: true,
+        });
+        return;
+
+      case "status":
+        await writeMessage(socket, {
+          id: request.id,
+          type: "result",
+          data: {
+            pid: process.pid,
+            uptimeMs: Date.now() - startedAt,
+            browserCount: manager.browserCount(),
+            browsers: manager.listBrowsers(),
+            socketPath: SOCKET_PATH,
+          },
+        });
+        await writeMessage(socket, {
+          id: request.id,
+          type: "complete",
+          success: true,
+        });
+        return;
+
+      case "install":
+        await handleInstall(socket, request);
+        return;
+
+      case "stop":
+        await writeMessage(socket, {
+          id: request.id,
+          type: "result",
+          data: { stopping: true },
+        });
+        await writeMessage(socket, {
+          id: request.id,
+          type: "complete",
+          success: true,
+        });
+        void shutdown(0);
+        return;
+    }
+  } finally {
+    finishOperation?.();
+  }
+}
+
+async function handleHandshake(socket: net.Socket, request: HandshakeRequest): Promise<void> {
+  const data = await buildRuntimeHandshake({
+    cliVersion: request.cliVersion,
+    cliBuildHash: request.cliBuildHash,
+    embeddedDaemonHash: request.embeddedDaemonHash,
+    expectedDaemonHash: request.expectedDaemonHash,
+  });
+  await writeMessage(socket, {
+    id: request.id,
+    type: "result",
+    data: { ...data, activeOperations: operations.activeOperations },
+  });
+  await writeMessage(socket, { id: request.id, type: "complete", success: true });
+}
+
+async function handleRestart(socket: net.Socket, request: RestartRequest): Promise<void> {
+  const processHash = await currentProcessHash();
+  const reservation =
+    request.currentDaemonHash === processHash
+      ? operations.reserveIdleRestart()
+      : { ok: false, activeOperations: operations.activeOperations };
+  if (!reservation.ok) {
+    const error = new AgentProtocolError(
+      "DAEMON_VERSION_MISMATCH",
+      reservation.activeOperations > 0
+        ? `Daemon runtime mismatch cannot restart while ${reservation.activeOperations} operation(s) are active`
+        : "Daemon runtime changed during restart coordination; retry the command",
+      true,
+      {
+        details: { activeOperations: reservation.activeOperations },
+        nextCommands: ["dev-browser status"],
+      }
+    );
+    await writeMessage(socket, {
+      id: request.id,
+      type: "error",
+      message: error.message,
+      exitCode: agentErrorExitCode(error.code),
+      error: error.toAgentError(),
+    });
+    return;
+  }
+  await writeMessage(socket, {
+    id: request.id,
+    type: "result",
+    data: { restarting: true, processHash },
+  });
+  await writeMessage(socket, { id: request.id, type: "complete", success: true });
+  void shutdown(0);
 }
 
 async function shutdown(exitCode = 0): Promise<void> {

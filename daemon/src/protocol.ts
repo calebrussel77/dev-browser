@@ -17,7 +17,12 @@ const StateGuardSchema = z.object({
     .regex(/^doc-\d+:\d+$/)
     .optional(),
   strictState: z.boolean().default(false),
-  confirmToken: z.string().min(32).max(200).regex(/^[A-Za-z0-9_-]+$/).optional(),
+  confirmToken: z
+    .string()
+    .min(32)
+    .max(200)
+    .regex(/^[A-Za-z0-9_-]+$/)
+    .optional(),
 });
 
 const WAIT_MATCH_MAX_LENGTH = 2_000;
@@ -40,7 +45,11 @@ function isSafeRegex(value: string): boolean {
 
 const WaitValueSchema = z.string().min(1).max(WAIT_MATCH_MAX_LENGTH);
 const WaitMatchSchema = z.enum(["exact", "contains", "glob", "safe-regex"]);
-const ScopedRefSchema = z.string().min(2).max(32).regex(/^(?:F\d+:)?R\d+$/);
+const ScopedRefSchema = z
+  .string()
+  .min(2)
+  .max(32)
+  .regex(/^(?:F\d+:)?R\d+$/);
 const MatchFieldsSchema = z
   .object({
     match: WaitMatchSchema,
@@ -159,22 +168,44 @@ const ScrollActionSchema = PrimitiveBaseSchema.extend({
   deltaY: z.number().finite().min(-100_000).max(100_000).optional(),
   direction: z.enum(["up", "down", "left", "right"]).optional(),
   pages: z.number().int().min(1).max(50).optional(),
-  until: z.string().regex(/^(text|role):.{1,2000}$/).optional(),
+  until: z
+    .string()
+    .regex(/^(text|role):.{1,2000}$/)
+    .optional(),
   maxSteps: z.number().int().min(1).max(50).optional(),
 }).superRefine((value, context) => {
-  const modes = [value.ref !== undefined, value.deltaX !== undefined || value.deltaY !== undefined,
-    value.direction !== undefined, value.until !== undefined].filter(Boolean).length;
-  if (modes !== 1) context.addIssue({ code: z.ZodIssueCode.custom, message: "exactly one scroll mode is required" });
+  const modes = [
+    value.ref !== undefined,
+    value.deltaX !== undefined || value.deltaY !== undefined,
+    value.direction !== undefined,
+    value.until !== undefined,
+  ].filter(Boolean).length;
+  if (modes !== 1)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exactly one scroll mode is required",
+    });
   if ((value.direction === undefined) !== (value.pages === undefined))
-    context.addIssue({ code: z.ZodIssueCode.custom, message: "direction and pages are required together" });
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "direction and pages are required together",
+    });
   if ((value.until === undefined) !== (value.maxSteps === undefined))
-    context.addIssue({ code: z.ZodIssueCode.custom, message: "until and maxSteps are required together" });
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "until and maxSteps are required together",
+    });
 });
 const SelectActionSchema = RefPrimitiveSchema.extend({
-  kind: z.literal("select"), value: z.string().max(2000).optional(), label: z.string().max(2000).optional(),
+  kind: z.literal("select"),
+  value: z.string().max(2000).optional(),
+  label: z.string().max(2000).optional(),
 }).superRefine((value, context) => {
   if ((value.value === undefined) === (value.label === undefined))
-    context.addIssue({ code: z.ZodIssueCode.custom, message: "exactly one of value or label is required" });
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exactly one of value or label is required",
+    });
 });
 const HistoryNavigationActionSchema = PrimitiveBaseSchema.extend({
   kind: z.enum(["back", "forward", "reload"]),
@@ -230,25 +261,47 @@ const ObserveOptionsSchema = z.object({
     .optional(),
 });
 
-const StructuredFindSchema = z.object({
-  kind: z.literal("find"),
-  query: z.string().min(1).max(2_000).optional(),
-  role: z.string().min(1).max(100).optional(),
-  name: z.string().min(1).max(2_000).optional(),
-  nameMode: z.enum(["exact", "contains"]).default("exact"),
-  within: z.string().min(1).max(500).optional(),
-  near: z.string().min(1).max(2_000).optional(),
-  frame: z.string().min(1).max(200).optional(),
-  scope: z.enum(["visible", "viewport", "document"]).default("visible"),
-  states: z.array(z.enum(["enabled", "disabled", "checked", "unchecked", "expanded", "collapsed", "selected"])).max(7).default([]),
-  index: z.number().int().nonnegative().max(999).optional(),
-  limit: z.number().int().positive().max(50).default(10),
-}).superRefine((value, context) => {
-  if (!value.query && !value.role && !value.name && !value.within && !value.near && !value.frame && value.states.length === 0)
-    context.addIssue({ code: z.ZodIssueCode.custom, message: "find requires a query or structured filter" });
-  if (!value.name && value.nameMode !== "exact")
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["nameMode"], message: "nameMode requires name" });
-});
+const StructuredFindSchema = z
+  .object({
+    kind: z.literal("find"),
+    query: z.string().min(1).max(2_000).optional(),
+    role: z.string().min(1).max(100).optional(),
+    name: z.string().min(1).max(2_000).optional(),
+    nameMode: z.enum(["exact", "contains"]).default("exact"),
+    within: z.string().min(1).max(500).optional(),
+    near: z.string().min(1).max(2_000).optional(),
+    frame: z.string().min(1).max(200).optional(),
+    scope: z.enum(["visible", "viewport", "document"]).default("visible"),
+    states: z
+      .array(
+        z.enum(["enabled", "disabled", "checked", "unchecked", "expanded", "collapsed", "selected"])
+      )
+      .max(7)
+      .default([]),
+    index: z.number().int().nonnegative().max(999).optional(),
+    limit: z.number().int().positive().max(50).default(10),
+  })
+  .superRefine((value, context) => {
+    if (
+      !value.query &&
+      !value.role &&
+      !value.name &&
+      !value.within &&
+      !value.near &&
+      !value.frame &&
+      value.states.length === 0
+    )
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "find requires a query or structured filter",
+      });
+    if (!value.name && value.nameMode !== "exact")
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["nameMode"],
+        message: "nameMode requires name",
+      });
+  });
 
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
@@ -266,7 +319,14 @@ const InteractiveActionSchema = z.union([
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
   RefPrimitiveSchema.extend({ kind: z.literal("focus") }),
-  RefPrimitiveSchema.extend({ kind: z.literal("press"), key: z.string().min(1).max(64).regex(/^[A-Za-z0-9+ -]+$/) }),
+  RefPrimitiveSchema.extend({
+    kind: z.literal("press"),
+    key: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9+ -]+$/),
+  }),
   RefPrimitiveSchema.extend({ kind: z.literal("paste"), text: z.string().max(1_000_000) }),
   ScrollActionSchema,
   SelectActionSchema,
@@ -311,18 +371,36 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   session: z.string().min(1).max(500).optional(),
 }).superRefine((value, context) => {
   if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["action"], message: "paste cannot create screenshots or annotations" });
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["action"],
+      message: "paste cannot create screenshots or annotations",
+    });
   }
-  if (value.protocolVersion === 2 && value.action.kind === "confirm" && (!value.action.ref || !value.action.expectText))
-    context.addIssue({ code: z.ZodIssueCode.custom, path: ["action"], message: "v2 confirmation requires ref and expectText" });
+  if (
+    value.protocolVersion === 2 &&
+    value.action.kind === "confirm" &&
+    (!value.action.ref || !value.action.expectText)
+  )
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["action"],
+      message: "v2 confirmation requires ref and expectText",
+    });
   if ("confirmToken" in value.action && value.action.confirmToken) {
     const trustedRefAction =
       (value.action.kind === "click" && "ref" in value.action) ||
       (value.action.kind === "type" && Boolean(value.action.ref)) ||
-      ["focus", "press", "paste", "select", "check", "uncheck", "hover", "drag", "upload"].includes(value.action.kind) ||
+      ["focus", "press", "paste", "select", "check", "uncheck", "hover", "drag", "upload"].includes(
+        value.action.kind
+      ) ||
       (value.action.kind === "scroll" && Boolean(value.action.ref));
     if (value.protocolVersion !== 2 || !trustedRefAction || !value.action.fromState)
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["action", "confirmToken"], message: "confirmToken requires a v2 trusted ref action and fromState" });
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["action", "confirmToken"],
+        message: "confirmToken requires a v2 trusted ref action and fromState",
+      });
   }
 });
 
@@ -368,6 +446,21 @@ const StopRequestSchema = RequestBaseSchema.extend({
   type: z.literal("stop"),
 });
 
+const HashSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const HandshakeRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("handshake"),
+  cliVersion: z.string().min(1).max(100),
+  cliBuildHash: HashSchema,
+  embeddedDaemonHash: HashSchema,
+  expectedDaemonHash: HashSchema,
+});
+
+const RestartRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("restart"),
+  currentDaemonHash: HashSchema,
+  ifIdle: z.literal(true),
+});
+
 const RequestSchema = z.union([
   ExecuteRequestSchema,
   InteractiveRequestSchema,
@@ -376,6 +469,8 @@ const RequestSchema = z.union([
   StatusRequestSchema,
   InstallRequestSchema,
   StopRequestSchema,
+  HandshakeRequestSchema,
+  RestartRequestSchema,
   SessionRequestSchema,
 ]);
 
@@ -422,15 +517,32 @@ const ResponseSchema = z.discriminatedUnion("type", [
 type Request = z.infer<typeof RequestSchema>;
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 export type SessionRequest = z.infer<typeof SessionRequestSchema>;
+export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
+export type RestartRequest = z.infer<typeof RestartRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
-    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states"> & { strictState?: boolean } & (Action extends {
+    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states"> & {
+        strictState?: boolean;
+      } & (Action extends {
           kind: "shot";
         }
           ? { padding?: number }
-          : unknown) & (Action extends { kind: "find" }
-          ? { scope?: "visible" | "viewport" | "document"; nameMode?: "exact" | "contains"; states?: ("enabled" | "disabled" | "checked" | "unchecked" | "expanded" | "collapsed" | "selected")[] }
+          : unknown) &
+        (Action extends { kind: "find" }
+          ? {
+              scope?: "visible" | "viewport" | "document";
+              nameMode?: "exact" | "contains";
+              states?: (
+                | "enabled"
+                | "disabled"
+                | "checked"
+                | "unchecked"
+                | "expanded"
+                | "collapsed"
+                | "selected"
+              )[];
+            }
           : unknown)
     : never
   : never;
@@ -547,7 +659,12 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
 
 export function serialize(message: Response): string {
   const parsed = ResponseSchema.parse(message);
-  const allowConfirmationToken = parsed.type === "result" &&
-    Boolean(parsed.data && typeof parsed.data === "object" && (parsed.data as { action?: unknown }).action === "confirm");
+  const allowConfirmationToken =
+    parsed.type === "result" &&
+    Boolean(
+      parsed.data &&
+      typeof parsed.data === "object" &&
+      (parsed.data as { action?: unknown }).action === "confirm"
+    );
   return `${JSON.stringify(redactSensitive(parsed, { allowConfirmationToken }))}\n`;
 }
