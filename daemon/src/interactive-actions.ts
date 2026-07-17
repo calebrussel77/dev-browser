@@ -1582,6 +1582,7 @@ export async function executeInteractiveAction(
       annotatedName: request.annotate ? name : undefined,
       annotate: request.annotate,
       fullPage: request.fullPage,
+      timeoutMs: request.shotTimeoutMs ?? Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 8_000),
       annotationElements: matchRefs
         ? visualPerception.elements.filter((element) => matchRefs.has(element.ref))
         : undefined,

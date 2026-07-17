@@ -410,6 +410,23 @@ describe("interactive request protocol", () => {
     });
   });
 
+  it("accepts only bounded screenshot timeout values", () => {
+    const request = {
+      id: "interactive-shot-timeout",
+      type: "interactive",
+      protocolVersion: 2,
+      shotTimeoutMs: 250,
+      action: { kind: "shot" },
+    };
+    expect(parseRequest(JSON.stringify(request))).toMatchObject({
+      success: true,
+      request: { shotTimeoutMs: 250 },
+    });
+    for (const shotTimeoutMs of [249, 120_001]) {
+      expect(parseRequest(JSON.stringify({ ...request, shotTimeoutMs }))).toMatchObject({ success: false });
+    }
+  });
+
   it("rejects clicks without a ref or coordinates", () => {
     const result = parseRequest(
       JSON.stringify({

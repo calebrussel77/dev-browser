@@ -239,6 +239,14 @@ struct PageActionArgs {
 
     #[arg(
         long,
+        value_name = "MILLISECONDS",
+        value_parser = clap::value_parser!(u32).range(250..=120_000),
+        help = "Maximum time for each screenshot capture"
+    )]
+    shot_timeout: Option<u32>,
+
+    #[arg(
+        long,
         help = "Draw deterministic ref labels on the returned screenshot"
     )]
     annotate: bool,
@@ -705,6 +713,8 @@ enum Command {
         full_page: bool,
         #[arg(long)]
         annotate: bool,
+        #[arg(long, value_name = "MILLISECONDS", value_parser = clap::value_parser!(u32).range(250..=120_000))]
+        shot_timeout: Option<u32>,
         #[arg(long, value_name = "STATE")]
         from_state: Option<String>,
         #[arg(long)]
@@ -833,6 +843,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             None,
             false,
             false,
+            None,
             json!({ "kind": "pages" }),
             None,
         ),
@@ -1132,6 +1143,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             padding,
             full_page,
             annotate,
+            shot_timeout,
             from_state,
             strict_state,
             session,
@@ -1152,6 +1164,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 Some(file),
                 *annotate,
                 *full_page,
+                shot_timeout.map(u64::from),
                 action,
                 session.as_deref(),
             )
@@ -1373,6 +1386,7 @@ fn run_page_action(
         output.shot.as_deref(),
         output.annotate,
         output.full_page,
+        output.shot_timeout.map(u64::from),
         action,
         output.session.as_deref(),
     )
@@ -1434,6 +1448,7 @@ fn run_interactive(
     shot: Option<&str>,
     annotate: bool,
     full_page: bool,
+    shot_timeout: Option<u64>,
     action: Value,
     session: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
@@ -1442,6 +1457,7 @@ fn run_interactive(
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("action");
+    let timeout_ms = timeout_ms(cli)?;
     let request = build_interactive_request(
         InteractiveRequestOptions {
             id: request_id(action_name),
@@ -1450,10 +1466,11 @@ fn run_interactive(
             shot,
             annotate,
             full_page,
+            shot_timeout_ms: shot_timeout.unwrap_or_else(|| timeout_ms.min(8_000)),
             connect: cli.connect.as_deref(),
             headless: cli.headless,
             ignore_https_errors: cli.ignore_https_errors,
-            timeout_ms: timeout_ms(cli)?,
+            timeout_ms,
             session,
             trace: cli.trace,
         },
@@ -1881,6 +1898,8 @@ mod tests {
             "eyJ2IjoxLCJvZmZzZXQiOjN9",
             "--annotate",
             "--full-page",
+            "--shot-timeout",
+            "250",
         ])
         .unwrap();
 
@@ -1897,7 +1916,7 @@ mod tests {
                 continuation: Some(_),
                 ref output,
                 ..
-            }) if track == "checkout" && output.annotate && output.full_page
+            }) if track == "checkout" && output.annotate && output.full_page && output.shot_timeout == Some(250)
         ));
     }
 
@@ -2007,13 +2026,16 @@ mod tests {
             "--padding",
             "32",
             "--full-page",
+            "--shot-timeout",
+            "120000",
         ])
         .unwrap();
         assert!(matches!(
             shot.command,
-            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, .. })
+            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, shot_timeout: Some(120_000), .. })
                 if ref_id.as_deref() == Some("R7")
         ));
+        assert!(Cli::try_parse_from(["dev-browser", "shot", "--shot-timeout", "249"]).is_err());
     }
 
     #[test]

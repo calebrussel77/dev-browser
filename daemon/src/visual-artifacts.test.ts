@@ -1,6 +1,6 @@
 import { readFile, rm } from "node:fs/promises";
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { BrowserManager } from "./browser-manager.js";
 import { collectPageState } from "./perception/collector.js";
@@ -68,6 +68,74 @@ describe.sequential("visual artifacts", () => {
     );
     expect(pixel.slice(0, 3)).toEqual([0, 0, 255]);
     await rm(artifact.path, { force: true });
+  });
+
+  it("uses bounded CDP captures for animated viewport, document, crop, and annotated screenshots", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setViewportSize({ width: 320, height: 180 });
+    await page.setContent(`
+      <style>
+        body { margin: 0; height: 720px; }
+        .animated { width: 80px; height: 80px; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+      </style>
+      <input autofocus value="blinking caret"><div class="animated"></div><button style="position:absolute;top:360px">Target</button>
+    `);
+    await page.evaluate(() => {
+      Object.defineProperty(document, "fonts", {
+        configurable: true,
+        value: { ready: new Promise(() => {}) },
+      });
+    });
+    const state = await collectPageState(page, { full: true });
+    const onePixel = await page.screenshot({ scale: "css", clip: { x: 0, y: 0, width: 1, height: 1 } });
+    const session = {
+      send: vi.fn().mockResolvedValue({ data: onePixel.toString("base64") }),
+      detach: vi.fn().mockResolvedValue(undefined),
+    };
+    const newSession = vi.spyOn(page.context(), "newCDPSession").mockResolvedValue(session as never);
+    const screenshot = vi.spyOn(page, "screenshot").mockImplementation(() => new Promise(() => {}));
+
+    try {
+      const started = Date.now();
+      const captureWithin = <T>(capture: Promise<T>) =>
+        Promise.race([
+          capture,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("screenshot did not complete before its deadline")), 250)
+          ),
+        ]);
+      const viewport = await captureWithin(captureVisualArtifacts(page, state, {
+        screenshotName: `visual-tests/bounded-viewport-${Date.now()}.png`,
+        timeoutMs: 250,
+      }));
+      const fullPage = await captureWithin(captureVisualArtifacts(page, state, {
+        screenshotName: `visual-tests/bounded-full-${Date.now()}.png`,
+        fullPage: true,
+        timeoutMs: 250,
+      }));
+      const crop = await captureWithin(captureVisualArtifacts(page, state, {
+        screenshotName: `visual-tests/bounded-crop-${Date.now()}.png`,
+        fullPage: true,
+        focus: { box: { x: 0, y: 360, width: 80, height: 40 }, padding: 8 },
+        timeoutMs: 250,
+      }));
+      const annotated = await captureWithin(captureVisualArtifacts(page, state, {
+        annotatedName: `visual-tests/bounded-annotated-${Date.now()}.png`,
+        annotate: true,
+        timeoutMs: 250,
+      }));
+
+      expect(Date.now() - started).toBeLessThan(1_000);
+      for (const artifact of [viewport.screenshot, fullPage.screenshot, crop.screenshot, annotated.annotatedScreenshot]) {
+        expect(artifact).toMatchObject({ captureMode: "cdp" });
+        await rm(artifact!.path, { force: true });
+      }
+      expect(session.send).toHaveBeenCalledWith("Page.captureScreenshot", expect.objectContaining({ format: "png", fromSurface: true }));
+    } finally {
+      screenshot.mockRestore();
+      newSession.mockRestore();
+    }
   });
 
   it("draws deterministic non-overlapping labels and cleans the temporary overlay", async () => {
@@ -186,6 +254,9 @@ describe.sequential("visual artifacts", () => {
     );
     const state = await collectPageState(page);
     const originalScreenshot = page.screenshot.bind(page);
+    const newSession = vi
+      .spyOn(page.context(), "newCDPSession")
+      .mockRejectedValue(new Error("Method not found"));
     page.screenshot = (async () => {
       expect(await page.locator("[data-dev-browser-visual-overlay]").count()).toBe(2);
       throw new Error("induced screenshot failure");
@@ -200,6 +271,7 @@ describe.sequential("visual artifacts", () => {
       ).rejects.toThrow("induced screenshot failure");
     } finally {
       page.screenshot = originalScreenshot;
+      newSession.mockRestore();
     }
     await expect(page.locator("[data-dev-browser-visual-overlay]").count()).resolves.toBe(1);
     await expect(page.locator("#site-overlay").textContent()).resolves.toBe("Site content");

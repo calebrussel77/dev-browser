@@ -47,6 +47,7 @@ pub struct InteractiveRequestOptions<'a> {
     pub shot: Option<&'a str>,
     pub annotate: bool,
     pub full_page: bool,
+    pub shot_timeout_ms: u64,
     pub connect: Option<&'a str>,
     pub headless: bool,
     pub ignore_https_errors: bool,
@@ -120,6 +121,7 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if options.full_page {
         request["fullPage"] = Value::Bool(true);
     }
+    request["shotTimeoutMs"] = Value::Number(options.shot_timeout_ms.into());
     if let Some(connect) = options.connect {
         request["connect"] = Value::String(connect.to_string());
     }
@@ -168,6 +170,7 @@ mod tests {
                 shot: Some("state.png"),
                 annotate: true,
                 full_page: true,
+                shot_timeout_ms: 8_000,
                 connect: Some("auto"),
                 headless: false,
                 ignore_https_errors: false,
@@ -186,6 +189,7 @@ mod tests {
         assert_eq!(request["shot"], "state.png");
         assert_eq!(request["annotate"], true);
         assert_eq!(request["fullPage"], true);
+        assert_eq!(request["shotTimeoutMs"], 8_000);
         assert_eq!(request["action"]["kind"], "read");
         assert_eq!(request["session"], "opaque-session");
         assert_eq!(request["trace"], true);
@@ -230,6 +234,7 @@ mod tests {
                 shot: None,
                 annotate: false,
                 full_page: false,
+                shot_timeout_ms: 8_000,
                 connect: None,
                 headless: false,
                 ignore_https_errors: false,

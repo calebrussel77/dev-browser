@@ -43,7 +43,7 @@ pub fn agent_schema() -> Value {
         },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
-            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
+            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
             "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
@@ -108,7 +108,7 @@ pub fn compact_capabilities() -> Value {
     json!({
         "schemaVersion": DISCOVERY_SCHEMA_VERSION,
         "protocol": 2,
-        "perception": ["observe", "delta", "refs", "annotated-screenshot", "frames", "open-shadow-dom"],
+        "perception": ["observe", "delta", "refs", "annotated-screenshot", "frames", "open-shadow-dom", "bounded-capture"],
         "safety": ["state-guards", "target-fingerprints", "leases", "typed-waits", "safe-retry", "confirmation-tokens", "redaction"],
         "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
         "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],

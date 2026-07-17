@@ -364,6 +364,7 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   shot: z.string().min(1).optional(),
   annotate: z.boolean().default(false),
   fullPage: z.boolean().default(false),
+  shotTimeoutMs: z.number().int().min(250).max(120_000).optional(),
   headless: z.boolean().optional(),
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
