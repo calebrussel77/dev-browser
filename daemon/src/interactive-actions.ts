@@ -1,4 +1,7 @@
-import type { Page } from "playwright";
+import { rm } from "node:fs/promises";
+import { Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { Download, Page } from "playwright";
 
 import {
   actionTargetMetadata,
@@ -39,10 +42,13 @@ import { findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
   capturedWaitEvents,
+  capturePopupMetadata,
   runWithWait,
   type WaitEvents,
   type WaitResult,
 } from "./wait-engine.js";
+import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
+import { observeRecoveryCommand } from "./recovery-command.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -121,6 +127,34 @@ export interface InteractiveResult {
   checked?: PrimitiveSummary["checked"];
   hovered?: PrimitiveSummary["hovered"];
   dragged?: PrimitiveSummary["dragged"];
+  navigation?: {
+    operation: "back" | "forward" | "reload";
+    navigated: boolean;
+    beforeUrl: string;
+    afterUrl: string;
+    beforeDocumentId?: string;
+    afterDocumentId?: string;
+    beforeStateId?: string;
+    afterStateId?: string;
+    nextCommand: string;
+  };
+  uploaded?: { ref: string; actualRef: string; filename: string; bytes: number; selected: boolean };
+  download?: {
+    filename: string;
+    bytes: number;
+    path: string;
+    originatingAction: "click" | "press";
+    page: string;
+  };
+  popup?: {
+    targetId: string;
+    url: string;
+    title: string;
+    openerPage: string;
+    focusChanged: boolean;
+    currentPageChanged: boolean;
+    nextCommand: string;
+  };
 }
 
 export interface ActionExecutionHooks {
@@ -133,6 +167,158 @@ const DEFAULT_FIND_LIMIT = 10;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
 const MAX_ERROR_CONTEXT_LENGTH = 500;
 const CLICK_SETTLE_MS = 100;
+const PRESS_SETTLE_MS = 750;
+
+function waitIncludes(wait: WaitSpec | undefined, kind: WaitSpec["conditions"][number]["kind"]): boolean {
+  return Boolean(wait?.conditions.some((condition) => condition.kind === kind));
+}
+
+function compactWaitEvidence(waitResult: WaitResult | undefined, fallback?: unknown) {
+  if (!waitResult) return fallback ?? null;
+  return {
+    mode: waitResult.mode,
+    elapsedMs: waitResult.elapsedMs,
+    passed: waitResult.passed.slice(0, 5),
+    timedOut: waitResult.timedOut.slice(0, 5),
+    observations: waitResult.observations.slice(0, 5),
+    events: boundedWaitEvents(waitResult.events),
+  };
+}
+
+function redactedUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.username) url.username = "[redacted]";
+    if (url.password) url.password = "[redacted]";
+    for (const key of [...url.searchParams.keys()])
+      if (/token|auth|key|password|secret|session|code|credential/i.test(key) ||
+          /(?:token|auth|key|password|secret|session|code|credential)\s*[:=]/i.test(url.searchParams.get(key) ?? ""))
+        url.searchParams.set(key, "[redacted]");
+    if (/(?:token|auth|key|password|secret|session|code|credential)[=:]/i.test(url.hash))
+      url.hash = "#[redacted]";
+    return url.toString().slice(0, 500);
+  } catch {
+    return value.slice(0, 500);
+  }
+}
+
+function pageAwareTrustedInputError(
+  error: unknown,
+  page: Page,
+  pageName: string
+): AgentProtocolError {
+  const typed = attemptError(error, page);
+  if (
+    (typed.code === "PAGE_CLOSED" || typed.code === "FRAME_DETACHED") &&
+    !(typed.nextCommands?.length)
+  ) {
+    return new AgentProtocolError(typed.code, typed.message, typed.recoverable, {
+      details: typed.details,
+      nextCommands: [observeRecoveryCommand(pageName)],
+    });
+  }
+  return typed;
+}
+
+async function saveDownload(
+  download: Download,
+  action: "click" | "press",
+  pageName: string,
+  journal: AttemptJournalEntry[]
+) {
+  const startedAt = new Date().toISOString();
+  let reserved: Awaited<ReturnType<typeof reserveUniqueDownloadFile>> | undefined;
+  try {
+    reserved = await reserveUniqueDownloadFile(download.suggestedFilename());
+    if (await download.failure()) throw new Error("interrupted");
+    const stream = await download.createReadStream();
+    if (!stream) throw new Error("download stream unavailable");
+    const heldHandle = reserved.handle;
+    await pipeline(stream, new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        void (async () => {
+          let offset = 0;
+          while (offset < chunk.byteLength) {
+            const { bytesWritten } = await heldHandle.write(
+              chunk,
+              offset,
+              chunk.byteLength - offset,
+              null
+            );
+            if (bytesWritten <= 0) throw new Error("Download destination stopped accepting bytes");
+            offset += bytesWritten;
+          }
+        })().then(() => callback(), callback);
+      },
+    }));
+    const saved = await reserved.handle.stat();
+    if (!saved.isFile()) throw new Error("not a regular file");
+    journal.push({
+      attempt: journal.length + 1,
+      startedAt,
+      inputMethod: "download",
+      sideEffects: emptyWaitEvents(),
+      change: unchangedAttempt(),
+      retryDecision: "stop",
+      reason: "artifact-saved",
+    });
+    return {
+      filename: reserved.filename,
+      bytes: saved.size,
+      path: reserved.path,
+      originatingAction: action,
+      page: pageName,
+    };
+  } catch {
+    journal.push({
+      attempt: journal.length + 1,
+      startedAt,
+      inputMethod: "download",
+      sideEffects: emptyWaitEvents(),
+      change: unchangedAttempt(),
+      retryDecision: "stop",
+      reason: "download-failed",
+    });
+    throw withAttemptJournal(new AgentProtocolError("DOWNLOAD_FAILED", "Download could not be saved safely", true, {
+      nextCommands: [observeRecoveryCommand(pageName)],
+    }), journal);
+  } finally {
+    await reserved?.handle.close().catch(() => undefined);
+    if (reserved && journal.at(-1)?.reason === "download-failed")
+      await rm(reserved.path, { force: true }).catch(() => undefined);
+  }
+}
+
+async function buildPopupResult(
+  manager: BrowserManager,
+  browser: string,
+  openerPage: string,
+  popup: Page,
+  metadata: WaitEvents["popup"][number] | undefined
+) {
+  try {
+    if (!metadata?.targetId || metadata.warning)
+      throw new Error("Popup metadata deadline expired");
+    manager.registerKnownPageTarget(browser, metadata.targetId, popup);
+    const focused = await Promise.race([
+      popup.evaluate(() => document.hasFocus()).catch(() => false),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+    return {
+      targetId: metadata.targetId,
+      url: metadata.url,
+      title: metadata.title,
+      openerPage,
+      focusChanged: focused,
+      currentPageChanged: manager.isNamedPage(browser, openerPage, popup),
+      nextCommand: observeRecoveryCommand(metadata.targetId),
+    };
+  } catch {
+    throw new AgentProtocolError("POPUP_OPENED", "Popup opened but metadata was unavailable", true, {
+      nextCommands: ["dev-browser pages", observeRecoveryCommand(openerPage)],
+    });
+  }
+}
 
 function summarizeErrorContext(value: string): string {
   if (value.length <= MAX_ERROR_CONTEXT_LENGTH) return value;
@@ -460,6 +646,176 @@ export async function executeInteractiveAction(
       }
       break;
 
+    case "back":
+    case "forward":
+    case "reload": {
+      const startedAt = new Date().toISOString();
+      await validateDecisionRefs([undefined]);
+      const beforeStateId = getLatestStateId(page) ?? undefined;
+      const beforeDocumentId = beforeStateId?.split(":", 1)[0];
+      const beforeUrl = redactedUrl(page.url());
+      let operationResponse: unknown = null;
+      const dispatch = async () => {
+        await hooks.beforeTrustedInput?.();
+        await validateDecisionRefs([undefined]);
+        pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+        if (action.kind === "back")
+          operationResponse = await page.goBack({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, waitUntil: "domcontentloaded" });
+        else if (action.kind === "forward")
+          operationResponse = await page.goForward({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, waitUntil: "domcontentloaded" });
+        else operationResponse = await page.reload({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, waitUntil: "domcontentloaded" });
+        return operationResponse;
+      };
+      let navigated = false;
+      let sideEffects = emptyWaitEvents();
+      try {
+        if (action.wait) {
+          const waited = await runWithWait(
+            page,
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            action.wait,
+            dispatch
+          );
+          result.waitResult = waited.waitResult;
+          sideEffects = boundedWaitEvents(waited.waitResult.events);
+          applyPerception(result, waited.state, protocolVersion);
+        } else {
+          await dispatch();
+          applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
+        }
+      } catch (error) {
+        const typed = pageAwareTrustedInputError(error, page, request.page);
+        const failureJournal: AttemptJournalEntry[] = [{
+          attempt: 1, startedAt, inputMethod: "navigation",
+          sideEffects: boundedWaitEvents(capturedWaitEvents(error) ?? emptyWaitEvents()),
+          change: unchangedAttempt(), retryDecision: "stop", reason: attemptErrorReason(typed),
+        }];
+        throw withAttemptJournal(typed, failureJournal);
+      }
+      const afterUrl = redactedUrl(page.url());
+      const documentChanged = Boolean(
+        beforeDocumentId && result.documentId && beforeDocumentId !== result.documentId
+      );
+      navigated = beforeUrl !== afterUrl || documentChanged || operationResponse !== null;
+      result.navigation = {
+        operation: action.kind,
+        navigated,
+        beforeUrl,
+        afterUrl,
+        beforeDocumentId,
+        afterDocumentId: result.documentId,
+        beforeStateId,
+        afterStateId: result.stateId,
+        nextCommand: observeRecoveryCommand(request.page),
+      };
+      result.attempts = 1;
+      result.attemptJournal = [{
+        attempt: 1,
+        startedAt,
+        inputMethod: "navigation",
+        sideEffects,
+        change: { ...unchangedAttempt(), any: navigated, url: beforeUrl !== afterUrl, snapshot: documentChanged, dom: Boolean(beforeStateId && beforeStateId !== result.stateId) },
+        retryDecision: "stop",
+        reason: navigated ? "action-complete" : "no-history-entry",
+      }];
+      break;
+    }
+
+    case "upload": {
+      const startedAt = new Date().toISOString();
+      const uploadJournal: AttemptJournalEntry[] = [];
+      const failUpload = (error: AgentProtocolError, reason: string): never => {
+        uploadJournal.push({
+          attempt: 1, startedAt, inputMethod: "upload", sideEffects: emptyWaitEvents(),
+          change: unchangedAttempt(), retryDecision: "stop", reason,
+        });
+        throw withAttemptJournal(error, uploadJournal);
+      };
+      if (action.wait?.conditions.some((condition) => condition.kind === "fileChooser"))
+        failUpload(new AgentProtocolError(
+          "UNSUPPORTED_CONTEXT",
+          "Upload uses direct file assignment and cannot wait for a file chooser; no file was selected",
+          true,
+          { nextCommands: [observeRecoveryCommand(request.page)] }
+        ), "unsupported-file-chooser-wait");
+      const controlled = await resolveControlledUploadFile(action.file).catch(() =>
+        failUpload(new AgentProtocolError(
+          "UNSUPPORTED_CONTEXT",
+          "Upload requires a regular file inside the controlled dev-browser temp directory",
+          true,
+          { nextCommands: [observeRecoveryCommand(request.page)] }
+        ), "unsafe-upload-source")
+      );
+      await validateDecisionRefs([action.ref]);
+      let resolved: ResolvedActionTarget | undefined;
+      const dispatch = async () => {
+        await hooks.beforeTrustedInput?.();
+        resolved = await resolveRef(page, action.ref, {
+          pageName: request.page,
+          timeoutMs: request.timeoutMs,
+          scroll: false,
+          hitTest: true,
+          applicability: "upload",
+        });
+        await validateDecisionRefs([action.ref]);
+        pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+        await resolved.locator.setInputFiles({
+          name: controlled.filename,
+          mimeType: "application/octet-stream",
+          buffer: controlled.buffer,
+        }, {
+          timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+        });
+      };
+      try {
+        let sideEffects = emptyWaitEvents();
+        if (action.wait) {
+          const waited = await runWithWait(
+            page,
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            action.wait,
+            dispatch
+          );
+          result.waitResult = waited.waitResult;
+          sideEffects = boundedWaitEvents(waited.waitResult.events);
+          applyPerception(result, waited.state, protocolVersion);
+        } else await dispatch();
+        result.uploaded = {
+          ref: action.ref,
+          actualRef: resolved!.actualRef,
+          filename: controlled.filename,
+          bytes: controlled.bytes,
+          selected: true,
+        };
+        result.targets = [actionTargetMetadata(resolved!, "upload")];
+        result.attempts = 1;
+        uploadJournal.push({
+          attempt: 1,
+          startedAt,
+          inputMethod: "upload",
+          sideEffects,
+          change: { ...unchangedAttempt(), any: true, value: true },
+          retryDecision: "stop",
+          reason: "action-complete",
+        });
+        result.attemptJournal = uploadJournal;
+      } catch (error) {
+        const typed = pageAwareTrustedInputError(error, page, request.page);
+        if (uploadJournal.length === 0)
+          uploadJournal.push({
+            attempt: 1, startedAt, inputMethod: "upload",
+            sideEffects: boundedWaitEvents(capturedWaitEvents(error) ?? emptyWaitEvents()),
+            change: unchangedAttempt(), retryDecision: "stop", reason: attemptErrorReason(typed),
+          });
+        throw withAttemptJournal(typed, uploadJournal);
+      } finally {
+        await resolved?.cleanup();
+      }
+      if (!result.stateId)
+        applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
+      break;
+    }
+
     case "observe": {
       const perception = await perceive(
         page,
@@ -514,6 +870,8 @@ export async function executeInteractiveAction(
     }
 
     case "click": {
+      const openedPopups: Page[] = [];
+      const startedDownloads: Download[] = [];
       if (action.expectText) {
         await requireExpectedText(page, action.expectText);
       }
@@ -604,19 +962,41 @@ export async function executeInteractiveAction(
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         const startedAt = new Date().toISOString();
         let attemptBefore = after;
+        let resolveOuterPopup: (() => void) | undefined;
+        const outerPopupArrived = new Promise<void>((resolve) => { resolveOuterPopup = resolve; });
+        const onOuterPopup = (popup: Page) => {
+          if (!openedPopups.includes(popup)) openedPopups.push(popup);
+          resolveOuterPopup?.();
+        };
+        page.on("popup", onOuterPopup);
+        const finishOuterPopupCapture = () => page.off("popup", onOuterPopup);
         try {
           attemptBefore = await pageSignal(page);
           const monitoringWait: WaitSpec = wait ?? {
             mode: "all",
-            timeoutMs: CLICK_SETTLE_MS,
-            conditions: [{ kind: "networkIdle", specialized: true, idleMs: 25 }],
+            timeoutMs: PRESS_SETTLE_MS,
+            conditions: [{ kind: "networkIdle", specialized: true, idleMs: 700 }],
           };
           const waited = await runWithWait(
             page,
-            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            {
+              collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              onPopup: (popup) => openedPopups.push(popup),
+              onDownload: (download) => startedDownloads.push(download),
+            },
             monitoringWait,
             clickOnce
           );
+          if (wait && !waitIncludes(wait, "popup") && !openedPopups[0])
+            await Promise.race([
+              outerPopupArrived,
+              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+            ]);
+          finishOuterPopupCapture();
+          if (openedPopups[0] && waited.waitResult.events.popup.length === 0)
+            waited.waitResult.events.popup.push(
+              await capturePopupMetadata(openedPopups[0], page.url())
+            );
           after = await pageSignal(page);
           journal.push({
             attempt,
@@ -627,17 +1007,52 @@ export async function executeInteractiveAction(
             retryDecision: "stop",
             reason: wait ? "wait-satisfied" : "action-complete",
           });
+          if (wait && !waitIncludes(wait, "popup") && openedPopups[0]) {
+            const popup = await buildPopupResult(
+              manager, request.browser, request.page, openedPopups[0], waited.waitResult.events.popup[0]
+            );
+            throw withAttemptJournal(new AgentProtocolError(
+              "POPUP_OPENED",
+              "Popup opened while waiting for a different outcome",
+              true,
+              { details: { popup, waitResult: compactWaitEvidence(waited.waitResult) }, nextCommands: [popup.nextCommand] }
+            ), journal);
+          }
           result.waitResult = wait ? waited.waitResult : undefined;
           applyPerception(result, waited.state, protocolVersion);
           break;
         } catch (error) {
+          if (wait && !waitIncludes(wait, "popup") && !openedPopups[0])
+            await Promise.race([
+              outerPopupArrived,
+              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+            ]);
+          finishOuterPopupCapture();
+          const captured = capturedWaitEvents(error) ??
+            (error instanceof AgentProtocolError ? timeoutEvents(error) : emptyWaitEvents());
+          if (openedPopups[0] && captured.popup.length === 0)
+            captured.popup.push(await capturePopupMetadata(openedPopups[0], page.url()));
           const sideEffects = boundedWaitEvents(
-            capturedWaitEvents(error) ??
-              (error instanceof AgentProtocolError ? timeoutEvents(error) : emptyWaitEvents())
+            captured
           );
           const typedError = attemptError(error, page);
           after = await pageSignal(page).catch(() => attemptBefore);
           const change = compareSignals(attemptBefore, after);
+          if (wait && !waitIncludes(wait, "popup") && sideEffects.popup[0] && openedPopups[0]) {
+            journal.push({
+              attempt, startedAt, inputMethod: action.method, sideEffects, change,
+              retryDecision: "stop", reason: "unexpected-popup",
+            });
+            const popup = await buildPopupResult(
+              manager, request.browser, request.page, openedPopups[0], sideEffects.popup[0]
+            );
+            throw withAttemptJournal(new AgentProtocolError(
+              "POPUP_OPENED",
+              "Popup opened while waiting for a different outcome",
+              true,
+              { details: { popup, waitResult: compactWaitEvidence(undefined, typedError.details) }, nextCommands: [popup.nextCommand] }
+            ), journal);
+          }
           if (!wait && typedError.code === "WAIT_TIMEOUT") {
             journal.push({
               attempt,
@@ -697,6 +1112,26 @@ export async function executeInteractiveAction(
       result.waitSatisfied = action.waitForText ? true : null;
       if (!result.stateId)
         applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      if (startedDownloads[0])
+        result.download = await saveDownload(startedDownloads[0], "click", request.page, journal);
+      if (openedPopups[0])
+        try {
+          result.popup = await buildPopupResult(
+            manager,
+            request.browser,
+            request.page,
+            openedPopups[0],
+            journal.flatMap((entry) => entry.sideEffects.popup)[0]
+          );
+        } catch (error) {
+          const typed = attemptError(error, page);
+          journal.push({
+            attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: "popup",
+            sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop",
+            reason: "popup-metadata-unavailable",
+          });
+          throw withAttemptJournal(typed, journal);
+        }
       break;
     }
 
@@ -794,6 +1229,8 @@ export async function executeInteractiveAction(
     case "uncheck":
     case "hover":
     case "drag": {
+      const openedPopups: Page[] = [];
+      const startedDownloads: Download[] = [];
       const primitiveRefs =
         action.kind === "drag"
           ? [action.from, action.to]
@@ -839,17 +1276,47 @@ export async function executeInteractiveAction(
         });
       };
       let summary: PrimitiveSummary;
-      if (action.wait) {
+      const primitiveWait: WaitSpec | undefined = action.wait ??
+        (action.kind === "press"
+          ? { mode: "all", timeoutMs: PRESS_SETTLE_MS, conditions: [{ kind: "networkIdle", specialized: true, idleMs: 700 }] }
+          : undefined);
+      let resolveOuterPrimitivePopup: (() => void) | undefined;
+      const outerPrimitivePopupArrived = new Promise<void>((resolve) => {
+        resolveOuterPrimitivePopup = resolve;
+      });
+      const onOuterPrimitivePopup = (popup: Page) => {
+        if (!openedPopups.includes(popup)) openedPopups.push(popup);
+        resolveOuterPrimitivePopup?.();
+      };
+      if (action.kind === "press") page.on("popup", onOuterPrimitivePopup);
+      const finishOuterPrimitivePopupCapture = () => {
+        if (action.kind === "press") page.off("popup", onOuterPrimitivePopup);
+      };
+      if (primitiveWait) {
         let dispatched: PrimitiveSummary | undefined;
         try {
           const waited = await runWithWait(
             page,
-            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
-            action.wait,
+            {
+              collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              onPopup: (popup) => openedPopups.push(popup),
+              onDownload: (download) => startedDownloads.push(download),
+            },
+            primitiveWait,
             async () => {
               dispatched = await dispatch();
             }
           );
+          if (action.wait && !waitIncludes(action.wait, "popup") && !openedPopups[0])
+            await Promise.race([
+              outerPrimitivePopupArrived,
+              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+            ]);
+          finishOuterPrimitivePopupCapture();
+          if (openedPopups[0] && waited.waitResult.events.popup.length === 0)
+            waited.waitResult.events.popup.push(
+              await capturePopupMetadata(openedPopups[0], page.url())
+            );
           summary = dispatched!;
           const lastAttempt = summary.attemptJournal?.at(-1);
           if (lastAttempt)
@@ -857,20 +1324,82 @@ export async function executeInteractiveAction(
               lastAttempt.sideEffects,
               boundedWaitEvents(waited.waitResult.events)
             );
-          result.waitResult = waited.waitResult;
+          if (action.wait && !waitIncludes(action.wait, "popup") && openedPopups[0]) {
+            const popup = await buildPopupResult(
+              manager, request.browser, request.page, openedPopups[0], waited.waitResult.events.popup[0]
+            );
+            throw new AgentProtocolError(
+              "POPUP_OPENED",
+              "Popup opened while waiting for a different outcome",
+              true,
+              { details: { popup, waitResult: compactWaitEvidence(waited.waitResult) }, nextCommands: [popup.nextCommand] }
+            );
+          }
+          result.waitResult = action.wait ? waited.waitResult : undefined;
           applyPerception(result, waited.state, protocolVersion);
         } catch (error) {
+          if (action.wait && !waitIncludes(action.wait, "popup") && !openedPopups[0])
+            await Promise.race([
+              outerPrimitivePopupArrived,
+              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+            ]);
+          finishOuterPrimitivePopupCapture();
           const journal = dispatched?.attemptJournal;
           const lastAttempt = journal?.at(-1);
           if (!journal || !lastAttempt) throw error;
+          const captured = capturedWaitEvents(error) ?? timeoutEvents(attemptError(error, page));
+          if (openedPopups[0] && captured.popup.length === 0)
+            captured.popup.push(await capturePopupMetadata(openedPopups[0], page.url()));
           lastAttempt.sideEffects = mergeWaitEvents(
             lastAttempt.sideEffects,
-            timeoutEvents(attemptError(error, page))
+            boundedWaitEvents(captured)
           );
+          if (action.wait && !waitIncludes(action.wait, "popup") && openedPopups[0]) {
+            const popup = await buildPopupResult(
+              manager, request.browser, request.page, openedPopups[0], lastAttempt.sideEffects.popup[0]
+            );
+            throw withAttemptJournal(new AgentProtocolError(
+              "POPUP_OPENED",
+              "Popup opened while waiting for a different outcome",
+              true,
+              { details: { popup, waitResult: compactWaitEvidence(undefined, (error as AgentProtocolError).details) }, nextCommands: [popup.nextCommand] }
+            ), journal);
+          }
           throw withAttemptJournal(attemptError(error, page), journal);
         }
-      } else summary = await dispatch();
+      } else {
+        try {
+          summary = await dispatch();
+        } finally {
+          finishOuterPrimitivePopupCapture();
+        }
+      }
       Object.assign(result, summary);
+      if (action.kind === "press" && startedDownloads[0])
+        result.download = await saveDownload(
+          startedDownloads[0],
+          "press",
+          request.page,
+          summary.attemptJournal ?? []
+        );
+      if (action.kind === "press" && openedPopups[0])
+        try {
+          result.popup = await buildPopupResult(
+            manager,
+            request.browser,
+            request.page,
+            openedPopups[0],
+            summary.attemptJournal?.flatMap((entry) => entry.sideEffects.popup)[0]
+          );
+        } catch (error) {
+          const journal = summary.attemptJournal ?? [];
+          journal.push({
+            attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: "popup",
+            sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop",
+            reason: "popup-metadata-unavailable",
+          });
+          throw withAttemptJournal(attemptError(error, page), journal);
+        }
       if (!result.stateId)
         applyPerception(
           result,

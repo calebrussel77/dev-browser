@@ -431,6 +431,51 @@ describe("interactive request protocol", () => {
     }
   });
 
+  it("parses navigation and controlled upload actions", () => {
+    for (const action of [
+      { kind: "back" },
+      { kind: "forward" },
+      { kind: "reload" },
+      { kind: "upload", ref: "R7", file: "C:\\Users\\tester\\.dev-browser\\tmp\\fixture.txt" },
+    ]) {
+      expect(parseRequest(JSON.stringify({
+        id: `transfer-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        page: "TARGET",
+        action,
+      }))).toMatchObject({ success: true });
+    }
+  });
+
+  it("keeps navigation and upload available through explicit protocol v1 compatibility", () => {
+    for (const action of [
+      { kind: "back" },
+      { kind: "forward" },
+      { kind: "reload" },
+      { kind: "upload", ref: "R1", file: "C:\\Users\\tester\\.dev-browser\\tmp\\fixture.txt" },
+    ]) {
+      expect(parseRequest(JSON.stringify({
+        id: `v1-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 1,
+        action,
+      }))).toMatchObject({ success: true, request: { protocolVersion: 1 } });
+    }
+  });
+
+  it("rejects malformed upload actions without reflecting the supplied path", () => {
+    const secretPath = "C:\\private\\TOKEN_SECRET.txt";
+    const parsed = parseRequest(JSON.stringify({
+      id: "bad-upload",
+      type: "interactive",
+      protocolVersion: 2,
+      action: { kind: "upload", ref: "not-a-ref", file: secretPath },
+    }));
+    expect(parsed).toMatchObject({ success: false });
+    expect(JSON.stringify(parsed)).not.toContain(secretPath);
+  });
+
   it("rejects invalid primitive variants and unbounded scrolling", () => {
     const actions = [
       { kind: "press", ref: "R1", key: "javascript:alert(1)" },

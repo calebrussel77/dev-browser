@@ -93,7 +93,7 @@ function mainPage(origin: string, crossOriginFrameUrl: string): string {
         <button data-testid="disabled-control" disabled>Disabled</button>
         <input data-testid="readonly-control" value="Readonly" readonly>
         <div data-testid="editor" contenteditable="true">Editable content</div>
-        <input data-testid="file-input" type="file">
+        <input data-testid="file-input" type="file" aria-label="Upload fixture">
         <output data-testid="file-name">No file</output>
       </section>
       <section data-testid="async-controls">
@@ -108,7 +108,9 @@ function mainPage(origin: string, crossOriginFrameUrl: string): string {
         <output data-testid="spa-location">/</output>
         <a data-testid="document-navigation" href="/document-target">Document target</a>
         <a data-testid="popup-link" href="/popup-target" target="_blank">Open popup</a>
+        <button data-testid="delayed-popup">Open delayed popup</button>
         <a data-testid="download-link" href="/download/agent-fixture.txt" download>Download fixture</a>
+        <a data-testid="interrupted-download-link" href="/download/interrupted.txt" download>Interrupted download</a>
       </section>
       <section data-testid="edge-cases">
         <a href="#nested-edge"><button data-testid="nested-link-button" type="button">Nested link button</button></a>
@@ -171,6 +173,9 @@ document.querySelector("[data-testid=failed-request-trigger]").addEventListener(
 document.querySelector("[data-testid=spa-navigation]").addEventListener("click", () => {
   history.pushState({}, "", "/spa/details");
   document.querySelector("[data-testid=spa-location]").textContent = location.pathname;
+});
+document.querySelector("[data-testid=delayed-popup]").addEventListener("click", () => {
+  setTimeout(() => window.open("/popup-target", "_blank"), 200);
 });
 document.querySelector("[data-testid=file-input]").addEventListener("change", (event) => {
   document.querySelector("[data-testid=file-name]").textContent = event.target.files[0]?.name ?? "No file";
@@ -237,7 +242,13 @@ export async function startAgentReliabilityFixture(): Promise<AgentReliabilityFi
       return;
     }
     if (requestUrl.pathname === "/popup-target") {
-      sendHtml(response, html('<h1 data-testid="popup-target">Popup target</h1>'));
+      const requestedTitle = requestUrl.searchParams.get("title");
+      sendHtml(
+        response,
+        requestedTitle
+          ? `<!doctype html><html><head><title>${requestedTitle.replace(/[<>&]/g, "")}</title></head><body><h1 data-testid="popup-target">Popup target</h1></body></html>`
+          : html('<h1 data-testid="popup-target">Popup target</h1>')
+      );
       return;
     }
     if (requestUrl.pathname === "/frame/same-origin") {
@@ -275,6 +286,16 @@ export async function startAgentReliabilityFixture(): Promise<AgentReliabilityFi
         "content-type": "text/plain; charset=utf-8",
       });
       response.end("deterministic fixture download\n");
+      return;
+    }
+    if (requestUrl.pathname === "/download/interrupted.txt") {
+      response.writeHead(200, {
+        "content-disposition": 'attachment; filename="interrupted.txt"',
+        "content-length": "100000",
+        "content-type": "text/plain; charset=utf-8",
+      });
+      response.write("partial");
+      response.socket?.destroy();
       return;
     }
     response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });

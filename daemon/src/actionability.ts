@@ -11,7 +11,8 @@ export type ActionApplicability =
   | "select"
   | "check"
   | "drag-source"
-  | "drop-target";
+  | "drop-target"
+  | "upload";
 export interface ActionTargetOptions {
   timeoutMs: number;
   scroll: boolean;
@@ -29,7 +30,8 @@ export type ActionTargetMethod =
   | "uncheck"
   | "hover"
   | "drag"
-  | "screenshot";
+  | "screenshot"
+  | "upload";
 export interface ResolvedActionTarget {
   locator: Locator;
   originalRef: string;
@@ -167,6 +169,8 @@ async function validateApplicability(
     (state.tag !== "input" || !["checkbox", "radio"].includes(state.inputType))
   )
     fail(pageName, "TARGET_MISSING", "Check requires a checkbox or radio control");
+  if (applicability === "upload" && (state.tag !== "input" || state.inputType !== "file"))
+    fail(pageName, "TARGET_MISSING", "Upload requires a file input");
   if (
     (applicability === "type" || applicability === "paste") &&
     state.tag !== "textarea" &&

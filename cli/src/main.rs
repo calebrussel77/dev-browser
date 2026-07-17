@@ -388,6 +388,24 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
     },
+    Back {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Forward {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Reload {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
     #[command(
         about = "Observe a compact, actionable page state",
         long_about = "Return the protocol v2 page state with stable inline refs, coordinate metadata, deterministic truncation, and optional deltas."
@@ -599,6 +617,16 @@ enum Command {
         #[command(flatten)]
         wait: WaitArgs,
     },
+    Upload {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_name = "REF", required = true)]
+        ref_id: String,
+        #[arg(long, value_name = "TEMP_FILE", required = true)]
+        file: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
     #[command(
         about = "Read and verify the current confirmation or dialog text",
         long_about = "Return visible dialog text, falling back to visible body text. --expect makes the command fail unless the supplied recipient or confirmation text is present. Use this before an irreversible final click."
@@ -737,6 +765,21 @@ fn run() -> Result<i32, Box<dyn Error>> {
         ),
         Some(Command::Navigate { url, output }) => {
             run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
+        }
+        Some(Command::Back { output, wait }) => {
+            let mut action = json!({ "kind": "back" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Forward { output, wait }) => {
+            let mut action = json!({ "kind": "forward" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Reload { output, wait }) => {
+            let mut action = json!({ "kind": "reload" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
         }
         Some(Command::Observe {
             output,
@@ -987,6 +1030,17 @@ fn run() -> Result<i32, Box<dyn Error>> {
             wait,
         }) => {
             let mut action = json!({ "kind": "drag", "from": from, "to": to });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Upload {
+            output,
+            ref_id,
+            file,
+            wait,
+        }) => {
+            let mut action =
+                build_primitive_action("upload", &[("ref", json!(ref_id)), ("file", json!(file))]);
             apply_wait(&mut action, wait)?;
             run_page_action(&cli, output, action)
         }
@@ -1614,6 +1668,29 @@ mod tests {
                 panic!("failed to parse {command:?}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn parses_navigation_and_upload_commands_with_required_targets() {
+        for args in [
+            vec!["dev-browser", "back", "--page", "TARGET"],
+            vec!["dev-browser", "forward", "--page", "TARGET"],
+            vec!["dev-browser", "reload", "--page", "TARGET"],
+            vec![
+                "dev-browser",
+                "upload",
+                "--ref",
+                "R14",
+                "--file",
+                "C:\\Users\\tester\\.dev-browser\\tmp\\fixture.txt",
+                "--page",
+                "TARGET",
+            ],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+        assert!(Cli::try_parse_from(["dev-browser", "upload", "--ref", "R1"]).is_err());
+        assert!(Cli::try_parse_from(["dev-browser", "upload", "--file", "fixture.txt"]).is_err());
     }
 
     #[test]

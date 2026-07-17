@@ -27,6 +27,8 @@ export function trustedInputError(error: unknown, page: Page): AgentProtocolErro
   if (error instanceof AgentProtocolError) return error;
   if (page.isClosed()) return new AgentProtocolError("PAGE_CLOSED", "Page closed during trusted input", true);
   const message = error instanceof Error ? error.message : String(error);
+  if (/frame.*(?:detached|navigat)|execution context was destroyed/i.test(message))
+    return new AgentProtocolError("FRAME_DETACHED", "Frame detached or navigated during trusted input", true);
   return new AgentProtocolError("RENDERER_UNRESPONSIVE", (message || "Trusted input failed").slice(0, 500), false);
 }
 
@@ -34,6 +36,7 @@ export function attemptErrorReason(error: AgentProtocolError): string {
   if (error.code === "LEASE_CONFLICT") return "lease-conflict";
   if (error.code === "STALE_REF" || error.code === "STALE_STATE") return "state-revalidation-failed";
   if (error.code === "PAGE_CLOSED") return "page-closed";
+  if (error.code === "FRAME_DETACHED") return "frame-detached";
   if (error.code === "TARGET_DISABLED" || error.code === "TARGET_HIDDEN" || error.code === "TARGET_MISSING" || error.code === "TARGET_OBSCURED") return "target-not-actionable";
   return "trusted-input-error";
 }

@@ -173,6 +173,13 @@ const SelectActionSchema = RefPrimitiveSchema.extend({
   if ((value.value === undefined) === (value.label === undefined))
     context.addIssue({ code: z.ZodIssueCode.custom, message: "exactly one of value or label is required" });
 });
+const HistoryNavigationActionSchema = PrimitiveBaseSchema.extend({
+  kind: z.enum(["back", "forward", "reload"]),
+});
+const UploadActionSchema = RefPrimitiveSchema.extend({
+  kind: z.literal("upload"),
+  file: z.string().min(1).max(32_768),
+});
 
 const ExecuteRequestSchema = RequestBaseSchema.extend({
   type: z.literal("execute"),
@@ -264,6 +271,8 @@ const InteractiveActionSchema = z.union([
   RefPrimitiveSchema.extend({ kind: z.literal("uncheck") }),
   RefPrimitiveSchema.extend({ kind: z.literal("hover") }),
   PrimitiveBaseSchema.extend({ kind: z.literal("drag"), from: RefSchema, to: RefSchema }),
+  HistoryNavigationActionSchema,
+  UploadActionSchema,
   StateGuardSchema.merge(WaitableActionSchema).extend({
     kind: z.literal("type"),
     ref: z

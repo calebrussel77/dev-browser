@@ -54,6 +54,8 @@ export interface WaitResult {
 
 export interface WaitStateContext<State> {
   collect(): Promise<State>;
+  onPopup?: (popup: Page) => void;
+  onDownload?: (download: Download) => void;
   popupMetadata?: (
     popup: Page,
     signal: AbortSignal
@@ -76,19 +78,57 @@ function bounded(value: string): string {
     : `${value.slice(0, MAX_OBSERVATION_LENGTH - 3)}...`;
 }
 
-function safeUrl(value: string): string {
+const SENSITIVE_LABEL = /token|auth|key|password|secret|session|code|credential/i;
+
+function sensitiveUrlValues(value: string): string[] {
+  try {
+    const parsed = new URL(value);
+    const values = new Set<string>();
+    const collect = (params: URLSearchParams) => {
+      for (const [key, candidate] of params.entries())
+        if (SENSITIVE_LABEL.test(key) && candidate.length >= 3)
+          values.add(candidate.slice(0, MAX_OBSERVATION_LENGTH));
+    };
+    collect(parsed.searchParams);
+    collect(new URLSearchParams(parsed.hash.replace(/^#/, "")));
+    return [...values].sort((left, right) => right.length - left.length);
+  } catch {
+    return [];
+  }
+}
+
+function replaceSecrets(value: string, secrets: string[]): string {
+  return secrets.reduce(
+    (current, secret) => current.split(secret).join("[redacted]"),
+    value
+  );
+}
+
+function safeUrl(value: string, secrets: string[] = []): string {
   try {
     const parsed = new URL(value);
     if (parsed.username) parsed.username = "[redacted]";
     if (parsed.password) parsed.password = "[redacted]";
     for (const key of parsed.searchParams.keys()) {
-      if (/token|auth|key|password|secret|session/i.test(key))
+      const value = parsed.searchParams.get(key) ?? "";
+      if (
+        SENSITIVE_LABEL.test(key) ||
+        /(?:token|auth|key|password|secret|session|code|credential)\s*[:=]/i.test(value)
+      )
         parsed.searchParams.set(key, "[redacted]");
     }
-    return bounded(parsed.toString());
+    if (/(?:token|auth|key|password|secret|session|code|credential)[=:]/i.test(parsed.hash))
+      parsed.hash = "#[redacted]";
+    return bounded(replaceSecrets(parsed.toString(), secrets));
   } catch {
-    return bounded(value);
+    return bounded(replaceSecrets(value, secrets));
   }
+}
+
+function safeText(value: string, secrets: string[] = []): string {
+  return bounded(replaceSecrets(value, secrets))
+    .replace(/\b(Bearer)\s+[^\s]+/gi, "$1 [redacted]")
+    .replace(/\b(token|auth|key|password|secret|session|code|credential)\s*[:=]\s*[^\s|,;]+/gi, "$1=[redacted]");
 }
 
 function boundedCondition(condition: WaitCondition): WaitCondition {
@@ -160,9 +200,20 @@ async function enrichPopupWithDeadline(
     return;
   }
   if (metadata.targetId) event.targetId = bounded(metadata.targetId);
-  if (metadata.url) event.url = safeUrl(metadata.url);
-  if (metadata.title !== undefined) event.title = bounded(metadata.title);
+  const urlSecrets = metadata.url ? sensitiveUrlValues(metadata.url) : [];
+  if (metadata.url) event.url = safeUrl(metadata.url, urlSecrets);
+  if (metadata.title !== undefined) event.title = safeText(metadata.title, urlSecrets);
   if (!metadata.targetId) event.warning = "Popup target id unavailable";
+}
+
+export async function capturePopupMetadata(popup: Page, opener: string): Promise<WaitEvents["popup"][number]> {
+  const event: WaitEvents["popup"][number] = {
+    url: safeUrl(popup.url()),
+    title: "",
+    opener: safeUrl(opener),
+  };
+  await enrichPopupWithDeadline(popup, event, defaultPopupMetadata);
+  return event;
 }
 
 function matcher(match: "exact" | "contains" | "glob" | "safe-regex", expected: string) {
@@ -542,6 +593,7 @@ export async function runWithWait<State>(
     void promise.finally(() => pendingMetadata.delete(promise));
   };
   const onPopup = (popup: Page) => {
+    stateContext.onPopup?.(popup);
     const event: WaitEvents["popup"][number] = {
       url: safeUrl(popup.url()),
       title: "",
@@ -552,7 +604,8 @@ export async function runWithWait<State>(
       enrichPopupWithDeadline(popup, event, stateContext.popupMetadata ?? defaultPopupMetadata)
     );
   };
-  const onDownload = (download: Download) =>
+  const onDownload = (download: Download) => {
+    stateContext.onDownload?.(download);
     track(
       Promise.resolve().then(() => {
         events.download.push({
@@ -561,6 +614,7 @@ export async function runWithWait<State>(
         });
       })
     );
+  };
   const onFileChooser = (chooser: FileChooser) =>
     events.fileChooser.push({ multiple: chooser.isMultiple() });
   const onDialog = (dialog: Dialog) => {
