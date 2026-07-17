@@ -25,6 +25,8 @@ export const AgentErrorCodeSchema = z.enum([
   "DAEMON_VERSION_MISMATCH",
   "PROTOCOL_VERSION_MISMATCH",
   "CONFIRMATION_INVALID",
+  "ASSERTION_FAILED",
+  "INPUT_VALUE_MISMATCH",
 ]);
 
 export type AgentErrorCode = z.infer<typeof AgentErrorCodeSchema>;
@@ -203,6 +205,8 @@ export function agentErrorExitCode(code: AgentErrorCode): number {
     "TARGET_OBSCURED",
     "TARGET_DISABLED",
     "UNSUPPORTED_CONTEXT",
+    "ASSERTION_FAILED",
+    "INPUT_VALUE_MISMATCH",
   ];
   if (actionabilityCodes.includes(code)) {
     return 3;

@@ -14,8 +14,8 @@ use daemon::{
 };
 use discovery::{agent_schema, compact_capabilities, focused_example};
 use interactive::{
-    apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
-    Coordinates, InteractiveRequestOptions, ObserveActionOptions,
+    apply_state_guard, build_content_scope_action, build_interactive_request, build_observe_action,
+    build_primitive_action, Coordinates, InteractiveRequestOptions, ObserveActionOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -239,6 +239,14 @@ struct PageActionArgs {
 
     #[arg(
         long,
+        value_name = "MILLISECONDS",
+        value_parser = clap::value_parser!(u32).range(250..=120_000),
+        help = "Maximum time for each screenshot capture"
+    )]
+    shot_timeout: Option<u32>,
+
+    #[arg(
+        long,
         help = "Draw deterministic ref labels on the returned screenshot"
     )]
     annotate: bool,
@@ -332,6 +340,19 @@ enum NameMode {
     Contains,
 }
 impl NameMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Contains => "contains",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum AssertMatch {
+    Exact,
+    Contains,
+}
+impl AssertMatch {
     fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -477,6 +498,78 @@ enum Command {
         breadth: u16,
         #[arg(long, value_name = "CURSOR")]
         continuation: Option<String>,
+        #[arg(
+            long = "root",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            help = "Scope observation to the subtree rooted at this ref"
+        )]
+        root_ref: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "root_ref",
+            help = "Scope observation to a landmark substring (find's within grammar), role:<role>, or name:<exact name>"
+        )]
+        within: Option<String>,
+        #[arg(
+            long,
+            help = "Return bounded normalized innerText instead of the element tree"
+        )]
+        text_only: bool,
+    },
+    #[command(
+        about = "Read bounded normalized text from a ref or landmark scope",
+        long_about = "Return bounded, normalized innerText for a single ref or a within scope (a landmark substring using find's within grammar, role:<role>, or name:<exact name>), preserving line breaks and truncation metadata."
+    )]
+    Text {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            required_unless_present = "within"
+        )]
+        ref_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "ref_id",
+            required_unless_present = "ref_id"
+        )]
+        within: Option<String>,
+        #[arg(long, default_value_t = 20_000, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+        max_chars: u32,
+    },
+    #[command(
+        about = "Assert that scoped text is present without mutating the page",
+        long_about = "Read bounded text from a ref or within scope and fail with a typed, recoverable ASSERTION_FAILED error (no trusted input attempt) if the expected text is absent."
+    )]
+    Assert {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            required_unless_present = "within"
+        )]
+        ref_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "ref_id",
+            required_unless_present = "ref_id"
+        )]
+        within: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        #[arg(long, value_enum, default_value = "contains")]
+        r#match: AssertMatch,
     },
     #[command(
         about = "Read the accessibility snapshot and interactive refs for a page",
@@ -520,6 +613,10 @@ enum Command {
         index: Option<u16>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
+        #[arg(long, value_parser = parse_ref_id, requires = "max_steps")]
+        scroll_container: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "scroll_container")]
+        max_steps: Option<u8>,
     },
     #[command(
         about = "Click through trusted Playwright mouse or locator input",
@@ -556,7 +653,7 @@ enum Command {
     },
     #[command(
         about = "Focus and type through trusted Playwright keyboard input",
-        long_about = "Focus an optional interactive ref with a real mouse click and type through page.keyboard. Use --clear to select and replace existing input or contenteditable text."
+        long_about = "Focus an optional interactive ref with a real mouse click and enter text with a React-safe, input-kind-specific strategy (native value setter for input/textarea, insertText for contenteditable, keyboard fallback otherwise); the entered value is reread and a mismatch fails with typed INPUT_VALUE_MISMATCH. Use --clear to replace existing input or contenteditable text; without --clear, input/textarea entry deterministically appends to the end of the existing value regardless of caret position. --delay applies only to the keyboard fallback strategy."
     )]
     Type {
         #[command(flatten)]
@@ -603,7 +700,7 @@ enum Command {
     Scroll {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction"], required_unless_present_any = ["delta_y", "direction", "until"])]
         ref_id: Option<String>,
         #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
         delta_y: Option<f64>,
@@ -613,7 +710,10 @@ enum Command {
         direction: Option<ScrollDirection>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "direction")]
         pages: Option<u8>,
-        #[arg(long, conflicts_with_all = ["ref_id", "delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
+        // `--ref CONTAINER --until ...` is a distinct container-relative scan
+        // mode (see build of the scroll action below), so `until` conflicts
+        // only with delta/direction, not with `ref`.
+        #[arg(long, conflicts_with_all = ["delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
         until: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
         max_steps: Option<u8>,
@@ -705,6 +805,8 @@ enum Command {
         full_page: bool,
         #[arg(long)]
         annotate: bool,
+        #[arg(long, value_name = "MILLISECONDS", value_parser = clap::value_parser!(u32).range(250..=120_000))]
+        shot_timeout: Option<u32>,
         #[arg(long, value_name = "STATE")]
         from_state: Option<String>,
         #[arg(long)]
@@ -833,6 +935,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             None,
             false,
             false,
+            None,
             json!({ "kind": "pages" }),
             None,
         ),
@@ -864,6 +967,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
             depth,
             breadth,
             continuation,
+            root_ref,
+            within,
+            text_only,
         }) => run_page_action(
             &cli,
             output,
@@ -876,8 +982,35 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 depth: *depth,
                 breadth: *breadth,
                 continuation: continuation.as_deref(),
+                root: root_ref.as_deref(),
+                within: within.as_deref(),
+                text_only: *text_only,
             }),
         ),
+        Some(Command::Text {
+            output,
+            ref_id,
+            within,
+            max_chars,
+        }) => {
+            let mut action =
+                build_content_scope_action("text", ref_id.as_deref(), within.as_deref());
+            action["maxChars"] = json!(max_chars);
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Assert {
+            output,
+            ref_id,
+            within,
+            text,
+            r#match,
+        }) => {
+            let mut action =
+                build_content_scope_action("assert", ref_id.as_deref(), within.as_deref());
+            action["text"] = json!(text);
+            action["match"] = json!(r#match.as_str());
+            run_page_action(&cli, output, action)
+        }
         Some(Command::Read {
             output,
             limit,
@@ -900,6 +1033,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
             states,
             index,
             limit,
+            scroll_container,
+            max_steps,
         }) => {
             let action = build_find_action(
                 query.as_deref(),
@@ -916,6 +1051,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     .collect::<Vec<_>>(),
                 *index,
                 *limit,
+                scroll_container.as_deref(),
+                *max_steps,
             );
             run_page_action(&cli, output, action)
         }
@@ -1132,6 +1269,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             padding,
             full_page,
             annotate,
+            shot_timeout,
             from_state,
             strict_state,
             session,
@@ -1152,6 +1290,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 Some(file),
                 *annotate,
                 *full_page,
+                shot_timeout.map(u64::from),
                 action,
                 session.as_deref(),
             )
@@ -1373,6 +1512,7 @@ fn run_page_action(
         output.shot.as_deref(),
         output.annotate,
         output.full_page,
+        output.shot_timeout.map(u64::from),
         action,
         output.session.as_deref(),
     )
@@ -1401,6 +1541,8 @@ fn build_find_action(
     states: &[&str],
     index: Option<u16>,
     limit: u8,
+    scroll_container: Option<&str>,
+    max_steps: Option<u8>,
 ) -> Value {
     let mut action = json!({ "kind": "find", "scope": scope, "states": states, "limit": limit });
     if let Some(value) = query {
@@ -1425,6 +1567,12 @@ fn build_find_action(
     if let Some(value) = index {
         action["index"] = json!(value);
     }
+    if let Some(value) = scroll_container {
+        action["scrollContainer"] = json!(value);
+    }
+    if let Some(value) = max_steps {
+        action["maxSteps"] = json!(value);
+    }
     action
 }
 
@@ -1434,6 +1582,7 @@ fn run_interactive(
     shot: Option<&str>,
     annotate: bool,
     full_page: bool,
+    shot_timeout: Option<u64>,
     action: Value,
     session: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
@@ -1442,6 +1591,7 @@ fn run_interactive(
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("action");
+    let timeout_ms = timeout_ms(cli)?;
     let request = build_interactive_request(
         InteractiveRequestOptions {
             id: request_id(action_name),
@@ -1450,10 +1600,11 @@ fn run_interactive(
             shot,
             annotate,
             full_page,
+            shot_timeout_ms: shot_timeout.unwrap_or_else(|| timeout_ms.min(8_000)),
             connect: cli.connect.as_deref(),
             headless: cli.headless,
             ignore_https_errors: cli.ignore_https_errors,
-            timeout_ms: timeout_ms(cli)?,
+            timeout_ms,
             session,
             trace: cli.trace,
         },
@@ -1546,7 +1697,9 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
             | "TARGET_HIDDEN"
             | "TARGET_OBSCURED"
             | "TARGET_DISABLED"
-            | "UNSUPPORTED_CONTEXT",
+            | "UNSUPPORTED_CONTEXT"
+            | "ASSERTION_FAILED"
+            | "INPUT_VALUE_MISMATCH",
         ) => 3,
         Some("WAIT_TIMEOUT") => 4,
         Some("LEASE_CONFLICT") => 5,
@@ -1718,6 +1871,8 @@ mod tests {
             ("STALE_REF", 3),
             ("AMBIGUOUS_TARGET", 3),
             ("TARGET_DISABLED", 3),
+            ("ASSERTION_FAILED", 3),
+            ("INPUT_VALUE_MISMATCH", 3),
             ("WAIT_TIMEOUT", 4),
             ("LEASE_CONFLICT", 5),
             ("CDP_ATTACH_FAILED", 6),
@@ -1881,6 +2036,8 @@ mod tests {
             "eyJ2IjoxLCJvZmZzZXQiOjN9",
             "--annotate",
             "--full-page",
+            "--shot-timeout",
+            "250",
         ])
         .unwrap();
 
@@ -1897,7 +2054,7 @@ mod tests {
                 continuation: Some(_),
                 ref output,
                 ..
-            }) if track == "checkout" && output.annotate && output.full_page
+            }) if track == "checkout" && output.annotate && output.full_page && output.shot_timeout == Some(250)
         ));
     }
 
@@ -2007,13 +2164,16 @@ mod tests {
             "--padding",
             "32",
             "--full-page",
+            "--shot-timeout",
+            "120000",
         ])
         .unwrap();
         assert!(matches!(
             shot.command,
-            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, .. })
+            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, shot_timeout: Some(120_000), .. })
                 if ref_id.as_deref() == Some("R7")
         ));
+        assert!(Cli::try_parse_from(["dev-browser", "shot", "--shot-timeout", "249"]).is_err());
     }
 
     #[test]
@@ -2294,6 +2454,8 @@ mod tests {
             &["enabled", "collapsed"],
             Some(1),
             5,
+            None,
+            None,
         );
         assert_eq!(
             action,
@@ -2310,6 +2472,136 @@ mod tests {
             "1000"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_and_builds_bounded_scroll_container_find() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--scroll-container",
+            "R2",
+            "--max-steps",
+            "10",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Find { ref scroll_container, max_steps: Some(10), .. }) if scroll_container.as_deref() == Some("R2"))
+        );
+        let action = build_find_action(
+            None,
+            None,
+            Some("Row 47"),
+            "exact",
+            None,
+            None,
+            None,
+            "visible",
+            &[],
+            None,
+            10,
+            Some("R2"),
+            Some(10),
+        );
+        assert_eq!(
+            action,
+            json!({ "kind": "find", "scope": "visible", "states": [], "limit": 10, "name": "Row 47", "nameMode": "exact", "scrollContainer": "R2", "maxSteps": 10 })
+        );
+        // --max-steps requires --scroll-container and vice versa.
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--max-steps",
+            "10"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--scroll-container",
+            "R2"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_container_relative_scroll_ref_and_until_together() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "scroll",
+            "--ref",
+            "R2",
+            "--until",
+            "text:Row 47",
+            "--max-steps",
+            "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Scroll { ref_id: Some(ref r), until: Some(ref u), max_steps: Some(10), .. })
+                if r == "R2" && u == "text:Row 47"
+        ));
+    }
+
+    #[test]
+    fn parses_observe_content_scope_flags_and_rejects_combining_root_and_within() {
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "observe", "--within", "main", "--text-only"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Observe { ref within, text_only: true, .. })
+                if within.as_deref() == Some("main")
+        ));
+
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "observe",
+            "--root",
+            "R42",
+            "--within",
+            "main",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_text_and_assert_commands_and_requires_exactly_one_scope() {
+        let text = Cli::try_parse_from(["dev-browser", "text", "--ref", "R42"]).unwrap();
+        assert!(matches!(
+            text.command,
+            Some(Command::Text { ref ref_id, .. }) if ref_id.as_deref() == Some("R42")
+        ));
+        assert!(Cli::try_parse_from(["dev-browser", "text"]).is_err());
+        assert!(
+            Cli::try_parse_from(["dev-browser", "text", "--ref", "R1", "--within", "main"])
+                .is_err()
+        );
+
+        let assertion = Cli::try_parse_from([
+            "dev-browser",
+            "assert",
+            "--within",
+            "main",
+            "--text",
+            "Jane Doe",
+            "--match",
+            "exact",
+        ])
+        .unwrap();
+        assert!(matches!(
+            assertion.command,
+            Some(Command::Assert { ref within, ref text, .. })
+                if within.as_deref() == Some("main") && text == "Jane Doe"
+        ));
+        assert!(Cli::try_parse_from(["dev-browser", "assert", "--within", "main"]).is_err());
     }
 
     #[test]

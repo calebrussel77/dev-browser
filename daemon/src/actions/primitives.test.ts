@@ -1,11 +1,15 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { BrowserManager } from "../browser-manager.js";
 import { executeInteractiveAction } from "../interactive-actions.js";
 import { pageLeases } from "../sessions.js";
+import {
+  startAgentReliabilityFixture,
+  type AgentReliabilityFixture,
+} from "../test-fixtures/agent-reliability-fixture.js";
 import { executePrimitive } from "./primitives.js";
 
 const browser = "primitive-actions";
@@ -119,6 +123,77 @@ describe.sequential("trusted interaction primitives", () => {
     const until = await run({ kind: "scroll", until: "text:Finished marker", maxSteps: 5 });
     expect(until.scroll).toMatchObject({ matched: true });
     expect(until.scroll!.steps).toBeGreaterThan(0);
+  });
+
+  it("scrolls within a container via a trusted wheel positioned over its own center", async () => {
+    const page = await manager.getPage(browser, "main");
+    await page.setViewportSize({ width: 800, height: 400 });
+    await page.setContent(
+      `<div data-testid="scroll-container" role="region" aria-label="Container" style="height:200px;width:300px;overflow-y:auto;position:relative">
+        <div style="height:1300px;position:relative"><p style="position:absolute;top:1000px">Deep container item</p></div>
+      </div>
+      <div style="height:2000px">Tall page content below the container</div>`
+    );
+    const container = await ref("Container");
+    expect(container.element.actionable).toBe(true);
+    const result = await run({
+      kind: "scroll",
+      ref: container.ref,
+      until: "text:Deep container item",
+      maxSteps: 10,
+      fromState: container.stateId,
+    });
+    expect(result.scroll).toMatchObject({ matched: true });
+    expect(result.scroll!.steps).toBeGreaterThan(0);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    const scrollTop = await page
+      .locator('[data-testid="scroll-container"]')
+      .evaluate((element) => element.scrollTop);
+    expect(scrollTop).toBeGreaterThan(0);
+    // When matched fires, the target must actually intersect the container's
+    // clipped visible area — not merely the (taller) window viewport. A
+    // window-bound check would report matched one step early here because
+    // the 200px container sits inside a 400px window.
+    const intersectsContainer = await page
+      .locator('[data-testid="scroll-container"]')
+      .evaluate((element) => {
+        const containerRect = element.getBoundingClientRect();
+        const visibleTop = containerRect.top + element.clientTop;
+        const visibleBottom = visibleTop + element.clientHeight;
+        const target = element.querySelector("p")!.getBoundingClientRect();
+        return target.bottom > visibleTop && target.top < visibleBottom;
+      });
+    expect(intersectsContainer).toBe(true);
+
+    // Bounded: an unreachable target still stops at maxSteps without matching.
+    await page.evaluate(() => {
+      document.querySelector('[data-testid="scroll-container"]')!.scrollTop = 0;
+    });
+    const bounded = await run({
+      kind: "scroll",
+      ref: container.ref,
+      until: "text:Never appears",
+      maxSteps: 2,
+      fromState: (await ref("Container")).stateId,
+    });
+    expect(bounded.scroll).toMatchObject({ matched: false, steps: 2 });
+
+    // Overscroll guard: with a generous budget the scan stops as soon as the
+    // container reaches its maximum scrollTop instead of wheeling further —
+    // the page underneath must never scroll (no wheel chaining to window).
+    await page.evaluate(() => {
+      document.querySelector('[data-testid="scroll-container"]')!.scrollTop = 0;
+    });
+    const exhausted = await run({
+      kind: "scroll",
+      ref: container.ref,
+      until: "text:Never appears",
+      maxSteps: 20,
+      fromState: (await ref("Container")).stateId,
+    });
+    expect(exhausted.scroll!.matched).toBe(false);
+    expect(exhausted.scroll!.steps).toBeLessThan(20);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
   });
 
   it("selects and checks with final safe state while rejecting disabled and readonly controls", async () => {
@@ -286,5 +361,108 @@ describe.sequential("trusted interaction primitives", () => {
         scroll: expect.objectContaining({ scrolled: expect.any(Boolean) }),
       }),
     ]);
+  });
+});
+
+describe.sequential("find --scroll-container bounded auto-scroll over a virtualized list", () => {
+  let fixture: AgentReliabilityFixture;
+  let manager: BrowserManager;
+  const browser = "virtualized-find";
+
+  beforeAll(async () => {
+    fixture = await startAgentReliabilityFixture();
+    const root = await mkdtemp(path.join(os.tmpdir(), "dev-browser-virtual-find-"));
+    manager = new BrowserManager(path.join(root, "browsers"));
+    await manager.ensureBrowser(browser, { headless: true });
+    const page = await manager.getPage(browser, "main");
+    await page.goto(fixture.mainUrl);
+  }, 120_000);
+  afterAll(async () => {
+    await manager?.stopAll();
+    await fixture?.close();
+  }, 120_000);
+  beforeEach(async () => {
+    const page = await manager.getPage(browser, "main");
+    await page.evaluate(() => {
+      document.querySelector('[data-testid="virtual-list"]')!.scrollTop = 0;
+    });
+  });
+
+  const run = (action: Parameters<typeof executeInteractiveAction>[1]["action"]) =>
+    executeInteractiveAction(manager, {
+      id: `virtual-find-${action.kind}`,
+      type: "interactive",
+      protocolVersion: 2,
+      browser,
+      page: "main",
+      action,
+    });
+
+  async function containerRef() {
+    const state = await run({ kind: "read", limit: 200, depth: 12 });
+    const element = state.elements!.find((item) => item.name === "Conversation list");
+    if (!element) throw new Error("Missing virtual list container");
+    return element.ref;
+  }
+
+  it("finds a row far below the initial render window without auto-clicking it", async () => {
+    const container = await containerRef();
+    const result = await run({
+      kind: "find",
+      name: "Conversation 47",
+      nameMode: "exact",
+      limit: 10,
+      scrollContainer: container,
+      maxSteps: 10,
+    });
+    expect(result.matches?.[0]).toMatchObject({ name: "Conversation 47", confidence: "high" });
+    expect(result.scrollMetrics).toMatchObject({ exhausted: false });
+    expect(result.scrollMetrics!.steps).toBeGreaterThan(0);
+    expect(result.scrollMetrics!.steps).toBeLessThanOrEqual(10);
+    expect(result.scrollMetrics!.positions.length).toBeGreaterThan(0);
+  });
+
+  it("enumerates at least 40 unique rows across scroll steps without duplicates", async () => {
+    const container = await containerRef();
+    const result = await run({
+      kind: "find",
+      role: "listitem",
+      limit: 10,
+      scrollContainer: container,
+      maxSteps: 10,
+    });
+    expect(result.scrollMetrics!.uniqueItems).toBeGreaterThanOrEqual(40);
+    // 60 logical rows total; identity tracking must never overcount recycled nodes.
+    expect(result.scrollMetrics!.uniqueItems).toBeLessThanOrEqual(60);
+  });
+
+  it("detects exhaustion when two consecutive steps add nothing and the scroll position stops changing", async () => {
+    const container = await containerRef();
+    const page = await manager.getPage(browser, "main");
+    // The container resolve may legitimately scroll the window once to bring
+    // the container into view; capture that baseline, then require that the
+    // scan itself never scrolls the page underneath (no wheel chaining once
+    // the container is at its maximum scrollTop).
+    const result = await run({
+      kind: "find",
+      role: "listitem",
+      limit: 10,
+      scrollContainer: container,
+      maxSteps: 12,
+    });
+    expect(result.scrollMetrics!.exhausted).toBe(true);
+    expect(result.scrollMetrics!.uniqueItems).toBe(60);
+    const positions = result.scrollMetrics!.positions;
+    expect(positions.at(-1)).toBe(positions.at(-2));
+    const scrollYAfterFirstScan = await page.evaluate(() => window.scrollY);
+    const again = await run({
+      kind: "find",
+      role: "listitem",
+      limit: 10,
+      scrollContainer: await containerRef(),
+      maxSteps: 12,
+    });
+    expect(again.scrollMetrics!.exhausted).toBe(true);
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollYAfterFirstScan);
   });
 });

@@ -33,13 +33,39 @@ export interface TargetAmbiguity {
   reason: string;
 }
 
-const normalize = (value: string) =>
+export const normalizeMatchText = (value: string): string =>
   value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+
+/**
+ * Find's `within` semantic: a case/diacritic/punctuation-insensitive
+ * substring match against a landmark descriptor. Scoped observation, text,
+ * and assert reuse this exact matching semantic for their scope roots.
+ */
+export function landmarkScopeMatches(landmark: string, within: string): boolean {
+  return normalizeMatchText(landmark).includes(normalizeMatchText(within));
+}
+
+/**
+ * A stable logical identity for an element, used to de-duplicate a virtualized
+ * container's recycled DOM nodes across scroll steps (find's --scroll-container
+ * auto-scan). Prefers the most stable signal available: test-id, then href,
+ * then role+name. Two recycled nodes that render the same logical row must
+ * resolve to the same identity even though their `ref` changes between scans.
+ */
+export function elementIdentity(element: PerceptionElement): string {
+  const testId = element.stableAttributes?.testId;
+  if (testId) return `testid:${testId}`;
+  const href = element.stableAttributes?.href;
+  if (href) return `href:${href}`;
+  return `role:${normalizeMatchText(element.role)}|name:${normalizeMatchText(element.name)}`;
+}
+
+const normalize = normalizeMatchText;
 const refOrder = (ref: string) => Number(ref.replace(/\D/g, "")) || Number.MAX_SAFE_INTEGER;
 
 function hasState(element: PerceptionElement, state: TargetState): boolean {
@@ -77,7 +103,7 @@ export function findTargets(
         score += mode === "exact" ? 100 : 60;
       }
       if (filters.within) {
-        if (!normalize(element.landmark).includes(normalize(filters.within))) return [];
+        if (!landmarkScopeMatches(element.landmark, filters.within)) return [];
         reasons.push(`within=${filters.within}`);
         score += 25;
       }

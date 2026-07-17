@@ -8,7 +8,12 @@ import {
   type QuickJSWASMModule,
 } from "quickjs-emscripten";
 
-export type QuickJSConsoleLevel = "log" | "warn" | "error" | "info";
+export type QuickJSConsoleLevel = "log" | "warn" | "error" | "info" | "json";
+
+/** Hard byte cap on a single `console.json(value)` line. Keeps the DX surface
+ * bounded: the emitted line (and any diagnostic about a rejected value) never
+ * grows unbounded even if the guest script hands it a huge structure. */
+export const MAX_CONSOLE_JSON_BYTES = 64 * 1024;
 
 export type QuickJSHostValue =
   | undefined
@@ -177,10 +182,74 @@ export class QuickJSHost {
         fn.dispose();
       }
 
+      const jsonFn = this.#context.newFunction("json", (valueHandle) => {
+        this.#consoleJson(valueHandle);
+      });
+      this.#context.setProp(consoleObject, "json", jsonFn);
+      jsonFn.dispose();
+
       this.#context.setProp(this.#context.global, "console", consoleObject);
     } finally {
       consoleObject.dispose();
     }
+  }
+
+  /**
+   * `console.json(value)` emits exactly one bounded JSON line via the host's
+   * onConsole callback. Serialization runs as the guest's own JSON.stringify
+   * (rather than the handle-dumping used by log/warn/error/info) so that
+   * cyclic references are rejected by the spec-mandated cycle check instead
+   * of risking an unbounded/host-side recursive dump. The resulting string is
+   * also byte-capped so a single oversized value cannot produce unbounded
+   * diagnostics or output.
+   */
+  #consoleJson(valueHandle: QuickJSHandle): void {
+    const jsonGlobal = this.#context.getProp(this.#context.global, "JSON");
+    const stringifyHandle = this.#context.getProp(jsonGlobal, "stringify");
+    let resultHandle: QuickJSHandle | undefined;
+
+    try {
+      const callResult = this.#context.callFunction(stringifyHandle, jsonGlobal, valueHandle);
+      if (callResult.error) {
+        const error = this.#toError(
+          "console.json could not serialize the value as JSON",
+          callResult.error
+        );
+        callResult.error.dispose();
+        throw this.#boundDiagnosticError(error);
+      }
+
+      resultHandle = callResult.value;
+
+      if (this.#context.typeof(resultHandle) !== "string") {
+        throw new TypeError(
+          "console.json requires a JSON-serializable value (received undefined, a function, or a symbol)"
+        );
+      }
+
+      const json = this.#context.getString(resultHandle);
+      const byteLength = Buffer.byteLength(json, "utf8");
+
+      if (byteLength > MAX_CONSOLE_JSON_BYTES) {
+        throw new RangeError(
+          `console.json value is ${byteLength} bytes, which exceeds the ${MAX_CONSOLE_JSON_BYTES}-byte limit; truncate or restructure the payload`
+        );
+      }
+
+      this.#options.onConsole?.("json", [json]);
+    } finally {
+      resultHandle?.dispose();
+      stringifyHandle.dispose();
+      jsonGlobal.dispose();
+    }
+  }
+
+  #boundDiagnosticError(error: Error): Error {
+    const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 500;
+    if (error.message.length > MAX_DIAGNOSTIC_MESSAGE_LENGTH) {
+      error.message = `${error.message.slice(0, MAX_DIAGNOSTIC_MESSAGE_LENGTH - 3)}...`;
+    }
+    return error;
   }
 
   #installHostCall(): void {

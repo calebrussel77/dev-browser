@@ -23,7 +23,7 @@ import {
   unchangedAttempt,
   withAttemptJournal,
 } from "./action-journal.js";
-import { executePrimitive, type PrimitiveSummary } from "./actions/primitives.js";
+import { executePrimitive, scrollContainerByViewport, type PrimitiveSummary } from "./actions/primitives.js";
 import { BrowserManager } from "./browser-manager.js";
 import {
   collectPageState,
@@ -41,7 +41,13 @@ import {
   type RetryPolicy,
 } from "./retry-policy.js";
 import { pageLeases } from "./sessions.js";
-import { findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
+import {
+  assertScopedText,
+  isValidWithinScope,
+  resolveContentScope,
+  type ScopeMetadata,
+} from "./scoped-content.js";
+import { elementIdentity, findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
   capturedWaitEvents,
@@ -52,6 +58,7 @@ import {
 } from "./wait-engine.js";
 import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
+import { enterExactText, type InputStrategy } from "./react-input.js";
 import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
 import { confirmationTokens, type ConfirmationScope } from "./confirmation-tokens.js";
 import { redactSensitive } from "./redaction.js";
@@ -70,6 +77,13 @@ export interface InteractiveResult {
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
   ambiguity?: TargetAmbiguity;
+  scrollMetrics?: {
+    steps: number;
+    uniqueItems: number;
+    newItems: number;
+    exhausted: boolean;
+    positions: number[];
+  };
   documentId?: string;
   stateId?: string;
   tree?: string;
@@ -77,6 +91,12 @@ export interface InteractiveResult {
   delta?: PagePerception["delta"];
   warnings?: string[];
   truncation?: PagePerception["truncation"];
+  textOnly?: PagePerception["textOnly"];
+  scope?: ScopeMetadata;
+  textContent?: string;
+  textTruncation?: { truncated: boolean; chars: number; maxChars: number };
+  asserted?: boolean;
+  observed?: string;
   clicked?: {
     ref: string | null;
     actualRef?: string | null;
@@ -96,6 +116,8 @@ export interface InteractiveResult {
     ref: string | null;
     characters: number;
   } & Partial<ActionTargetMetadata>;
+  inputStrategy?: InputStrategy;
+  verifiedValue?: string;
   targets?: ActionTargetMetadata[];
   confirmation?: {
     confirmed: boolean;
@@ -449,6 +471,9 @@ function applyPerception(
   result.delta = perception.delta;
   result.warnings = [...(result.warnings ?? []), ...perception.warnings];
   result.truncation = perception.truncation;
+  if (perception.textOnly) result.textOnly = perception.textOnly;
+  if (perception.scope)
+    result.scope = { kind: perception.scope.kind, value: perception.scope.value, frameId: perception.scope.frameId };
   result.coordinateSpace =
     protocolVersion === 2
       ? perception.coordinateSpace
@@ -463,6 +488,41 @@ function applyPerception(
     const visibleElements = perception.elements.filter((element) => element.actionable);
     result.elements = visibleElements;
   }
+}
+
+/**
+ * Populates `coordinateSpace` directly from the viewport/DPR/scroll without
+ * running a full, unscoped `collectPageState` walk. Used by actions (`text`,
+ * `assert`) that already resolved their own scoped content and must not have
+ * the shared finalizer re-collect the entire page tree just to fill in this
+ * field.
+ */
+async function coordinateSpaceOnly(
+  page: Page,
+  protocolVersion: 1 | 2
+): Promise<NonNullable<InteractiveResult["coordinateSpace"]>> {
+  const info = await page.evaluate(() => ({
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    devicePixelRatio,
+    scrollX,
+    scrollY,
+  }));
+  const viewport = page.viewportSize() ?? { width: info.innerWidth, height: info.innerHeight };
+  return protocolVersion === 2
+    ? {
+        unit: "css-px",
+        screenshotScale: "css",
+        viewport,
+        devicePixelRatio: info.devicePixelRatio,
+        scroll: { x: info.scrollX, y: info.scrollY },
+      }
+    : {
+        unit: "css-px",
+        screenshotScale: "css",
+        viewport,
+        devicePixelRatio: info.devicePixelRatio,
+      };
 }
 
 interface PageSignal {
@@ -850,6 +910,12 @@ export async function executeInteractiveAction(
     }
 
     case "observe": {
+      if (action.within && !isValidWithinScope(action.within))
+        throw new AgentProtocolError(
+          "UNSUPPORTED_CONTEXT",
+          `Unsupported within scope "${action.within}"; use a landmark substring (find's within grammar), role:<role>, or name:<exact name>`,
+          false
+        );
       const perception = await perceive(
         page,
         {
@@ -861,10 +927,38 @@ export async function executeInteractiveAction(
           depth: action.depth,
           breadth: action.breadth,
           continuation: action.continuation,
+          scope: action.root || action.within ? { ref: action.root, within: action.within } : undefined,
+          textOnly: action.textOnly,
         },
         false
       );
       applyPerception(result, perception, protocolVersion);
+      break;
+    }
+
+    case "text": {
+      const scoped = await resolveContentScope(page, {
+        ref: action.ref,
+        within: action.within,
+        maxChars: action.maxChars,
+      });
+      result.scope = scoped.scope;
+      result.textContent = scoped.text;
+      result.textTruncation = scoped.truncation;
+      break;
+    }
+
+    case "assert": {
+      const asserted = await assertScopedText(page, {
+        ref: action.ref,
+        within: action.within,
+        text: action.text,
+        match: action.match,
+        nextCommands: [observeRecoveryCommand(request.page)],
+      });
+      result.scope = asserted.scope;
+      result.observed = asserted.observed;
+      result.asserted = asserted.asserted;
       break;
     }
 
@@ -879,26 +973,113 @@ export async function executeInteractiveAction(
     }
 
     case "find": {
-      const perception = await perceive(page, {}, protocolVersion === 1);
-      applyPerception(result, perception, protocolVersion, protocolVersion === 1);
-      const targeted = findTargets(
-        perception.elements.filter((element) => element.actionable),
-        {
-          query: action.query,
-          role: action.role,
-          name: action.name,
-          nameMode: action.nameMode,
-          within: action.within,
-          near: action.near,
-          frame: action.frame,
-          scope: action.scope ?? "visible",
-          states: action.states ?? [],
-          index: action.index,
-        },
-        action.limit ?? DEFAULT_FIND_LIMIT
-      );
-      result.matches = targeted.matches;
-      result.ambiguity = targeted.ambiguity;
+      const findFilters = {
+        query: action.query,
+        role: action.role,
+        name: action.name,
+        nameMode: action.nameMode,
+        within: action.within,
+        near: action.near,
+        frame: action.frame,
+        scope: action.scope ?? "visible",
+        states: action.states ?? [],
+        index: action.index,
+      };
+      const findLimit = action.limit ?? DEFAULT_FIND_LIMIT;
+
+      if (!action.scrollContainer) {
+        const perception = await perceive(page, {}, protocolVersion === 1);
+        applyPerception(result, perception, protocolVersion, protocolVersion === 1);
+        const targeted = findTargets(
+          perception.elements.filter((element) => element.actionable),
+          findFilters,
+          findLimit
+        );
+        result.matches = targeted.matches;
+        result.ambiguity = targeted.ambiguity;
+        break;
+      }
+
+      // Bounded auto-scroll for virtualized/overflow containers: fresh find,
+      // one trusted container wheel step, fresh find, repeated until a
+      // confident match, maxSteps, or exhaustion. Never auto-clicks.
+      const maxSteps = action.maxSteps!;
+      const container = await resolveRef(page, action.scrollContainer, {
+        pageName: request.page,
+        timeoutMs: request.timeoutMs,
+        // Bring the container into the window viewport once so its box is
+        // valid for a trusted mouse move + wheel on every scan step.
+        scroll: true,
+        legacyRefs: protocolVersion === 1,
+      });
+      const seen = new Set<string>();
+      let initialCount: number | undefined;
+      const positions: number[] = [];
+      let steps = 0;
+      let exhausted = false;
+      let consecutiveZeroGrowth = 0;
+      let previousScrollTop: number | undefined;
+      let targeted: ReturnType<typeof findTargets> | undefined;
+      let lastPerception: PagePerception | undefined;
+      try {
+        for (;;) {
+          const perception = await perceive(
+            page,
+            { scope: { ref: action.scrollContainer } },
+            protocolVersion === 1
+          );
+          lastPerception = perception;
+          const actionable = perception.elements.filter((element) => element.actionable);
+          const newIdentities = actionable
+            .map((element) => elementIdentity(element))
+            .filter((identity) => !seen.has(identity));
+          for (const identity of newIdentities) seen.add(identity);
+          if (initialCount === undefined) initialCount = seen.size;
+          targeted = findTargets(actionable, findFilters, findLimit);
+
+          const scrollTop = await container.locator.evaluate((element) => (element as HTMLElement).scrollTop);
+          positions.push(scrollTop);
+
+          const confidentMatch =
+            targeted.matches.length > 0 &&
+            !targeted.ambiguity.ambiguous &&
+            targeted.matches[0]!.confidence === "high";
+          if (confidentMatch) break;
+
+          if (newIdentities.length === 0 && previousScrollTop === scrollTop) {
+            consecutiveZeroGrowth += 1;
+            if (consecutiveZeroGrowth >= 2) {
+              exhausted = true;
+              break;
+            }
+          } else {
+            consecutiveZeroGrowth = newIdentities.length === 0 ? 1 : 0;
+          }
+          previousScrollTop = scrollTop;
+
+          if (steps >= maxSteps) break;
+
+          await hooks.beforeTrustedInput?.();
+          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+          await scrollContainerByViewport(page, container);
+          steps += 1;
+        }
+      } finally {
+        await container.cleanup();
+      }
+      // The loop always completes at least one perception + findTargets pass
+      // before any break (errors propagate before reaching here), so both
+      // `targeted` and `lastPerception` are guaranteed to be assigned.
+      result.matches = targeted!.matches;
+      result.ambiguity = targeted!.ambiguity;
+      result.scrollMetrics = {
+        steps,
+        uniqueItems: seen.size,
+        newItems: seen.size - (initialCount ?? seen.size),
+        exhausted,
+        positions,
+      };
+      applyPerception(result, lastPerception!, protocolVersion, protocolVersion === 1);
       break;
     }
 
@@ -1195,6 +1376,8 @@ export async function executeInteractiveAction(
       const journal: AttemptJournalEntry[] = [];
       let resolvedTypeTarget: ResolvedActionTarget | undefined;
       let typeConfirmationConsumed = false;
+      let inputStrategy: InputStrategy | undefined;
+      let verifiedValue: string | undefined;
       const typeEntry = (
         method: AttemptJournalEntry["inputMethod"],
         reason: string,
@@ -1249,22 +1432,55 @@ export async function executeInteractiveAction(
             element instanceof HTMLInputElement &&
             (element.type === "password" || /password|secret|token|credential/i.test(element.autocomplete || element.name || element.id))
           ).catch(() => false)) sensitiveValues.push(action.text);
-          const { box, cleanup } = resolved;
+          const { box, locator, cleanup } = resolved;
           try {
             await dispatchTypeInput("mouse", () =>
               page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
             );
+            // React-safe, input-kind-specific entry runs while the locator's
+            // action-ref attribute is still attached (cleanup() below strips
+            // it, so this must stay inside the try before cleanup runs).
+            // Every discrete trusted input inside enterExactText goes through
+            // its own dispatchTypeInput so leases/refs are revalidated and
+            // journaled per real input (e.g. the contenteditable clear path
+            // is select-all+Backspace and insertText as separate dispatches).
+            try {
+              const entry = await enterExactText({
+                page,
+                locator,
+                text: action.text,
+                clear: action.clear,
+                delayMs: action.delayMs,
+                dispatch: (input) => dispatchTypeInput("keyboard", input),
+              });
+              inputStrategy = entry.strategy;
+              verifiedValue = entry.verifiedValue;
+            } catch (error) {
+              // Verification rereads happen outside the dispatch wrapper, so
+              // a mismatch is not yet journaled; attach the journal here.
+              // Dispatch-originated errors already carry their journal.
+              if (error instanceof AgentProtocolError && error.code === "INPUT_VALUE_MISMATCH") {
+                recordAttempt(
+                  journal,
+                  typeEntry("keyboard", "input-value-mismatch", new Date().toISOString())
+                );
+                throw withAttemptJournal(error, journal);
+              }
+              throw error;
+            }
           } finally {
             await cleanup();
           }
+        } else {
+          if (action.clear) {
+            await dispatchTypeInput("keyboard", () => page.keyboard.press("ControlOrMeta+A"));
+            await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
+          }
+          await dispatchTypeInput("keyboard", () =>
+            page.keyboard.type(action.text, { delay: action.delayMs })
+          );
+          inputStrategy = "keyboard";
         }
-        if (action.clear) {
-          await dispatchTypeInput("keyboard", () => page.keyboard.press("ControlOrMeta+A"));
-          await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
-        }
-        await dispatchTypeInput("keyboard", () =>
-          page.keyboard.type(action.text, { delay: action.delayMs })
-        );
       };
       if (action.wait) {
         const waited = await runWithWait(
@@ -1284,6 +1500,8 @@ export async function executeInteractiveAction(
         characters: Array.from(action.text).length,
         ...typeTarget,
       };
+      result.inputStrategy = inputStrategy;
+      result.verifiedValue = verifiedValue;
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)
@@ -1335,7 +1553,12 @@ export async function executeInteractiveAction(
             return resolveRef(page, ref, {
               pageName: request.page,
               timeoutMs: request.timeoutMs,
-              scroll: action.kind !== "scroll",
+              // Container-relative "scroll --ref CONTAINER --until" needs the
+              // container itself brought into the window viewport once so its
+              // box is valid for a trusted mouse move + wheel; the plain
+              // scrollIntoView ref mode performs its own explicit scroll and
+              // must not be pre-scrolled here.
+              scroll: action.kind === "scroll" ? Boolean(action.ref && action.until) : true,
               hitTest: action.kind === "hover" || action.kind === "drag",
               applicability,
               legacyRefs: protocolVersion === 1,
@@ -1535,12 +1758,19 @@ export async function executeInteractiveAction(
   result.url = page.url();
   result.title = await page.title();
   if (!result.coordinateSpace) {
-    applyPerception(
-      result,
-      await perceive(page, {}, protocolVersion === 1),
-      protocolVersion,
-      action.kind !== "find" || protocolVersion === 1
-    );
+    if (action.kind === "text" || action.kind === "assert") {
+      // These actions already resolved their own scoped content above; avoid
+      // re-collecting the full unscoped tree/elements just to populate
+      // coordinateSpace (see coordinateSpaceOnly's doc comment).
+      result.coordinateSpace = await coordinateSpaceOnly(page, protocolVersion);
+    } else {
+      applyPerception(
+        result,
+        await perceive(page, {}, protocolVersion === 1),
+        protocolVersion,
+        action.kind !== "find" || protocolVersion === 1
+      );
+    }
   }
 
   if (request.shot || request.annotate || action.kind === "shot") {
@@ -1582,6 +1812,7 @@ export async function executeInteractiveAction(
       annotatedName: request.annotate ? name : undefined,
       annotate: request.annotate,
       fullPage: request.fullPage,
+      timeoutMs: request.shotTimeoutMs ?? Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 8_000),
       annotationElements: matchRefs
         ? visualPerception.elements.filter((element) => matchRefs.has(element.ref))
         : undefined,

@@ -1,7 +1,7 @@
 import type { Frame, Page } from "playwright";
 
 import { AgentProtocolError } from "../agent-protocol.js";
-import { beginFrameGeneration, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
+import { beginFrameGeneration, parseScopedRef, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
 import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "../frame-geometry.js";
 import { recordPageState, type PerceptionDelta } from "../page-state.js";
 import { collectRealm } from "./realm-collector.js";
@@ -17,6 +17,8 @@ export interface CollectPageStateOptions {
   breadth?: number;
   continuation?: string;
   legacyRefs?: boolean;
+  scope?: { ref?: string; within?: string };
+  textOnly?: boolean;
 }
 
 export interface PerceptionElement {
@@ -73,6 +75,8 @@ export interface PagePerception {
   delta: PerceptionDelta | null;
   warnings: string[];
   truncation: { truncated: boolean; omittedNodes: number; continuation: string | null };
+  scope?: { kind: "ref" | "within"; value: string; frameId: string } | null;
+  textOnly?: { text: string; truncation: { truncated: boolean; chars: number; maxChars: number } };
 }
 
 const DEFAULTS = { maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 };
@@ -554,9 +558,59 @@ export async function collectPageState(
   const full = options.full ?? false;
   const maxDepth = bounded(options.depth, DEFAULTS.depth, 50);
   const breadth = bounded(options.breadth, DEFAULTS.breadth, 500);
-  const initialTop = await page.mainFrame().evaluate(collectRealm, { full, legacyRefs: false, maxRecords: MAX_RECORDS_PER_OBSERVATION, maxWork: MAX_WORK_PER_FRAME });
+  const maxChars = bounded(options.maxChars, DEFAULTS.maxChars, 100_000);
+  const scope = options.scope && (options.scope.ref || options.scope.within) ? options.scope : undefined;
+  // Refs arrive in scoped `F#:R#` (or bare `R#`) form; the realm registry is
+  // keyed by the local `R#` part, so parse before the in-page lookup.
+  let realmScope: { ref?: string; within?: string } | undefined = scope;
+  if (scope?.ref) {
+    const parsedRef = parseScopedRef(scope.ref);
+    if (!parsedRef)
+      throw new AgentProtocolError("TARGET_MISSING", `Scope ref "${scope.ref}" is invalid`, true, {
+        details: { ref: scope.ref },
+      });
+    if (parsedRef.frameId !== "F0")
+      throw new AgentProtocolError(
+        "UNSUPPORTED_CONTEXT",
+        `Scoped observation only supports top-document refs; "${scope.ref}" targets frame ${parsedRef.frameId}`,
+        false,
+        { details: { ref: scope.ref, frameId: parsedRef.frameId } }
+      );
+    realmScope = { ref: parsedRef.localRef };
+  }
+  const initialTop = await page.mainFrame().evaluate(collectRealm, {
+    full,
+    legacyRefs: false,
+    maxRecords: MAX_RECORDS_PER_OBSERVATION,
+    maxWork: MAX_WORK_PER_FRAME,
+    scope: realmScope,
+    textOnly: options.textOnly ?? false,
+    textMaxChars: maxChars,
+  });
+  if (scope) {
+    const scopeLabel = scope.within ?? scope.ref ?? "";
+    if (initialTop.scope?.ambiguous)
+      throw new AgentProtocolError(
+        "AMBIGUOUS_TARGET",
+        `Scope "${scopeLabel}" matched ${initialTop.scope.count} elements; refine with role: or name:`,
+        true,
+        { details: { scope } }
+      );
+    if (initialTop.scope && !initialTop.scope.matched)
+      throw new AgentProtocolError(
+        "TARGET_MISSING",
+        `No element matched scope "${scopeLabel}"`,
+        true,
+        { details: { scope } }
+      );
+  }
   beginFrameGeneration(page, initialTop.realmToken);
-  const selectedFrames = await deterministicFrames(page);
+  // A resolved content scope is document-scoped (main/aside/dialog/ref), not
+  // frame-scoped: restrict collection to the top frame so budgets are spent
+  // only inside the selected subtree instead of also walking every iframe.
+  const selectedFrames = scope
+    ? { entries: [{ frame: page.mainFrame(), id: "F0", path: ["F0"] }], truncated: false }
+    : await deterministicFrames(page);
   const frames = selectedFrames.entries;
   const warnings: string[] = ["Closed shadow roots cannot be inspected; observation covers light DOM and open shadow roots only"];
   const registered: RegisteredFrame[] = [];
@@ -607,7 +661,6 @@ export async function collectPageState(
     warnings.push(`Frame candidate scan was truncated at ${MAX_FRAME_CANDIDATE_SCAN} direct children before inspection`);
   registerFrames(page, top.realmToken, registered);
   const maxNodes = bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000);
-  const maxChars = bounded(options.maxChars, DEFAULTS.maxChars, 100_000);
   const offset = decodeCursor(options.continuation);
   if (offset > records.length)
     throw new AgentProtocolError("STALE_STATE", "Invalid or expired continuation cursor", true, { nextCommands: ["dev-browser observe"] });
@@ -625,5 +678,12 @@ export async function collectPageState(
     focusedRef: records.find((record) => record.focused)?.ref || null,
     tree: built.tree, elements: built.elements, delta: history.delta, warnings: warnings.slice(0, 20),
     truncation: { truncated: built.omittedNodes > 0 || collectionTruncated, omittedNodes: built.omittedNodes + (collectionTruncated ? 1 : 0), continuation: built.omittedNodes > 0 ? encodeCursor(offset + built.consumedNodes) : null },
+    scope: scope
+      ? { kind: scope.ref ? "ref" : "within", value: scope.ref ?? scope.within ?? "", frameId: "F0" }
+      : null,
+    textOnly:
+      options.textOnly && top.text
+        ? { text: top.text.text, truncation: { truncated: top.text.truncated, chars: top.text.text.length, maxChars } }
+        : undefined,
   };
 }

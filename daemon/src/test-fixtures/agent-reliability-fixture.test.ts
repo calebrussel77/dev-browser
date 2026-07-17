@@ -163,4 +163,33 @@ describe("agent reliability fixture", { timeout: 20_000 }, () => {
     await page.getByTestId("remove-frame").click();
     await expect.poll(() => page.getByTestId("navigable-frame").count()).toBe(0);
   });
+
+  it("virtualizes 60 conversation rows, rendering only 12 at a time and recycling DOM nodes on scroll", async () => {
+    const container = page.locator('[data-testid="virtual-list"]');
+    await container.evaluate((element) => { element.scrollTop = 0; });
+
+    // Exactly 12 of 60 rows are rendered initially.
+    await expect.poll(() => page.locator('[data-testid^="conversation-row-"]').count()).toBe(12);
+    await expectVisible(page.getByTestId("conversation-row-1"));
+    await expectVisible(page.getByTestId("conversation-row-12"));
+    expect(await page.getByTestId("conversation-row-13").count()).toBe(0);
+    expect(await page.getByTestId("conversation-row-47").count()).toBe(0);
+
+    // DOM nodes are recycled (removed/created), not merely accumulated: after
+    // scrolling well past the initial window, still only 12 rows exist and
+    // row 47 becomes visible while row 1 is gone.
+    await container.evaluate((element) => { element.scrollTop = 1440; });
+    await expect.poll(() => page.getByTestId("conversation-row-47").count()).toBe(1);
+    expect(await page.getByTestId("conversation-row-1").count()).toBe(0);
+    expect(await page.locator('[data-testid^="conversation-row-"]').count()).toBe(12);
+
+    // Scrolling to the end still renders at most 12 rows (fewer would only
+    // happen past the last full page, which 60/12 does not hit) and reaches
+    // the final row.
+    await container.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await expect.poll(() => page.getByTestId("conversation-row-60").count()).toBe(1);
+    expect(await page.locator('[data-testid^="conversation-row-"]').count()).toBeLessThanOrEqual(12);
+
+    await container.evaluate((element) => { element.scrollTop = 0; });
+  });
 });

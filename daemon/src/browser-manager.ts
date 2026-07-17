@@ -70,7 +70,11 @@ type DebuggerWebSocketLookupResult =
       webSocketDebuggerUrl: string;
     }
   | {
-      status: "not-found" | "unavailable";
+      status: "not-found";
+    }
+  | {
+      status: "unavailable";
+      error?: unknown;
     };
 
 type ConnectBrowserOptions = {
@@ -106,6 +110,23 @@ const TARGET_ID_PATTERN = /^[a-f0-9]{16,}$/i;
 function isIgnorableFileError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return code === "ENOENT" || code === "ENOTDIR" || code === "EACCES";
+}
+
+/** Walks an error's `.cause` chain (as Node's `fetch`/undici wraps a raw
+ * socket error in a top-level `TypeError: fetch failed`) to find an errno
+ * code such as `ECONNREFUSED`. */
+function extractErrnoCode(error: unknown, depth = 0): string | undefined {
+  if (!error || typeof error !== "object" || depth > 5) {
+    return undefined;
+  }
+
+  const code = (error as NodeJS.ErrnoException).code;
+  if (typeof code === "string" && code.length > 0) {
+    return code;
+  }
+
+  const cause = (error as { cause?: unknown }).cause;
+  return cause === undefined ? undefined : extractErrnoCode(cause, depth + 1);
 }
 
 function isHttpEndpoint(endpoint: string): boolean {
@@ -975,16 +996,13 @@ export class BrowserManager {
     }
 
     if (isHttpEndpoint(endpoint)) {
-      const discoveredEndpoint = await this.resolveHttpEndpoint(
-        endpoint,
-        MANUAL_CONNECT_TIMEOUT_MS
-      );
+      const resolved = await this.resolveHttpEndpoint(endpoint, MANUAL_CONNECT_TIMEOUT_MS);
 
-      if (!discoveredEndpoint) {
-        throw new Error(this.buildManualConnectError(endpoint));
+      if (!resolved.webSocketDebuggerUrl) {
+        throw new Error(this.buildManualConnectError(endpoint, resolved.lastError));
       }
 
-      return discoveredEndpoint;
+      return resolved.webSocketDebuggerUrl;
     }
 
     return endpoint;
@@ -1003,8 +1021,8 @@ export class BrowserManager {
         },
         signal: AbortSignal.timeout(timeoutMs),
       });
-    } catch {
-      return { status: "unavailable" };
+    } catch (error) {
+      return { status: "unavailable", error };
     }
 
     if (response.status === 404) {
@@ -1076,20 +1094,28 @@ export class BrowserManager {
     ].join("\n");
   }
 
-  private async resolveHttpEndpoint(endpoint: string, timeoutMs: number): Promise<string | null> {
+  private async resolveHttpEndpoint(
+    endpoint: string,
+    timeoutMs: number
+  ): Promise<{ webSocketDebuggerUrl: string | null; lastError?: unknown }> {
     const result = await this.fetchDebuggerWebSocketUrl(endpoint, timeoutMs);
     if (result.status === "ok") {
-      return result.webSocketDebuggerUrl;
+      return { webSocketDebuggerUrl: result.webSocketDebuggerUrl };
     }
 
     if (result.status === "not-found") {
       const port = this.getEndpointPort(endpoint);
       if (port !== null) {
-        return this.readDevToolsActivePort(port);
+        const devToolsEndpoint = await this.readDevToolsActivePort(port);
+        if (devToolsEndpoint) {
+          return { webSocketDebuggerUrl: devToolsEndpoint };
+        }
       }
+
+      return { webSocketDebuggerUrl: null };
     }
 
-    return null;
+    return { webSocketDebuggerUrl: null, lastError: result.error };
   }
 
   private parseDevToolsActivePort(contents: string, expectedPort?: number): string | null {
@@ -1131,7 +1157,20 @@ export class BrowserManager {
     return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
   }
 
-  private buildManualConnectError(endpoint: string): string {
+  private buildManualConnectError(endpoint: string, cause?: unknown): string {
+    const errnoCode = extractErrnoCode(cause);
+
+    if (errnoCode === "ECONNREFUSED") {
+      const port = this.getEndpointPort(endpoint) ?? 9222;
+      const causeMessage = cause instanceof Error ? cause.message : String(cause);
+
+      return [
+        `Could not resolve a CDP WebSocket endpoint from ${endpoint}: connection refused (ECONNREFUSED).`,
+        `No process is listening at ${endpoint}. Launch Chrome with --remote-debugging-port=${port} and retry, or run \`dev-browser --connect\` without a URL to auto-discover a running instance.`,
+        `Original error: ${causeMessage}`,
+      ].join("\n");
+    }
+
     return [
       `Could not resolve a CDP WebSocket endpoint from ${endpoint}.`,
       "If Chrome is using built-in remote debugging, run `dev-browser --connect` without a URL so DevToolsActivePort can be auto-discovered.",

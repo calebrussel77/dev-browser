@@ -174,8 +174,10 @@ const ScrollActionSchema = PrimitiveBaseSchema.extend({
     .optional(),
   maxSteps: z.number().int().min(1).max(50).optional(),
 }).superRefine((value, context) => {
+  // A ref combined with until is a distinct "scroll this container until"
+  // mode (container-relative scrolling); ref alone remains scrollIntoView.
   const modes = [
-    value.ref !== undefined,
+    value.ref !== undefined && value.until === undefined,
     value.deltaX !== undefined || value.deltaY !== undefined,
     value.direction !== undefined,
     value.until !== undefined,
@@ -259,7 +261,21 @@ const ObserveOptionsSchema = z.object({
     .max(80)
     .regex(/^[A-Za-z0-9_-]+$/)
     .optional(),
+  root: ScopedRefSchema.optional(),
+  within: z.string().min(1).max(500).optional(),
+  textOnly: z.boolean().default(false),
 });
+function rejectCombinedRootAndWithin(
+  value: { root?: string; within?: string },
+  context: z.RefinementCtx
+): void {
+  if (value.root && value.within)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["within"],
+      message: "provide either root or within, not both",
+    });
+}
 
 const StructuredFindSchema = z
   .object({
@@ -280,6 +296,11 @@ const StructuredFindSchema = z
       .default([]),
     index: z.number().int().nonnegative().max(999).optional(),
     limit: z.number().int().positive().max(50).default(10),
+    // Bounded auto-scroll: scans inside a virtualized/overflow container by
+    // taking one trusted wheel step per round until a confident match,
+    // maxSteps, or exhaustion (see executeInteractiveAction's "find" case).
+    scrollContainer: ScopedRefSchema.optional(),
+    maxSteps: z.number().int().min(1).max(50).optional(),
   })
   .superRefine((value, context) => {
     if (
@@ -301,7 +322,37 @@ const StructuredFindSchema = z
         path: ["nameMode"],
         message: "nameMode requires name",
       });
+    if ((value.scrollContainer === undefined) !== (value.maxSteps === undefined))
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "scrollContainer and maxSteps are required together",
+      });
   });
+
+const ContentScopeFieldsSchema = z.object({
+  ref: ScopedRefSchema.optional(),
+  within: z.string().min(1).max(500).optional(),
+});
+const requireExactlyOneScope = (
+  value: { ref?: string; within?: string },
+  context: z.RefinementCtx
+): void => {
+  if ((value.ref === undefined) === (value.within === undefined))
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exactly one of ref or within is required",
+    });
+};
+const TextActionSchema = ContentScopeFieldsSchema.extend({
+  kind: z.literal("text"),
+  maxChars: z.number().int().positive().max(200_000).default(20_000),
+}).superRefine(requireExactlyOneScope);
+const AssertMatchSchema = z.enum(["exact", "contains"]);
+const AssertActionSchema = ContentScopeFieldsSchema.extend({
+  kind: z.literal("assert"),
+  text: z.string().min(1).max(2_000),
+  match: AssertMatchSchema.default("contains"),
+}).superRefine(requireExactlyOneScope);
 
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
@@ -309,13 +360,17 @@ const InteractiveActionSchema = z.union([
     kind: z.literal("navigate"),
     url: z.string().url(),
   }),
-  ObserveOptionsSchema.extend({ kind: z.literal("observe") }),
+  ObserveOptionsSchema.extend({ kind: z.literal("observe") }).superRefine(
+    rejectCombinedRootAndWithin
+  ),
   z.object({
     kind: z.literal("read"),
     limit: z.number().int().positive().max(500).default(100),
     depth: z.number().int().positive().max(50).default(12),
   }),
   StructuredFindSchema,
+  TextActionSchema,
+  AssertActionSchema,
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
   RefPrimitiveSchema.extend({ kind: z.literal("focus") }),
@@ -364,6 +419,7 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   shot: z.string().min(1).optional(),
   annotate: z.boolean().default(false),
   fullPage: z.boolean().default(false),
+  shotTimeoutMs: z.number().int().min(250).max(120_000).optional(),
   headless: z.boolean().optional(),
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
@@ -531,13 +587,14 @@ export type TraceRequest = z.infer<typeof TraceRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
-    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states"> & {
+    ? Omit<Action, "strictState" | "padding" | "scope" | "nameMode" | "states" | "textOnly"> & {
         strictState?: boolean;
       } & (Action extends {
           kind: "shot";
         }
           ? { padding?: number }
           : unknown) &
+        (Action extends { kind: "observe" } ? { textOnly?: boolean } : unknown) &
         (Action extends { kind: "find" }
           ? {
               scope?: "visible" | "viewport" | "document";

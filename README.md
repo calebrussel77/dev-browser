@@ -86,6 +86,128 @@ Open each returned screenshot path with your agent's image-viewing capability be
 
 The CLI and daemon negotiate version, bundle, protocol, Playwright, and QuickJS provenance before each request. An idle mismatched daemon is restarted automatically; in-flight work is never killed silently. `doctor --json` distinguishes daemon, browser/CDP, and renderer failures and provides recovery codes. `--trace` stores a redacted, size-bounded journal under `~/.dev-browser/tmp/traces` with timing, before/after state, target/input method, requested screenshots, errors, network/lifecycle events, waits, retries, and recovery hints. Twenty recent traces are retained. External CDP traces are best-effort and report that limitation.
 
+### Bounded screenshots
+
+Every capture — `shot`, `observe --shot`, and action screenshots — has a hard deadline: `--shot-timeout MILLISECONDS` (`250..120000`, default `min(--timeout, 8000)`). Capture prefers a single CDP `Page.captureScreenshot` call so it never waits on perpetual CSS/Web animations, blinking carets, or `document.fonts.ready`; animations and the caret are hidden for the duration of the capture and the injected style is always removed afterward, even on failure. Playwright's own `page.screenshot()` is used only as a one-time fallback when CDP capture is unavailable, and never after a CDP deadline has already elapsed. Result metadata reports `captureMode: "cdp" | "playwright"` so callers can tell which path produced the artifact.
+
+```powershell
+dev-browser --connect shot --page TARGET_ID --shot-timeout 4000 spinner.png
+```
+
+### Scoped observation, subtree text, and assertions
+
+`observe`, `text`, and `assert` share the same scope grammar as `find`'s `--within`: a landmark substring (`main`, `aside`, `dialog`), `role:<role>`, or `name:<exact accessible name>`. Scoping keeps node/character/depth/breadth budgets focused on the relevant subtree instead of being spent on repeated chrome (headers, sidebars, nav) outside it.
+
+```powershell
+# Perceive only the main region instead of spending the node budget on chrome around it
+dev-browser --connect observe --page TARGET_ID --within main --max-nodes 300
+
+# Read bounded, normalized text (line breaks preserved) from a ref or a scope
+dev-browser --connect text --page TARGET_ID --ref R42
+dev-browser --connect text --page TARGET_ID --within main
+
+# Fail fast, with no trusted-input attempt, if expected text is not present
+dev-browser --connect assert --page TARGET_ID --within main --text "Jane Doe" --match contains
+```
+
+`observe --root REF` scopes to the subtree under a specific ref instead of a landmark (mutually exclusive with `--within`); `observe --text-only` returns bounded normalized `innerText` with truncation metadata instead of the full element tree. `assert` returns `{ asserted: true, scope, observed }` on success; on failure it returns the typed, recoverable `ASSERTION_FAILED` error (exit status `3`) and makes no trusted-input attempt.
+
+### Virtualized / infinite-scroll containers
+
+Rows recycled by a virtualized list (only a handful of DOM nodes exist for dozens or hundreds of logical items) are invisible to a single snapshot. `scroll --ref CONTAINER --until ...` and `find --scroll-container CONTAINER --max-steps N` scroll the container itself (positioning the mouse over it and issuing a trusted wheel event, not `window`/`element.scrollIntoView`) and re-collect scoped perception after every step:
+
+```powershell
+# Container-relative scroll until a specific row's text appears
+dev-browser --connect scroll --page TARGET_ID --ref R2 --until "text:Conversation 47" --max-steps 20
+
+# Bounded auto-scroll find: fresh find -> one container scroll -> fresh find, repeated until confident,
+# exhausted, or --max-steps is reached. Never auto-clicks the result.
+dev-browser --connect find --page TARGET_ID --name "Conversation 47" --scroll-container R2 --max-steps 20
+```
+
+The result includes `scrollMetrics: { steps, uniqueItems, newItems, exhausted, positions[] }` so callers can tell a genuinely short list from one that stopped discovering new rows for another reason.
+
+### React-safe exact text entry
+
+`type` inspects the resolved ref's kind and enters text the way the corresponding DOM API expects instead of relying on `HTMLElement.click()` + naive keystrokes alone:
+
+- `input`/`textarea`: invokes the element's native value setter, then dispatches composed, bubbling `beforeinput`, `input`, and `change` events — the same sequence a real keystroke produces, so React (and similar) controlled components observe and commit the change.
+- `contenteditable`: focuses the element and uses `page.keyboard.insertText(text)` (after select-all/backspace when `--clear` is set).
+
+The result reports `{ typed, inputStrategy, verifiedValue }`, where `inputStrategy` is `native-setter`, `insert-text`, or `keyboard`. After entry, dev-browser rereads the field's `value`/`innerText`; if it does not match what was requested (a validating/normalizing field rewrote it, or the controlled component never re-rendered), the action returns the typed, recoverable `INPUT_VALUE_MISMATCH` error (exit status `3`) instead of reporting success. `--clear false` (the default) appends at the existing caret/end of the field rather than replacing its contents.
+
+```powershell
+dev-browser --connect type --page TARGET_ID --ref R13 --text "Exact message, multiple\nlines" --clear
+```
+
+### Error codes
+
+All actionability, assertion, and input-verification failures share the exit-status-`3` family and are typed and recoverable (no partial or ambiguous side effect):
+
+| Code | Meaning |
+| --- | --- |
+| `STALE_REF` / `STALE_STATE` | The ref or `--from-state` no longer matches the live DOM/document. |
+| `AMBIGUOUS_TARGET` | A scope or filter (`--within`, `--role`, `--name`, ...) matched more than one element. |
+| `TARGET_MISSING` / `TARGET_HIDDEN` / `TARGET_OBSCURED` | The resolved element does not exist, is not visible, or is covered by another element. |
+| `TARGET_DISABLED` | The resolved element is currently disabled (e.g. a send button gated on composer state). |
+| `ASSERTION_FAILED` | `assert`'s expected text was not found in the resolved scope. |
+| `INPUT_VALUE_MISMATCH` | The reread value/`innerText` after `type` did not match the requested text. |
+
+`WAIT_TIMEOUT` (exit `4`), `LEASE_CONFLICT` (exit `5`), and `CONFIRMATION_INVALID` (exit `8`) remain their own families. The full set, with process exit statuses, is in `dev-browser schema --json`.
+
+### Safe recipient / send-availability recipes
+
+These two patterns are site-agnostic (no LinkedIn or other site-specific selectors) and cover the most common "did this actually work" failure modes for messaging-style UIs:
+
+**Detect an unavailable send button before attempting to click it:**
+
+```powershell
+# find --state disabled surfaces the button as currently disabled...
+dev-browser --connect find --page TARGET_ID --role button --name "Send" --state disabled
+
+# ...and clicking a disabled target returns the typed TARGET_DISABLED error (exit 3)
+# instead of silently no-opping or reporting a false success.
+dev-browser --connect click --page TARGET_ID --ref R9
+```
+
+**Verify a thread actually opened before composing a message:** a deep link into a single-page app's conversation view may resolve the URL without the panel having hydrated yet. Do a real click, then assert on the resulting URL or header text rather than trusting the click alone:
+
+```powershell
+# 1. A real click (not a direct navigation) opens the thread the same way a user would.
+dev-browser --connect click --page TARGET_ID --ref R14 --wait-url "contains,/thread/"
+
+# 2. Confirm the thread that actually rendered is the expected one before typing into it.
+dev-browser --connect assert --page TARGET_ID --within main --text "Jane Doe" --match contains
+
+# 3. Only now is it safe to type/confirm/send.
+dev-browser --connect type --page TARGET_ID --ref R13 --text "Hello" --clear
+```
+
+### `console.json` for scripted output
+
+Inside a piped script, `console.json(value)` emits `value` as exactly one bounded, parseable JSON line (via the sandbox's own `JSON.stringify`, so it correctly rejects circular references instead of hanging or crashing). Oversized values (over 64 KiB serialized) are also rejected with a short, bounded diagnostic rather than being emitted partially or truncated mid-structure:
+
+```javascript
+console.json({ ok: true, count: 3 }); // stdout: {"ok":true,"count":3}
+```
+
+Prefer `console.json` over `console.log(JSON.stringify(...))` when structured output must be exactly one line for a caller to parse.
+
+### Local, non-destructive reliability fixture (T1-T5)
+
+The daemon test suite includes `daemon/src/test-fixtures/agent-reliability-fixture.ts`, a fully local (`127.0.0.1`) fixture with no external network access, used to reproduce LinkedIn/Sales-Navigator-shaped reliability problems without ever touching a real site or account. It is exercised by the daemon's own Vitest suite (`agent-reliability-fixture.test.ts`, `visual-artifacts.test.ts`, `scoped-content.test.ts`, `actions/primitives.test.ts`, `react-input.test.ts`, and others) and, once started under Node, is drivable with the same CLI commands documented above — for example:
+
+```powershell
+dev-browser --connect shot --page TARGET_ID --shot-timeout 4000 t1-shot.png
+dev-browser --connect observe --page TARGET_ID --within main --max-nodes 300
+dev-browser --connect find --page TARGET_ID --name "Conversation 47" --scroll-container R2 --max-steps 20
+dev-browser --connect click --page TARGET_ID --ref R14 --wait-url "contains,/thread/"
+dev-browser --connect assert --page TARGET_ID --within main --text "Jane Doe" --match contains
+dev-browser --connect type --page TARGET_ID --ref R13 --text "Exact message" --clear
+```
+
+No command in this workflow sends a real message, invitation, or connection request; the fixture never talks to a real site.
+
 ### PowerShell (Windows)
 
 ```powershell

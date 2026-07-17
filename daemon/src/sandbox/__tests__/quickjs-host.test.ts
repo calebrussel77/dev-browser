@@ -144,6 +144,69 @@ describe("QuickJSHost", () => {
     ]);
   });
 
+  it("emits console.json as exactly one parseable JSON line", async () => {
+    const entries: Array<{ level: string; args: unknown[] }> = [];
+    const host = await createHost({
+      onConsole: (level, args) => {
+        entries.push({ level, args });
+      },
+    });
+
+    expect(host.executeScriptSync('console.json({ ok: true })')).toBeUndefined();
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.level).toBe("json");
+    expect(entries[0]!.args).toHaveLength(1);
+
+    const line = entries[0]!.args[0];
+    expect(typeof line).toBe("string");
+    expect(line as string).not.toMatch(/\n/);
+    expect(JSON.parse(line as string)).toEqual({ ok: true });
+  });
+
+  it("rejects cyclic values passed to console.json with a bounded diagnostic", async () => {
+    const entries: Array<{ level: string; args: unknown[] }> = [];
+    const host = await createHost({
+      onConsole: (level, args) => {
+        entries.push({ level, args });
+      },
+    });
+
+    await expect(
+      host.executeScript(`
+        const cyclic = {};
+        cyclic.self = cyclic;
+        console.json(cyclic);
+      `)
+    ).rejects.toThrow(/circular/i);
+
+    expect(entries).toEqual([]);
+  });
+
+  it("rejects oversized values passed to console.json with a bounded diagnostic", async () => {
+    const entries: Array<{ level: string; args: unknown[] }> = [];
+    const host = await createHost({
+      onConsole: (level, args) => {
+        entries.push({ level, args });
+      },
+    });
+
+    let rejection: Error | undefined;
+    try {
+      await host.executeScript(`
+        console.json({ big: "x".repeat(200000) });
+      `);
+    } catch (error) {
+      rejection = error as Error;
+    }
+
+    expect(rejection).toBeDefined();
+    // The diagnostic must stay bounded — it must not echo the full oversized payload.
+    expect(rejection!.message.length).toBeLessThan(1000);
+    expect(rejection!.message).toMatch(/exceeds|too large|limit/i);
+    expect(entries).toEqual([]);
+  });
+
   it("disposes resources cleanly", async () => {
     const host = await createHost();
 
