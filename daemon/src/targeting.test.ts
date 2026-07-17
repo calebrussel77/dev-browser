@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PerceptionElement } from "./perception/collector.js";
-import { findTargets } from "./targeting.js";
+import { elementIdentity, findTargets } from "./targeting.js";
 
 function element(ref: string, overrides: Partial<PerceptionElement>): PerceptionElement {
   return {
@@ -136,5 +136,33 @@ describe("structured targeting", () => {
     );
     expect(result.matches.slice(0, 2).map((match) => match.ref)).toEqual(["R1", "R2"]);
     expect(result.matches[0]!.matchedBecause).toContain("query:Connect button");
+  });
+
+  it("derives a stable logical identity that survives ref reassignment on recycled DOM nodes", () => {
+    // Same logical row recycled onto a different ref: identity must match.
+    const rowAtR1 = element("R1", { stableAttributes: { id: "", testId: "conversation-row-47", href: "" } });
+    const rowRecycledAtR9 = element("R9", { stableAttributes: { id: "", testId: "conversation-row-47", href: "" } });
+    expect(elementIdentity(rowAtR1)).toBe(elementIdentity(rowRecycledAtR9));
+
+    // testId beats href and role/name when present.
+    const withHrefAndTestId = element("R2", {
+      stableAttributes: { id: "", testId: "conversation-row-2", href: "/conversations/2" },
+    });
+    expect(elementIdentity(withHrefAndTestId)).toBe("testid:conversation-row-2");
+
+    // Falls back to href when no testId is present.
+    const withHrefOnly = element("R3", { stableAttributes: { id: "", testId: "", href: "/conversations/3" } });
+    expect(elementIdentity(withHrefOnly)).toBe("href:/conversations/3");
+
+    // Falls back to normalized role+name when neither testId nor href exist.
+    const withRoleName = element("R4", {
+      stableAttributes: { id: "", testId: "", href: "" },
+      role: "listitem",
+      name: "Conversation 4",
+    });
+    expect(elementIdentity(withRoleName)).toBe("role:listitem|name:conversation 4");
+
+    // Two distinct rows never collide.
+    expect(elementIdentity(rowAtR1)).not.toBe(elementIdentity(withHrefAndTestId));
   });
 });

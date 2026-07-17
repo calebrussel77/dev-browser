@@ -23,7 +23,7 @@ import {
   unchangedAttempt,
   withAttemptJournal,
 } from "./action-journal.js";
-import { executePrimitive, type PrimitiveSummary } from "./actions/primitives.js";
+import { executePrimitive, scrollContainerByViewport, type PrimitiveSummary } from "./actions/primitives.js";
 import { BrowserManager } from "./browser-manager.js";
 import {
   collectPageState,
@@ -47,7 +47,7 @@ import {
   resolveContentScope,
   type ScopeMetadata,
 } from "./scoped-content.js";
-import { findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
+import { elementIdentity, findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
   capturedWaitEvents,
@@ -76,6 +76,13 @@ export interface InteractiveResult {
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
   ambiguity?: TargetAmbiguity;
+  scrollMetrics?: {
+    steps: number;
+    uniqueItems: number;
+    newItems: number;
+    exhausted: boolean;
+    positions: number[];
+  };
   documentId?: string;
   stateId?: string;
   tree?: string;
@@ -928,26 +935,111 @@ export async function executeInteractiveAction(
     }
 
     case "find": {
-      const perception = await perceive(page, {}, protocolVersion === 1);
-      applyPerception(result, perception, protocolVersion, protocolVersion === 1);
-      const targeted = findTargets(
-        perception.elements.filter((element) => element.actionable),
-        {
-          query: action.query,
-          role: action.role,
-          name: action.name,
-          nameMode: action.nameMode,
-          within: action.within,
-          near: action.near,
-          frame: action.frame,
-          scope: action.scope ?? "visible",
-          states: action.states ?? [],
-          index: action.index,
-        },
-        action.limit ?? DEFAULT_FIND_LIMIT
-      );
-      result.matches = targeted.matches;
-      result.ambiguity = targeted.ambiguity;
+      const findFilters = {
+        query: action.query,
+        role: action.role,
+        name: action.name,
+        nameMode: action.nameMode,
+        within: action.within,
+        near: action.near,
+        frame: action.frame,
+        scope: action.scope ?? "visible",
+        states: action.states ?? [],
+        index: action.index,
+      };
+      const findLimit = action.limit ?? DEFAULT_FIND_LIMIT;
+
+      if (!action.scrollContainer) {
+        const perception = await perceive(page, {}, protocolVersion === 1);
+        applyPerception(result, perception, protocolVersion, protocolVersion === 1);
+        const targeted = findTargets(
+          perception.elements.filter((element) => element.actionable),
+          findFilters,
+          findLimit
+        );
+        result.matches = targeted.matches;
+        result.ambiguity = targeted.ambiguity;
+        break;
+      }
+
+      // Bounded auto-scroll for virtualized/overflow containers: fresh find,
+      // one trusted container wheel step, fresh find, repeated until a
+      // confident match, maxSteps, or exhaustion. Never auto-clicks.
+      const maxSteps = action.maxSteps!;
+      const container = await resolveRef(page, action.scrollContainer, {
+        pageName: request.page,
+        timeoutMs: request.timeoutMs,
+        // Bring the container into the window viewport once so its box is
+        // valid for a trusted mouse move + wheel on every scan step.
+        scroll: true,
+        legacyRefs: protocolVersion === 1,
+      });
+      const seen = new Set<string>();
+      let initialCount: number | undefined;
+      const positions: number[] = [];
+      let steps = 0;
+      let exhausted = false;
+      let consecutiveZeroGrowth = 0;
+      let previousScrollTop: number | undefined;
+      let targeted: ReturnType<typeof findTargets> | undefined;
+      let lastPerception: PagePerception | undefined;
+      try {
+        for (;;) {
+          const perception = await perceive(
+            page,
+            { scope: { ref: action.scrollContainer } },
+            protocolVersion === 1
+          );
+          lastPerception = perception;
+          const actionable = perception.elements.filter((element) => element.actionable);
+          const newIdentities = actionable
+            .map((element) => elementIdentity(element))
+            .filter((identity) => !seen.has(identity));
+          for (const identity of newIdentities) seen.add(identity);
+          if (initialCount === undefined) initialCount = seen.size;
+          targeted = findTargets(actionable, findFilters, findLimit);
+
+          const scrollTop = await container.locator.evaluate((element) => (element as HTMLElement).scrollTop);
+          positions.push(scrollTop);
+
+          const confidentMatch =
+            targeted.matches.length > 0 &&
+            !targeted.ambiguity.ambiguous &&
+            targeted.matches[0]!.confidence === "high";
+          if (confidentMatch) break;
+
+          if (newIdentities.length === 0 && previousScrollTop === scrollTop) {
+            consecutiveZeroGrowth += 1;
+            if (consecutiveZeroGrowth >= 2) {
+              exhausted = true;
+              break;
+            }
+          } else {
+            consecutiveZeroGrowth = newIdentities.length === 0 ? 1 : 0;
+          }
+          previousScrollTop = scrollTop;
+
+          if (steps >= maxSteps) break;
+
+          await hooks.beforeTrustedInput?.();
+          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+          await scrollContainerByViewport(page, container);
+          steps += 1;
+        }
+      } finally {
+        await container.cleanup();
+      }
+      result.matches = targeted?.matches ?? [];
+      result.ambiguity =
+        targeted?.ambiguity ?? { ambiguous: false, topScore: null, scoreGap: null, reason: "no-match" };
+      result.scrollMetrics = {
+        steps,
+        uniqueItems: seen.size,
+        newItems: seen.size - (initialCount ?? seen.size),
+        exhausted,
+        positions,
+      };
+      if (lastPerception) applyPerception(result, lastPerception, protocolVersion, protocolVersion === 1);
       break;
     }
 
@@ -1384,7 +1476,12 @@ export async function executeInteractiveAction(
             return resolveRef(page, ref, {
               pageName: request.page,
               timeoutMs: request.timeoutMs,
-              scroll: action.kind !== "scroll",
+              // Container-relative "scroll --ref CONTAINER --until" needs the
+              // container itself brought into the window viewport once so its
+              // box is valid for a trusted mouse move + wheel; the plain
+              // scrollIntoView ref mode performs its own explicit scroll and
+              // must not be pre-scrolled here.
+              scroll: action.kind === "scroll" ? Boolean(action.ref && action.until) : true,
               hitTest: action.kind === "hover" || action.kind === "drag",
               applicability,
               legacyRefs: protocolVersion === 1,

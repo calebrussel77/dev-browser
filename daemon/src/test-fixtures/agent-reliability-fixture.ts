@@ -6,6 +6,16 @@ import path from "node:path";
 const LOOPBACK_HOST = "127.0.0.1";
 const DOWNLOAD_FILENAME = "agent-fixture.txt";
 
+// Deterministic virtualized-list fixture: 60 logical conversation rows, only
+// VIRTUAL_LIST_VISIBLE rendered at a time (DOM nodes recycled on scroll),
+// each with a stable per-row identity (a unique data-testid) so a scanning
+// agent can recognize the same logical row across repeated scroll steps
+// even though its underlying DOM node is reused for a different index.
+const VIRTUAL_LIST_ROW_COUNT = 60;
+const VIRTUAL_LIST_VISIBLE = 12;
+const VIRTUAL_LIST_ROW_HEIGHT = 40;
+const VIRTUAL_LIST_HEIGHT = VIRTUAL_LIST_VISIBLE * VIRTUAL_LIST_ROW_HEIGHT;
+
 export interface AgentReliabilityFixture {
   mainUrl: string;
   crossOriginFrameUrl: string;
@@ -159,6 +169,14 @@ function mainPage(origin: string, crossOriginFrameUrl: string): string {
         <div data-testid="loaded-items"></div>
         <button data-testid="load-more">Load more</button>
       </section>
+      <section data-testid="virtual-list-region">
+        <p>Conversations</p>
+        <div data-testid="virtual-list" role="region" aria-label="Conversation list" style="height:${VIRTUAL_LIST_HEIGHT}px;overflow-y:auto;position:relative;border:1px solid #ccc">
+          <div data-testid="virtual-list-spacer" style="height:${VIRTUAL_LIST_ROW_COUNT * VIRTUAL_LIST_ROW_HEIGHT}px;position:relative">
+            <div data-testid="virtual-list-viewport" style="position:absolute;top:0;left:0;right:0"></div>
+          </div>
+        </div>
+      </section>
       <div data-testid="tall-spacer"></div>
       <p data-testid="scroll-target">End of tall content</p>
     </main>
@@ -224,7 +242,40 @@ openRoot.innerHTML = '<button data-testid="shadow-action">Shadow action</button>
 openRoot.querySelector('[data-testid=shadow-action]').addEventListener('click', () => openRoot.querySelector('[data-testid=shadow-result]').textContent = 'clicked');
 openRoot.querySelector('#nested-shadow-host').attachShadow({ mode: "open" }).innerHTML = '<input aria-label="Nested shadow input">';
 const closedHost = document.querySelector("[data-testid=closed-shadow-host]");
-closedHost.attachShadow({ mode: "closed" }).innerHTML = '<button>Closed action</button>';`,
+closedHost.attachShadow({ mode: "closed" }).innerHTML = '<button>Closed action</button>';
+(function virtualizedList() {
+  const ROW_COUNT = ${VIRTUAL_LIST_ROW_COUNT};
+  const VISIBLE = ${VIRTUAL_LIST_VISIBLE};
+  const ROW_HEIGHT = ${VIRTUAL_LIST_ROW_HEIGHT};
+  const container = document.querySelector('[data-testid=virtual-list]');
+  const viewport = document.querySelector('[data-testid=virtual-list-viewport]');
+  const rendered = new Map();
+  function render() {
+    const start = Math.max(0, Math.min(ROW_COUNT - VISIBLE, Math.floor(container.scrollTop / ROW_HEIGHT)));
+    const end = Math.min(ROW_COUNT, start + VISIBLE);
+    for (const [index, node] of rendered) {
+      if (index < start || index >= end) { node.remove(); rendered.delete(index); }
+    }
+    for (let index = start; index < end; index += 1) {
+      if (rendered.has(index)) continue;
+      const rowNumber = index + 1;
+      const row = document.createElement('div');
+      row.setAttribute('role', 'listitem');
+      row.setAttribute('data-testid', 'conversation-row-' + rowNumber);
+      row.setAttribute('aria-label', 'Conversation ' + rowNumber);
+      row.style.position = 'absolute';
+      row.style.left = '0';
+      row.style.right = '0';
+      row.style.top = (index * ROW_HEIGHT) + 'px';
+      row.style.height = ROW_HEIGHT + 'px';
+      row.textContent = 'Conversation ' + rowNumber;
+      viewport.appendChild(row);
+      rendered.set(index, row);
+    }
+  }
+  container.addEventListener('scroll', render);
+  render();
+})();`,
     `body { font-family: sans-serif; margin: 0; }
 main, aside { padding: 16px; }
 section { margin: 24px 0; }

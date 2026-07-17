@@ -36,25 +36,70 @@ export interface PrimitiveSummary {
 const offsets = (page: Page) => page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
 const settleScroll = (page: Page) => page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 
-async function scrollUntil(page: Page, query: string, maxSteps: number, wheel: (deltaY: number) => Promise<void>) {
+/**
+ * Positions the mouse over a container's current center and dispatches a
+ * real (trusted) wheel event sized to one client height of that container.
+ * This is the single trusted-input path for container-relative scrolling:
+ * both the `scroll --ref CONTAINER --until` primitive and find's bounded
+ * `--scroll-container` auto-scan funnel through this function so there is
+ * exactly one place that ever moves the mouse and performs the wheel act.
+ * Locator evaluation is used only to *read* clientHeight for sizing the
+ * wheel delta, never to perform the scroll itself.
+ */
+export async function scrollContainerByViewport(
+  page: Page,
+  container: ResolvedActionTarget
+): Promise<{ deltaY: number }> {
+  const clientHeight = await container.locator.evaluate((element) => (element as HTMLElement).clientHeight);
+  const deltaY = Math.max(1, clientHeight);
+  await page.mouse.move(container.box.x + container.box.width / 2, container.box.y + container.box.height / 2);
+  await page.mouse.wheel(0, deltaY);
+  await settleScroll(page);
+  return { deltaY };
+}
+
+async function scrollUntil(
+  page: Page,
+  query: string,
+  maxSteps: number,
+  wheel: (deltaY: number) => Promise<void>,
+  container?: ResolvedActionTarget
+) {
   const [kind, expected] = query.split(":", 2) as ["text" | "role", string];
   for (let step = 0; step <= maxSteps; step += 1) {
-    const matched = await page.evaluate(({ kind, expected }) => {
-      const normalized = expected.trim().toLowerCase();
-      const intersectsViewport = (element: Element) => {
-        const rect = element.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
-      };
-      if (kind === "text") return Array.from(document.body.querySelectorAll("*")).some((element) => {
-        if (!intersectsViewport(element)) return false;
-        const ownText = Array.from(element.childNodes).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || "").join(" ").trim().toLowerCase();
-        return ownText === normalized;
-      });
-      return Array.from(document.querySelectorAll("[role]")).some((element) => element.getAttribute("role")?.trim().toLowerCase() === normalized && intersectsViewport(element));
-    }, { kind, expected });
+    const matched = container
+      ? await container.locator.evaluate((element, { kind, expected }) => {
+          const normalized = expected.trim().toLowerCase();
+          const intersectsViewport = (candidate: Element) => {
+            const rect = candidate.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+          };
+          if (kind === "text") return Array.from(element.querySelectorAll("*")).some((candidate) => {
+            if (!intersectsViewport(candidate)) return false;
+            const ownText = Array.from(candidate.childNodes).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || "").join(" ").trim().toLowerCase();
+            return ownText === normalized;
+          });
+          return Array.from(element.querySelectorAll("[role]")).some((candidate) => candidate.getAttribute("role")?.trim().toLowerCase() === normalized && intersectsViewport(candidate));
+        }, { kind, expected })
+      : await page.evaluate(({ kind, expected }) => {
+          const normalized = expected.trim().toLowerCase();
+          const intersectsViewport = (element: Element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+          };
+          if (kind === "text") return Array.from(document.body.querySelectorAll("*")).some((element) => {
+            if (!intersectsViewport(element)) return false;
+            const ownText = Array.from(element.childNodes).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || "").join(" ").trim().toLowerCase();
+            return ownText === normalized;
+          });
+          return Array.from(document.querySelectorAll("[role]")).some((element) => element.getAttribute("role")?.trim().toLowerCase() === normalized && intersectsViewport(element));
+        }, { kind, expected });
     if (matched) return { steps: step, matched: true };
     if (step < maxSteps) {
-      await wheel(await page.evaluate(() => Math.max(1, innerHeight)));
+      const deltaY = container
+        ? await container.locator.evaluate((element) => Math.max(1, (element as HTMLElement).clientHeight))
+        : await page.evaluate(() => Math.max(1, innerHeight));
+      await wheel(deltaY);
       await settleScroll(page);
     }
   }
@@ -100,7 +145,28 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     let steps = 1;
     let matched: boolean | null = null;
     let targetMetadata: ActionTargetMetadata[] | undefined;
-    if (action.ref) {
+    if (action.ref && action.until) {
+      // Container-relative scrolling: `ref` names the scrollable container,
+      // not a scroll-into-view target. Scan for `until` one client height at
+      // a time, positioning the mouse over the container's own center before
+      // every trusted wheel step (never window.scrollTo/element.scrollTop).
+      const target = await resolve(action.ref);
+      journalContext = attemptFrameContext(action.ref, target);
+      try {
+        ({ steps, matched } = await scrollUntil(
+          page,
+          action.until,
+          action.maxSteps!,
+          (deltaY) =>
+            dispatch("wheel", [action.ref!], async () => {
+              await page.mouse.move(target.box.x + target.box.width / 2, target.box.y + target.box.height / 2);
+              await page.mouse.wheel(0, deltaY);
+            }, [target]),
+          target
+        ));
+        targetMetadata = [actionTargetMetadata(target, "mouse")];
+      } finally { await target.cleanup(); }
+    } else if (action.ref) {
       const target = await resolve(action.ref);
       journalContext = attemptFrameContext(action.ref, target);
       try {

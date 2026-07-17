@@ -610,6 +610,10 @@ enum Command {
         index: Option<u16>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
+        #[arg(long, value_parser = parse_ref_id, requires = "max_steps")]
+        scroll_container: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "scroll_container")]
+        max_steps: Option<u8>,
     },
     #[command(
         about = "Click through trusted Playwright mouse or locator input",
@@ -693,7 +697,7 @@ enum Command {
     Scroll {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction"], required_unless_present_any = ["delta_y", "direction", "until"])]
         ref_id: Option<String>,
         #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
         delta_y: Option<f64>,
@@ -703,7 +707,10 @@ enum Command {
         direction: Option<ScrollDirection>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "direction")]
         pages: Option<u8>,
-        #[arg(long, conflicts_with_all = ["ref_id", "delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
+        // `--ref CONTAINER --until ...` is a distinct container-relative scan
+        // mode (see build of the scroll action below), so `until` conflicts
+        // only with delta/direction, not with `ref`.
+        #[arg(long, conflicts_with_all = ["delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
         until: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
         max_steps: Option<u8>,
@@ -1023,6 +1030,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
             states,
             index,
             limit,
+            scroll_container,
+            max_steps,
         }) => {
             let action = build_find_action(
                 query.as_deref(),
@@ -1039,6 +1048,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     .collect::<Vec<_>>(),
                 *index,
                 *limit,
+                scroll_container.as_deref(),
+                *max_steps,
             );
             run_page_action(&cli, output, action)
         }
@@ -1527,6 +1538,8 @@ fn build_find_action(
     states: &[&str],
     index: Option<u16>,
     limit: u8,
+    scroll_container: Option<&str>,
+    max_steps: Option<u8>,
 ) -> Value {
     let mut action = json!({ "kind": "find", "scope": scope, "states": states, "limit": limit });
     if let Some(value) = query {
@@ -1550,6 +1563,12 @@ fn build_find_action(
     }
     if let Some(value) = index {
         action["index"] = json!(value);
+    }
+    if let Some(value) = scroll_container {
+        action["scrollContainer"] = json!(value);
+    }
+    if let Some(value) = max_steps {
+        action["maxSteps"] = json!(value);
     }
     action
 }
@@ -2430,6 +2449,8 @@ mod tests {
             &["enabled", "collapsed"],
             Some(1),
             5,
+            None,
+            None,
         );
         assert_eq!(
             action,
@@ -2446,6 +2467,82 @@ mod tests {
             "1000"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_and_builds_bounded_scroll_container_find() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--scroll-container",
+            "R2",
+            "--max-steps",
+            "10",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Find { ref scroll_container, max_steps: Some(10), .. }) if scroll_container.as_deref() == Some("R2"))
+        );
+        let action = build_find_action(
+            None,
+            None,
+            Some("Row 47"),
+            "exact",
+            None,
+            None,
+            None,
+            "visible",
+            &[],
+            None,
+            10,
+            Some("R2"),
+            Some(10),
+        );
+        assert_eq!(
+            action,
+            json!({ "kind": "find", "scope": "visible", "states": [], "limit": 10, "name": "Row 47", "nameMode": "exact", "scrollContainer": "R2", "maxSteps": 10 })
+        );
+        // --max-steps requires --scroll-container and vice versa.
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--max-steps",
+            "10"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Row 47",
+            "--scroll-container",
+            "R2"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_container_relative_scroll_ref_and_until_together() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "scroll",
+            "--ref",
+            "R2",
+            "--until",
+            "text:Row 47",
+            "--max-steps",
+            "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Scroll { ref_id: Some(ref r), until: Some(ref u), max_steps: Some(10), .. })
+                if r == "R2" && u == "text:Row 47"
+        ));
     }
 
     #[test]

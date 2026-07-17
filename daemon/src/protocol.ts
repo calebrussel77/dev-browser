@@ -174,8 +174,10 @@ const ScrollActionSchema = PrimitiveBaseSchema.extend({
     .optional(),
   maxSteps: z.number().int().min(1).max(50).optional(),
 }).superRefine((value, context) => {
+  // A ref combined with until is a distinct "scroll this container until"
+  // mode (container-relative scrolling); ref alone remains scrollIntoView.
   const modes = [
-    value.ref !== undefined,
+    value.ref !== undefined && value.until === undefined,
     value.deltaX !== undefined || value.deltaY !== undefined,
     value.direction !== undefined,
     value.until !== undefined,
@@ -294,6 +296,11 @@ const StructuredFindSchema = z
       .default([]),
     index: z.number().int().nonnegative().max(999).optional(),
     limit: z.number().int().positive().max(50).default(10),
+    // Bounded auto-scroll: scans inside a virtualized/overflow container by
+    // taking one trusted wheel step per round until a confident match,
+    // maxSteps, or exhaustion (see executeInteractiveAction's "find" case).
+    scrollContainer: ScopedRefSchema.optional(),
+    maxSteps: z.number().int().min(1).max(50).optional(),
   })
   .superRefine((value, context) => {
     if (
@@ -314,6 +321,11 @@ const StructuredFindSchema = z
         code: z.ZodIssueCode.custom,
         path: ["nameMode"],
         message: "nameMode requires name",
+      });
+    if ((value.scrollContainer === undefined) !== (value.maxSteps === undefined))
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "scrollContainer and maxSteps are required together",
       });
   });
 
