@@ -16,7 +16,7 @@ export interface AttemptChange {
 export interface AttemptJournalEntry {
   attempt: number;
   startedAt: string;
-  inputMethod: "mouse" | "locator";
+  inputMethod: "mouse" | "locator" | "focus" | "keyboard" | "wheel" | "select" | "check" | "uncheck" | "hover" | "drag";
   sideEffects: WaitEvents;
   change: AttemptChange;
   retryDecision: "retry" | "stop";

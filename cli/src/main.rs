@@ -12,8 +12,8 @@ use daemon::{
     wait_for_daemon_exit,
 };
 use interactive::{
-    apply_state_guard, build_interactive_request, build_observe_action, Coordinates,
-    InteractiveRequestOptions, ObserveActionOptions,
+    apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
+    Coordinates, InteractiveRequestOptions, ObserveActionOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -270,6 +270,24 @@ enum RetryPolicy {
     Once,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+impl ScrollDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
 impl RetryPolicy {
     fn as_str(self) -> &'static str {
         match self {
@@ -413,6 +431,100 @@ enum Command {
         clear: bool,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
         delay: u16,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Focus {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Press {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[arg(long)]
+        key: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Paste {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[arg(long, required = true, conflicts_with_all = ["shot", "annotate"])]
+        text_stdin: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Scroll {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        ref_id: Option<String>,
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
+        delta_y: Option<f64>,
+        #[arg(long, allow_hyphen_values = true, requires = "delta_y")]
+        delta_x: Option<f64>,
+        #[arg(long, value_enum, conflicts_with_all = ["ref_id", "delta_y", "until"], requires = "pages", required_unless_present_any = ["ref_id", "delta_y", "until"])]
+        direction: Option<ScrollDirection>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "direction")]
+        pages: Option<u8>,
+        #[arg(long, conflicts_with_all = ["ref_id", "delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
+        until: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
+        max_steps: Option<u8>,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Select {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[arg(long, conflicts_with = "label", required_unless_present = "label")]
+        value: Option<String>,
+        #[arg(long, conflicts_with = "value", required_unless_present = "value")]
+        label: Option<String>,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Check {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Uncheck {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Hover {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref")]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Drag {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -665,6 +777,125 @@ fn run() -> Result<i32, Box<dyn Error>> {
             }
             run_page_action(&cli, output, action)
         }
+        Some(Command::Focus {
+            output,
+            ref_id,
+            wait,
+        }) => {
+            let mut action = build_primitive_action("focus", &[("ref", json!(ref_id))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Press {
+            output,
+            ref_id,
+            key,
+            wait,
+        }) => {
+            let mut action =
+                build_primitive_action("press", &[("ref", json!(ref_id)), ("key", json!(key))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Paste {
+            output,
+            ref_id,
+            text_stdin: _,
+            wait,
+        }) => {
+            let text = read_script_from_stdin()?;
+            let mut action =
+                build_primitive_action("paste", &[("ref", json!(ref_id)), ("text", json!(text))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Scroll {
+            output,
+            ref_id,
+            delta_y,
+            delta_x,
+            direction,
+            pages,
+            until,
+            max_steps,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "scroll" });
+            if let Some(value) = ref_id {
+                action["ref"] = json!(value);
+            }
+            if let Some(value) = delta_y {
+                action["deltaY"] = json!(value);
+            }
+            if let Some(value) = delta_x {
+                action["deltaX"] = json!(value);
+            }
+            if let Some(value) = direction {
+                action["direction"] = json!(value.as_str());
+            }
+            if let Some(value) = pages {
+                action["pages"] = json!(value);
+            }
+            if let Some(value) = until {
+                action["until"] = json!(value);
+            }
+            if let Some(value) = max_steps {
+                action["maxSteps"] = json!(value);
+            }
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Select {
+            output,
+            ref_id,
+            value,
+            label,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "select", "ref": ref_id });
+            if let Some(value) = value {
+                action["value"] = json!(value);
+            }
+            if let Some(label) = label {
+                action["label"] = json!(label);
+            }
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Check {
+            output,
+            ref_id,
+            wait,
+        })
+        | Some(Command::Uncheck {
+            output,
+            ref_id,
+            wait,
+        })
+        | Some(Command::Hover {
+            output,
+            ref_id,
+            wait,
+        }) => {
+            let kind = match &cli.command {
+                Some(Command::Check { .. }) => "check",
+                Some(Command::Uncheck { .. }) => "uncheck",
+                _ => "hover",
+            };
+            let mut action = json!({ "kind": kind, "ref": ref_id });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Drag {
+            output,
+            from,
+            to,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "drag", "from": from, "to": to });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
         Some(Command::Confirm { output, expect }) => {
             let mut action = json!({ "kind": "confirm" });
             if let Some(expect) = expect {
@@ -852,6 +1083,16 @@ fn run_page_action(
         action,
         output.session.as_deref(),
     )
+}
+
+fn apply_wait(action: &mut Value, wait: &WaitArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(spec) = wait
+        .build_spec(None)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+    {
+        action["wait"] = spec;
+    }
+    Ok(())
 }
 
 fn run_interactive(
@@ -1085,8 +1326,12 @@ fn print_status(data: &Value) -> Result<(), Box<dyn Error>> {
 }
 
 fn read_script_from_stdin() -> io::Result<String> {
+    read_text_stream(&mut io::stdin())
+}
+
+fn read_text_stream(reader: &mut impl Read) -> io::Result<String> {
     let mut script = String::new();
-    io::stdin().read_to_string(&mut script)?;
+    reader.read_to_string(&mut script)?;
     Ok(script)
 }
 
@@ -1120,10 +1365,11 @@ fn format_duration_ms(duration_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_retry_policy, build_execute_request, cli_error_exit_code, stream_responses, Cli,
-        Command, ResultMode, SessionCommand,
+        apply_retry_policy, build_execute_request, build_primitive_action, cli_error_exit_code,
+        read_text_stream, stream_responses, Cli, Command, ResultMode, SessionCommand,
     };
     use clap::Parser;
+    use serde_json::json;
     use std::io::Cursor;
 
     fn response_exit_code(response: &str) -> i32 {
@@ -1341,15 +1587,9 @@ mod tests {
     #[test]
     fn parses_and_serializes_every_click_retry_policy() {
         for policy in ["never", "safe", "once"] {
-            let parsed = Cli::try_parse_from([
-                "dev-browser",
-                "click",
-                "--ref",
-                "R2",
-                "--retry",
-                policy,
-            ])
-            .unwrap();
+            let parsed =
+                Cli::try_parse_from(["dev-browser", "click", "--ref", "R2", "--retry", policy])
+                    .unwrap();
             let Some(Command::Click { retry, .. }) = parsed.command else {
                 panic!("expected click command");
             };
@@ -1357,15 +1597,10 @@ mod tests {
             apply_retry_policy(&mut action, retry);
             assert_eq!(action["retry"], policy);
         }
-        assert!(Cli::try_parse_from([
-            "dev-browser",
-            "click",
-            "--ref",
-            "R2",
-            "--retry",
-            "always"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["dev-browser", "click", "--ref", "R2", "--retry", "always"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1502,5 +1737,104 @@ mod tests {
             Some("opaque"),
         );
         assert_eq!(request["session"], "opaque");
+    }
+
+    #[test]
+    fn parses_every_interaction_primitive_and_enforces_exclusivity() {
+        for args in [
+            vec!["dev-browser", "focus", "--ref", "R1"],
+            vec!["dev-browser", "press", "--ref", "R1", "--key", "Enter"],
+            vec!["dev-browser", "paste", "--ref", "R1", "--text-stdin"],
+            vec!["dev-browser", "scroll", "--ref", "R1"],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--delta-y",
+                "600",
+                "--delta-x",
+                "-10",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--direction",
+                "down",
+                "--pages",
+                "2",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--until",
+                "text:Done",
+                "--max-steps",
+                "50",
+            ],
+            vec!["dev-browser", "select", "--ref", "R1", "--value", "ci"],
+            vec!["dev-browser", "select", "--ref", "R1", "--label", "Nigeria"],
+            vec!["dev-browser", "check", "--ref", "R1"],
+            vec!["dev-browser", "uncheck", "--ref", "R1"],
+            vec!["dev-browser", "hover", "--ref", "R1"],
+            vec!["dev-browser", "drag", "--from", "R1", "--to", "R2"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+        for args in [
+            vec!["dev-browser", "paste", "--ref", "R1"],
+            vec![
+                "dev-browser",
+                "paste",
+                "--ref",
+                "R1",
+                "--text-stdin",
+                "--shot",
+            ],
+            vec![
+                "dev-browser",
+                "paste",
+                "--ref",
+                "R1",
+                "--text-stdin",
+                "--annotate",
+            ],
+            vec![
+                "dev-browser",
+                "select",
+                "--ref",
+                "R1",
+                "--value",
+                "ci",
+                "--label",
+                "CI",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--until",
+                "text:Done",
+                "--max-steps",
+                "51",
+            ],
+            vec!["dev-browser", "scroll", "--ref", "R1", "--delta-y", "10"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn paste_consumes_exact_stdin_once_and_builds_only_a_paste_action() {
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "paste", "--ref", "R7", "--text-stdin"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Paste { .. })));
+        let mut stdin = std::io::Cursor::new(b"secret\nwith newline".to_vec());
+        let text = read_text_stream(&mut stdin).unwrap();
+        assert_eq!(text, "secret\nwith newline");
+        let action =
+            build_primitive_action("paste", &[("ref", json!("R7")), ("text", json!(text))]);
+        assert_eq!(
+            action,
+            json!({ "kind": "paste", "ref": "R7", "text": "secret\nwith newline" })
+        );
+        assert_eq!(stdin.position(), 19);
     }
 }

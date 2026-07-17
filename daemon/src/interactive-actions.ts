@@ -1,6 +1,8 @@
 import type { Page } from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
+import { attemptErrorReason, boundedWaitEvents, emptyWaitEvents, mergeWaitEvents, trustedInputError as attemptError, withAttemptJournal } from "./action-journal.js";
+import { executePrimitive, type PrimitiveSummary } from "./actions/primitives.js";
 import { BrowserManager } from "./browser-manager.js";
 import {
   collectPageState,
@@ -87,6 +89,13 @@ export interface InteractiveResult {
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
   waitResult?: WaitResult;
+  pressed?: PrimitiveSummary["pressed"];
+  pasted?: PrimitiveSummary["pasted"];
+  scroll?: PrimitiveSummary["scroll"];
+  selected?: PrimitiveSummary["selected"];
+  checked?: PrimitiveSummary["checked"];
+  hovered?: PrimitiveSummary["hovered"];
+  dragged?: PrimitiveSummary["dragged"];
 }
 
 export interface ActionExecutionHooks {
@@ -429,74 +438,9 @@ function actionWaitSpec(
   return undefined;
 }
 
-function emptyWaitEvents(): WaitEvents {
-  return {
-    requests: [],
-    mutations: [],
-    focusChanges: [],
-    valueChanges: [],
-    dialogs: [],
-    popup: [],
-    download: [],
-    fileChooser: [],
-    navigation: [],
-    responses: [],
-    failedRequests: [],
-  };
-}
-
-function boundedWaitEvents(events: WaitEvents): WaitEvents {
-  return Object.fromEntries(
-    Object.entries(events).map(([key, entries]) => [key, entries.slice(0, 2)])
-  ) as unknown as WaitEvents;
-}
-
 function timeoutEvents(error: AgentProtocolError): WaitEvents {
   const events = (error.details as { events?: WaitEvents } | undefined)?.events;
   return boundedWaitEvents(events ?? capturedWaitEvents(error) ?? emptyWaitEvents());
-}
-
-function attemptError(error: unknown, page: Page): AgentProtocolError {
-  if (error instanceof AgentProtocolError) return error;
-  if (page.isClosed())
-    return new AgentProtocolError("PAGE_CLOSED", "Page closed during trusted input", true);
-  const message = error instanceof Error ? error.message : String(error);
-  return new AgentProtocolError(
-    "RENDERER_UNRESPONSIVE",
-    summarizeErrorContext(message || "Trusted input failed"),
-    false
-  );
-}
-
-function attemptErrorReason(error: AgentProtocolError): string {
-  if (error.code === "LEASE_CONFLICT") return "lease-conflict";
-  if (error.code === "STALE_REF" || error.code === "STALE_STATE")
-    return "state-revalidation-failed";
-  if (error.code === "PAGE_CLOSED") return "page-closed";
-  return "trusted-input-error";
-}
-
-function withAttemptJournal(
-  error: AgentProtocolError,
-  journal: AttemptJournalEntry[]
-): AgentProtocolError {
-  const details =
-    error.details && typeof error.details === "object" && !Array.isArray(error.details)
-      ? (error.details as Record<string, unknown>)
-      : {};
-  const { events: _duplicateEvents, ...detailsWithoutEvents } = details;
-  const journalDetails = { attempts: journal.length, attemptJournal: journal };
-  try {
-    return new AgentProtocolError(error.code, error.message, error.recoverable, {
-      details: { ...detailsWithoutEvents, ...journalDetails },
-      nextCommands: error.nextCommands,
-    });
-  } catch {
-    return new AgentProtocolError(error.code, error.message, error.recoverable, {
-      details: journalDetails,
-      nextCommands: error.nextCommands,
-    });
-  }
 }
 
 async function hasIrreversibleClickIntent(
@@ -542,6 +486,10 @@ export async function executeInteractiveAction(
   hooks: ActionExecutionHooks = {}
 ): Promise<InteractiveResult> {
   const { action } = request;
+
+  if (action.kind === "paste" && (request.shot || request.annotate)) {
+    throw new AgentProtocolError("UNSUPPORTED_CONTEXT", "Paste cannot create screenshots or annotations", false);
+  }
 
   if (action.kind === "pages") {
     return {
@@ -855,6 +803,64 @@ export async function executeInteractiveAction(
       result.typed = { ref: action.ref ?? null, characters: Array.from(action.text).length };
       if (!result.stateId)
         applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+      break;
+    }
+
+    case "focus":
+    case "press":
+    case "paste":
+    case "scroll":
+    case "select":
+    case "check":
+    case "uncheck":
+    case "hover":
+    case "drag": {
+      const dispatch = async () => executePrimitive({
+        page,
+        action,
+        timeoutMs: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+        resolve: async (ref) => resolveRef(page, ref),
+        authorize: async (refs) => {
+          await hooks.beforeTrustedInput?.();
+          if (protocolVersion === 2) {
+            const previousLatestStateId = getLatestStateId(page);
+            const latest = await perceive(page, {}, false);
+            for (const ref of refs.length > 0 ? refs : [undefined]) {
+              result.warnings = [
+                ...(result.warnings ?? []),
+                ...validateObservedDecision(page, request.page, action, ref, latest, previousLatestStateId),
+              ];
+            }
+            discardValidationState(page, latest.stateId, previousLatestStateId);
+          }
+          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+        },
+      });
+      let summary: PrimitiveSummary;
+      if (action.wait) {
+        let dispatched: PrimitiveSummary | undefined;
+        try {
+          const waited = await runWithWait(
+            page,
+            { collect: () => perceive(page, { delta: true }, protocolVersion === 1) },
+            action.wait,
+            async () => { dispatched = await dispatch(); }
+          );
+          summary = dispatched!;
+          const lastAttempt = summary.attemptJournal?.at(-1);
+          if (lastAttempt) lastAttempt.sideEffects = mergeWaitEvents(lastAttempt.sideEffects, boundedWaitEvents(waited.waitResult.events));
+          result.waitResult = waited.waitResult;
+          applyPerception(result, waited.state, protocolVersion);
+        } catch (error) {
+          const journal = dispatched?.attemptJournal;
+          const lastAttempt = journal?.at(-1);
+          if (!journal || !lastAttempt) throw error;
+          lastAttempt.sideEffects = mergeWaitEvents(lastAttempt.sideEffects, timeoutEvents(attemptError(error, page)));
+          throw withAttemptJournal(attemptError(error, page), journal);
+        }
+      } else summary = await dispatch();
+      Object.assign(result, summary);
+      if (!result.stateId) applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
       break;
     }
 

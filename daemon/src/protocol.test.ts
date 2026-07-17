@@ -390,6 +390,62 @@ describe("interactive request protocol", () => {
       expect(parseRequest(JSON.stringify(request))).toMatchObject({ success: true });
   });
 
+  it("parses keyboard, scroll, form, hover, and drag actions", () => {
+    const actions = [
+      { kind: "focus", ref: "R1" },
+      { kind: "press", ref: "R1", key: "Enter" },
+      { kind: "paste", ref: "R1", text: "secret" },
+      { kind: "scroll", ref: "R1" },
+      { kind: "scroll", deltaY: 600, deltaX: -20 },
+      { kind: "scroll", direction: "down", pages: 2 },
+      { kind: "scroll", until: "text:Finished", maxSteps: 10 },
+      { kind: "select", ref: "R1", value: "ci" },
+      { kind: "select", ref: "R1", label: "Cote d'Ivoire" },
+      { kind: "check", ref: "R1" },
+      { kind: "uncheck", ref: "R1" },
+      { kind: "hover", ref: "R1" },
+      { kind: "drag", from: "R1", to: "R2" },
+    ];
+    for (const action of actions) {
+      expect(parseRequest(JSON.stringify({
+        id: `action-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        action: { ...action, fromState: "doc-1:2", strictState: true },
+      }))).toMatchObject({ success: true });
+    }
+  });
+
+  it("rejects invalid primitive variants and unbounded scrolling", () => {
+    const actions = [
+      { kind: "press", ref: "R1", key: "javascript:alert(1)" },
+      { kind: "select", ref: "R1", value: "ci", label: "CI" },
+      { kind: "select", ref: "R1" },
+      { kind: "scroll", until: "Finished", maxSteps: 0 },
+      { kind: "scroll", until: "Finished", maxSteps: 51 },
+      { kind: "scroll" },
+    ];
+    for (const action of actions) {
+      expect(parseRequest(JSON.stringify({ id: "invalid-primitive", type: "interactive", action })))
+        .toMatchObject({ success: false });
+    }
+  });
+
+  it("rejects paste requests that could persist plaintext artifacts", () => {
+    for (const artifact of [{ shot: "paste.png" }, { annotate: true }]) {
+      const secret = "TOP_SECRET_PROTOCOL";
+      const parsed = parseRequest(JSON.stringify({
+        id: "paste-artifact",
+        type: "interactive",
+        protocolVersion: 2,
+        ...artifact,
+        action: { kind: "paste", ref: "R1", text: secret },
+      }));
+      expect(parsed).toMatchObject({ success: false });
+      expect(JSON.stringify(parsed)).not.toContain(secret);
+    }
+  });
+
   it("rejects session TTLs outside 1 through 3600 seconds", () => {
     for (const ttl of [0, 3601]) {
       expect(

@@ -146,6 +146,33 @@ export type WaitSpec = z.infer<typeof WaitSpecSchema>;
 
 const WaitableActionSchema = z.object({ wait: WaitSpecSchema.optional() });
 const RetryPolicySchema = z.enum(["never", "safe", "once"]);
+const RefSchema = z.string().regex(/^R\d+$/);
+const PrimitiveBaseSchema = StateGuardSchema.merge(WaitableActionSchema);
+const RefPrimitiveSchema = PrimitiveBaseSchema.extend({ ref: RefSchema });
+const ScrollActionSchema = PrimitiveBaseSchema.extend({
+  kind: z.literal("scroll"),
+  ref: RefSchema.optional(),
+  deltaX: z.number().finite().min(-100_000).max(100_000).optional(),
+  deltaY: z.number().finite().min(-100_000).max(100_000).optional(),
+  direction: z.enum(["up", "down", "left", "right"]).optional(),
+  pages: z.number().int().min(1).max(50).optional(),
+  until: z.string().regex(/^(text|role):.{1,2000}$/).optional(),
+  maxSteps: z.number().int().min(1).max(50).optional(),
+}).superRefine((value, context) => {
+  const modes = [value.ref !== undefined, value.deltaX !== undefined || value.deltaY !== undefined,
+    value.direction !== undefined, value.until !== undefined].filter(Boolean).length;
+  if (modes !== 1) context.addIssue({ code: z.ZodIssueCode.custom, message: "exactly one scroll mode is required" });
+  if ((value.direction === undefined) !== (value.pages === undefined))
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "direction and pages are required together" });
+  if ((value.until === undefined) !== (value.maxSteps === undefined))
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "until and maxSteps are required together" });
+});
+const SelectActionSchema = RefPrimitiveSchema.extend({
+  kind: z.literal("select"), value: z.string().max(2000).optional(), label: z.string().max(2000).optional(),
+}).superRefine((value, context) => {
+  if ((value.value === undefined) === (value.label === undefined))
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "exactly one of value or label is required" });
+});
 
 const ExecuteRequestSchema = RequestBaseSchema.extend({
   type: z.literal("execute"),
@@ -212,6 +239,15 @@ const InteractiveActionSchema = z.union([
   }),
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
+  RefPrimitiveSchema.extend({ kind: z.literal("focus") }),
+  RefPrimitiveSchema.extend({ kind: z.literal("press"), key: z.string().min(1).max(64).regex(/^[A-Za-z0-9+ -]+$/) }),
+  RefPrimitiveSchema.extend({ kind: z.literal("paste"), text: z.string().max(1_000_000) }),
+  ScrollActionSchema,
+  SelectActionSchema,
+  RefPrimitiveSchema.extend({ kind: z.literal("check") }),
+  RefPrimitiveSchema.extend({ kind: z.literal("uncheck") }),
+  RefPrimitiveSchema.extend({ kind: z.literal("hover") }),
+  PrimitiveBaseSchema.extend({ kind: z.literal("drag"), from: RefSchema, to: RefSchema }),
   StateGuardSchema.merge(WaitableActionSchema).extend({
     kind: z.literal("type"),
     ref: z
@@ -250,6 +286,10 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   connect: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
   session: z.string().min(1).max(500).optional(),
+}).superRefine((value, context) => {
+  if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["action"], message: "paste cannot create screenshots or annotations" });
+  }
 });
 
 const SessionRequestSchema = z.union([

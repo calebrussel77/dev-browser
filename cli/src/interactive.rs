@@ -91,6 +91,14 @@ pub fn apply_state_guard(action: &mut Value, from_state: Option<&str>, strict_st
     }
 }
 
+pub fn build_primitive_action(kind: &str, fields: &[(&str, Value)]) -> Value {
+    let mut action = json!({ "kind": kind });
+    for (name, value) in fields {
+        action[*name] = value.clone();
+    }
+    action
+}
+
 pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action: Value) -> Value {
     let mut request = json!({
         "id": options.id,
@@ -130,8 +138,8 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_state_guard, build_interactive_request, build_observe_action, Coordinates,
-        InteractiveRequestOptions, ObserveActionOptions,
+        apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
+        Coordinates, InteractiveRequestOptions, ObserveActionOptions,
     };
     use serde_json::json;
 
@@ -235,5 +243,36 @@ mod tests {
         apply_state_guard(&mut action, Some("doc-4:9"), true);
         assert_eq!(action["fromState"], "doc-4:9");
         assert_eq!(action["strictState"], true);
+    }
+
+    #[test]
+    fn builds_json_for_every_interaction_primitive_without_echo_helpers() {
+        let cases = [
+            ("focus", vec![("ref", json!("R1"))]),
+            ("press", vec![("ref", json!("R1")), ("key", json!("Enter"))]),
+            (
+                "paste",
+                vec![("ref", json!("R1")), ("text", json!("secret"))],
+            ),
+            (
+                "scroll",
+                vec![("deltaY", json!(600)), ("deltaX", json!(-10))],
+            ),
+            (
+                "select",
+                vec![("ref", json!("R1")), ("label", json!("Nigeria"))],
+            ),
+            ("check", vec![("ref", json!("R1"))]),
+            ("uncheck", vec![("ref", json!("R1"))]),
+            ("hover", vec![("ref", json!("R1"))]),
+            ("drag", vec![("from", json!("R1")), ("to", json!("R2"))]),
+        ];
+        for (kind, fields) in cases {
+            let action = build_primitive_action(kind, &fields);
+            assert_eq!(action["kind"], kind);
+            for (name, value) in fields {
+                assert_eq!(action[name], value);
+            }
+        }
     }
 }
