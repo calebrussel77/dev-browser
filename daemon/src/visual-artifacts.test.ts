@@ -264,6 +264,32 @@ describe.sequential("visual artifacts", () => {
     }
   });
 
+  it("keeps screenshot refs and direct coordinates aligned at browser zoom", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setViewportSize({ width: 320, height: 180 });
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1.5 });
+    try {
+      await page.setContent(`
+        <style>html,body{margin:0}button{position:absolute;left:80px;top:60px;width:100px;height:40px;background:#00f}</style>
+        <button>Zoom target</button><output>clicks:0</output>
+        <script>let clicks=0;document.querySelector('button').onclick=()=>document.querySelector('output').textContent='clicks:'+ ++clicks</script>
+      `);
+      const state = await collectPageState(page);
+      const target = state.elements.find((element) => element.name === "Zoom target")!;
+      const result = await captureVisualArtifacts(page, state, {
+        screenshotName: `visual-tests/zoom-${Date.now()}.png`,
+      });
+      expect(result.screenshot!.coordinateSpace.zoom).toBeCloseTo(1.5, 1);
+      await page.mouse.click(target.box.x + target.box.width / 2, target.box.y + target.box.height / 2);
+      await expect(page.locator("output").textContent()).resolves.toBe("clicks:1");
+      await rm(result.screenshot!.path, { force: true });
+    } finally {
+      await session.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+      await session.detach();
+    }
+  });
+
   it("crops around a ref with padding and clamps to document bounds", async () => {
     const page = await manager.getPage("visual", "main");
     await page.setViewportSize({ width: 300, height: 160 });
