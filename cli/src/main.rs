@@ -14,8 +14,8 @@ use daemon::{
 };
 use discovery::{agent_schema, compact_capabilities, focused_example};
 use interactive::{
-    apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
-    Coordinates, InteractiveRequestOptions, ObserveActionOptions,
+    apply_state_guard, build_content_scope_action, build_interactive_request, build_observe_action,
+    build_primitive_action, Coordinates, InteractiveRequestOptions, ObserveActionOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -348,6 +348,19 @@ impl NameMode {
     }
 }
 #[derive(Clone, Copy, ValueEnum)]
+enum AssertMatch {
+    Exact,
+    Contains,
+}
+impl AssertMatch {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Contains => "contains",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
 enum FindScope {
     Visible,
     Viewport,
@@ -485,6 +498,75 @@ enum Command {
         breadth: u16,
         #[arg(long, value_name = "CURSOR")]
         continuation: Option<String>,
+        #[arg(
+            long = "root",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            help = "Scope observation to the subtree rooted at this ref"
+        )]
+        root_ref: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "root_ref",
+            help = "Scope observation to main, aside, dialog, role:<role>, or name:<exact name>"
+        )]
+        within: Option<String>,
+        #[arg(long, help = "Return bounded normalized innerText instead of the element tree")]
+        text_only: bool,
+    },
+    #[command(
+        about = "Read bounded normalized text from a ref or landmark scope",
+        long_about = "Return bounded, normalized innerText for a single ref or a within scope (main, aside, dialog, role:<role>, name:<exact name>), preserving line breaks and truncation metadata."
+    )]
+    Text {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            required_unless_present = "within"
+        )]
+        ref_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "ref_id",
+            required_unless_present = "ref_id"
+        )]
+        within: Option<String>,
+        #[arg(long, default_value_t = 20_000, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+        max_chars: u32,
+    },
+    #[command(
+        about = "Assert that scoped text is present without mutating the page",
+        long_about = "Read bounded text from a ref or within scope and fail with a typed, recoverable ASSERTION_FAILED error (no trusted input attempt) if the expected text is absent."
+    )]
+    Assert {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "within",
+            required_unless_present = "within"
+        )]
+        ref_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            conflicts_with = "ref_id",
+            required_unless_present = "ref_id"
+        )]
+        within: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        #[arg(long, value_enum, default_value = "contains")]
+        r#match: AssertMatch,
     },
     #[command(
         about = "Read the accessibility snapshot and interactive refs for a page",
@@ -875,6 +957,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
             depth,
             breadth,
             continuation,
+            root_ref,
+            within,
+            text_only,
         }) => run_page_action(
             &cli,
             output,
@@ -887,8 +972,35 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 depth: *depth,
                 breadth: *breadth,
                 continuation: continuation.as_deref(),
+                root: root_ref.as_deref(),
+                within: within.as_deref(),
+                text_only: *text_only,
             }),
         ),
+        Some(Command::Text {
+            output,
+            ref_id,
+            within,
+            max_chars,
+        }) => {
+            let mut action =
+                build_content_scope_action("text", ref_id.as_deref(), within.as_deref());
+            action["maxChars"] = json!(max_chars);
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Assert {
+            output,
+            ref_id,
+            within,
+            text,
+            r#match,
+        }) => {
+            let mut action =
+                build_content_scope_action("assert", ref_id.as_deref(), within.as_deref());
+            action["text"] = json!(text);
+            action["match"] = json!(r#match.as_str());
+            run_page_action(&cli, output, action)
+        }
         Some(Command::Read {
             output,
             limit,
@@ -1563,7 +1675,8 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
             | "TARGET_HIDDEN"
             | "TARGET_OBSCURED"
             | "TARGET_DISABLED"
-            | "UNSUPPORTED_CONTEXT",
+            | "UNSUPPORTED_CONTEXT"
+            | "ASSERTION_FAILED",
         ) => 3,
         Some("WAIT_TIMEOUT") => 4,
         Some("LEASE_CONFLICT") => 5,
@@ -1735,6 +1848,7 @@ mod tests {
             ("STALE_REF", 3),
             ("AMBIGUOUS_TARGET", 3),
             ("TARGET_DISABLED", 3),
+            ("ASSERTION_FAILED", 3),
             ("WAIT_TIMEOUT", 4),
             ("LEASE_CONFLICT", 5),
             ("CDP_ATTACH_FAILED", 6),
@@ -2332,6 +2446,70 @@ mod tests {
             "1000"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_observe_content_scope_flags_and_rejects_combining_root_and_within() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "observe",
+            "--within",
+            "main",
+            "--text-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Observe { ref within, text_only: true, .. })
+                if within.as_deref() == Some("main")
+        ));
+
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "observe",
+            "--root",
+            "R42",
+            "--within",
+            "main",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_text_and_assert_commands_and_requires_exactly_one_scope() {
+        let text = Cli::try_parse_from(["dev-browser", "text", "--ref", "R42"]).unwrap();
+        assert!(matches!(
+            text.command,
+            Some(Command::Text { ref ref_id, .. }) if ref_id.as_deref() == Some("R42")
+        ));
+        assert!(Cli::try_parse_from(["dev-browser", "text"]).is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "text",
+            "--ref",
+            "R1",
+            "--within",
+            "main"
+        ])
+        .is_err());
+
+        let assertion = Cli::try_parse_from([
+            "dev-browser",
+            "assert",
+            "--within",
+            "main",
+            "--text",
+            "Jane Doe",
+            "--match",
+            "exact",
+        ])
+        .unwrap();
+        assert!(matches!(
+            assertion.command,
+            Some(Command::Assert { ref within, ref text, .. })
+                if within.as_deref() == Some("main") && text == "Jane Doe"
+        ));
+        assert!(Cli::try_parse_from(["dev-browser", "assert", "--within", "main"]).is_err());
     }
 
     #[test]

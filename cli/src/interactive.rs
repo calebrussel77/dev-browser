@@ -65,6 +65,9 @@ pub struct ObserveActionOptions<'a> {
     pub depth: u8,
     pub breadth: u16,
     pub continuation: Option<&'a str>,
+    pub root: Option<&'a str>,
+    pub within: Option<&'a str>,
+    pub text_only: bool,
 }
 
 pub fn build_observe_action(options: ObserveActionOptions<'_>) -> Value {
@@ -80,6 +83,26 @@ pub fn build_observe_action(options: ObserveActionOptions<'_>) -> Value {
     });
     if let Some(continuation) = options.continuation {
         action["continuation"] = Value::String(continuation.to_string());
+    }
+    if let Some(root) = options.root {
+        action["root"] = Value::String(root.to_string());
+    }
+    if let Some(within) = options.within {
+        action["within"] = Value::String(within.to_string());
+    }
+    if options.text_only {
+        action["textOnly"] = Value::Bool(true);
+    }
+    action
+}
+
+pub fn build_content_scope_action(kind: &str, ref_id: Option<&str>, within: Option<&str>) -> Value {
+    let mut action = json!({ "kind": kind });
+    if let Some(ref_id) = ref_id {
+        action["ref"] = Value::String(ref_id.to_string());
+    }
+    if let Some(within) = within {
+        action["within"] = Value::String(within.to_string());
     }
     action
 }
@@ -144,8 +167,9 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
-        Coordinates, InteractiveRequestOptions, ObserveActionOptions,
+        apply_state_guard, build_content_scope_action, build_interactive_request,
+        build_observe_action, build_primitive_action, Coordinates, InteractiveRequestOptions,
+        ObserveActionOptions,
     };
     use serde_json::json;
 
@@ -206,6 +230,9 @@ mod tests {
             depth: 49,
             breadth: 499,
             continuation: Some("eyJ2IjoxLCJvZmZzZXQiOjN9"),
+            root: None,
+            within: None,
+            text_only: false,
         });
 
         assert_eq!(
@@ -222,6 +249,36 @@ mod tests {
                 "continuation": "eyJ2IjoxLCJvZmZzZXQiOjN9",
             })
         );
+    }
+
+    #[test]
+    fn builds_observe_json_with_a_content_scope() {
+        let action = build_observe_action(ObserveActionOptions {
+            full: false,
+            delta: false,
+            track: "default",
+            max_nodes: 300,
+            max_chars: 12_000,
+            depth: 12,
+            breadth: 50,
+            continuation: None,
+            root: None,
+            within: Some("main"),
+            text_only: true,
+        });
+
+        assert_eq!(action["within"], "main");
+        assert_eq!(action["textOnly"], true);
+        assert!(action.get("root").is_none());
+    }
+
+    #[test]
+    fn builds_content_scope_actions_for_text_and_assert() {
+        let text_action = build_content_scope_action("text", Some("R42"), None);
+        assert_eq!(text_action, json!({ "kind": "text", "ref": "R42" }));
+
+        let within_action = build_content_scope_action("assert", None, Some("main"));
+        assert_eq!(within_action, json!({ "kind": "assert", "within": "main" }));
     }
 
     #[test]

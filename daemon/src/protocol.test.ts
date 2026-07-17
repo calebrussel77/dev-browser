@@ -374,6 +374,58 @@ describe("interactive request protocol", () => {
     ]) expect(parseRequest(JSON.stringify({ id: "bad-find", type: "interactive", action }))).toMatchObject({ success: false });
   });
 
+  it("parses observe scope options and rejects combining root with within", () => {
+    const withinResult = parseRequest(JSON.stringify({
+      id: "observe-within", type: "interactive", protocolVersion: 2,
+      action: { kind: "observe", within: "main", textOnly: true },
+    }));
+    expect(withinResult).toMatchObject({
+      success: true,
+      request: { action: { kind: "observe", within: "main", textOnly: true } },
+    });
+
+    const rootResult = parseRequest(JSON.stringify({
+      id: "observe-root", type: "interactive", protocolVersion: 2,
+      action: { kind: "observe", root: "R42" },
+    }));
+    expect(rootResult).toMatchObject({ success: true, request: { action: { root: "R42" } } });
+
+    expect(parseRequest(JSON.stringify({
+      id: "observe-both", type: "interactive", protocolVersion: 2,
+      action: { kind: "observe", root: "R1", within: "main" },
+    }))).toMatchObject({ success: false });
+  });
+
+  it("parses text and assert actions and requires exactly one of ref or within", () => {
+    const text = parseRequest(JSON.stringify({
+      id: "text-within", type: "interactive", protocolVersion: 2,
+      action: { kind: "text", within: "main" },
+    }));
+    expect(text).toMatchObject({
+      success: true,
+      request: { action: { kind: "text", within: "main", maxChars: 20_000 } },
+    });
+
+    const assertion = parseRequest(JSON.stringify({
+      id: "assert-ref", type: "interactive", protocolVersion: 2,
+      action: { kind: "assert", ref: "R7", text: "Jane Doe", match: "contains" },
+    }));
+    expect(assertion).toMatchObject({
+      success: true,
+      request: { action: { kind: "assert", ref: "R7", text: "Jane Doe", match: "contains" } },
+    });
+
+    for (const action of [
+      { kind: "text" },
+      { kind: "text", ref: "R1", within: "main" },
+      { kind: "assert", text: "Jane Doe" },
+      { kind: "assert", ref: "R1", within: "main", text: "Jane Doe" },
+    ])
+      expect(
+        parseRequest(JSON.stringify({ id: "bad-scope", type: "interactive", action }))
+      ).toMatchObject({ success: false });
+  });
+
   it("parses annotation and full-page artifact options", () => {
     const result = parseRequest(
       JSON.stringify({

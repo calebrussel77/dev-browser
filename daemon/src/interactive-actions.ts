@@ -41,6 +41,12 @@ import {
   type RetryPolicy,
 } from "./retry-policy.js";
 import { pageLeases } from "./sessions.js";
+import {
+  assertScopedText,
+  isValidWithinScope,
+  resolveContentScope,
+  type ScopeMetadata,
+} from "./scoped-content.js";
 import { findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
@@ -77,6 +83,12 @@ export interface InteractiveResult {
   delta?: PagePerception["delta"];
   warnings?: string[];
   truncation?: PagePerception["truncation"];
+  textOnly?: PagePerception["textOnly"];
+  scope?: ScopeMetadata;
+  textContent?: string;
+  textTruncation?: { truncated: boolean; chars: number; maxChars: number };
+  asserted?: boolean;
+  observed?: string;
   clicked?: {
     ref: string | null;
     actualRef?: string | null;
@@ -449,6 +461,9 @@ function applyPerception(
   result.delta = perception.delta;
   result.warnings = [...(result.warnings ?? []), ...perception.warnings];
   result.truncation = perception.truncation;
+  if (perception.textOnly) result.textOnly = perception.textOnly;
+  if (perception.scope)
+    result.scope = { kind: perception.scope.kind, value: perception.scope.value, frameId: perception.scope.frameId };
   result.coordinateSpace =
     protocolVersion === 2
       ? perception.coordinateSpace
@@ -850,6 +865,12 @@ export async function executeInteractiveAction(
     }
 
     case "observe": {
+      if (action.within && !isValidWithinScope(action.within))
+        throw new AgentProtocolError(
+          "UNSUPPORTED_CONTEXT",
+          `Unsupported within scope "${action.within}"; use main, aside, dialog, role:<role>, or name:<exact name>`,
+          false
+        );
       const perception = await perceive(
         page,
         {
@@ -861,10 +882,38 @@ export async function executeInteractiveAction(
           depth: action.depth,
           breadth: action.breadth,
           continuation: action.continuation,
+          scope: action.root || action.within ? { ref: action.root, within: action.within } : undefined,
+          textOnly: action.textOnly,
         },
         false
       );
       applyPerception(result, perception, protocolVersion);
+      break;
+    }
+
+    case "text": {
+      const scoped = await resolveContentScope(page, {
+        ref: action.ref,
+        within: action.within,
+        maxChars: action.maxChars,
+      });
+      result.scope = scoped.scope;
+      result.textContent = scoped.text;
+      result.textTruncation = scoped.truncation;
+      break;
+    }
+
+    case "assert": {
+      const asserted = await assertScopedText(page, {
+        ref: action.ref,
+        within: action.within,
+        text: action.text,
+        match: action.match,
+        nextCommands: [observeRecoveryCommand(request.page)],
+      });
+      result.scope = asserted.scope;
+      result.observed = asserted.observed;
+      result.asserted = asserted.asserted;
       break;
     }
 

@@ -259,7 +259,21 @@ const ObserveOptionsSchema = z.object({
     .max(80)
     .regex(/^[A-Za-z0-9_-]+$/)
     .optional(),
+  root: ScopedRefSchema.optional(),
+  within: z.string().min(1).max(500).optional(),
+  textOnly: z.boolean().default(false),
 });
+function rejectCombinedRootAndWithin(
+  value: { root?: string; within?: string },
+  context: z.RefinementCtx
+): void {
+  if (value.root && value.within)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["within"],
+      message: "provide either root or within, not both",
+    });
+}
 
 const StructuredFindSchema = z
   .object({
@@ -303,19 +317,48 @@ const StructuredFindSchema = z
       });
   });
 
+const ContentScopeFieldsSchema = z.object({
+  ref: ScopedRefSchema.optional(),
+  within: z.string().min(1).max(500).optional(),
+});
+const requireExactlyOneScope = (
+  value: { ref?: string; within?: string },
+  context: z.RefinementCtx
+): void => {
+  if ((value.ref === undefined) === (value.within === undefined))
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exactly one of ref or within is required",
+    });
+};
+const TextActionSchema = ContentScopeFieldsSchema.extend({
+  kind: z.literal("text"),
+  maxChars: z.number().int().positive().max(200_000).default(20_000),
+}).superRefine(requireExactlyOneScope);
+const AssertMatchSchema = z.enum(["exact", "contains"]);
+const AssertActionSchema = ContentScopeFieldsSchema.extend({
+  kind: z.literal("assert"),
+  text: z.string().min(1).max(2_000),
+  match: AssertMatchSchema.default("contains"),
+}).superRefine(requireExactlyOneScope);
+
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
   WaitableActionSchema.extend({
     kind: z.literal("navigate"),
     url: z.string().url(),
   }),
-  ObserveOptionsSchema.extend({ kind: z.literal("observe") }),
+  ObserveOptionsSchema.extend({ kind: z.literal("observe") }).superRefine(
+    rejectCombinedRootAndWithin
+  ),
   z.object({
     kind: z.literal("read"),
     limit: z.number().int().positive().max(500).default(100),
     depth: z.number().int().positive().max(50).default(12),
   }),
   StructuredFindSchema,
+  TextActionSchema,
+  AssertActionSchema,
   InteractiveClickByRefSchema,
   InteractiveClickByCoordinatesSchema,
   RefPrimitiveSchema.extend({ kind: z.literal("focus") }),

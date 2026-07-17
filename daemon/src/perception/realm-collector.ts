@@ -1,11 +1,39 @@
+export interface RealmContentScope {
+  ref?: string;
+  within?: string;
+}
+
+export interface RealmScopeResult {
+  requested: boolean;
+  matched: boolean;
+  ambiguous: boolean;
+  count: number;
+}
+
+export interface RealmTextResult {
+  text: string;
+  truncated: boolean;
+}
+
 export interface RealmCollectionOptions {
   full: boolean;
   legacyRefs: boolean;
   maxRecords?: number;
   maxWork?: number;
+  scope?: RealmContentScope;
+  textOnly?: boolean;
+  textMaxChars?: number;
 }
 
-export function collectRealm({ full, legacyRefs, maxRecords = 2_000, maxWork = 5_000 }: RealmCollectionOptions) {
+export function collectRealm({
+  full,
+  legacyRefs,
+  maxRecords = 2_000,
+  maxWork = 5_000,
+  scope,
+  textOnly = false,
+  textMaxChars = 20_000,
+}: RealmCollectionOptions) {
   type BoundedText = (root: Node, maxChars?: number, maxNodes?: number) => { text: string; truncated: boolean; visited: number };
   type RealmState = { token: string; refs: WeakMap<Element, string>; byRef: Map<string, WeakRef<Element>>; boundedText?: BoundedText; counter: number };
   type RealmWindow = Window & { __devBrowserPerceptionState?: RealmState };
@@ -52,6 +80,52 @@ export function collectRealm({ full, legacyRefs, maxRecords = 2_000, maxWork = 5
     const html = element as HTMLElement;
     return `${element.tagName.toLowerCase()}${html.id ? `#${compact(html.id, 50)}` : ""}${html.dataset.testid ? `[data-testid=${compact(html.dataset.testid, 50)}]` : ""}`;
   };
+  const accessibleScopeName = (element: Element): string => {
+    const aria = element.getAttribute("aria-label");
+    if (aria) return compact(aria);
+    return boundedDescendantText(element, 500, 100).text;
+  };
+  let scopeRoot: Element = document.documentElement ?? document.body;
+  const scopeResult: RealmScopeResult = { requested: false, matched: true, ambiguous: false, count: 1 };
+  if (scope && (scope.ref || scope.within)) {
+    scopeResult.requested = true;
+    let scopeMatches: Element[] = [];
+    if (scope.ref) {
+      const found = registry.byRef.get(scope.ref)?.deref();
+      scopeMatches = found && found.isConnected ? [found] : [];
+    } else if (scope.within) {
+      const value = scope.within;
+      const roleMatch = /^role:(.+)$/.exec(value);
+      const nameMatch = /^name:(.+)$/.exec(value);
+      if (value === "main") scopeMatches = Array.from(document.querySelectorAll("main"));
+      else if (value === "aside") scopeMatches = Array.from(document.querySelectorAll("aside"));
+      else if (value === "dialog")
+        scopeMatches = Array.from(document.querySelectorAll('dialog,[role="dialog"]'));
+      else if (roleMatch)
+        scopeMatches = Array.from(
+          document.querySelectorAll(`[role="${roleMatch[1]!.replace(/"/g, '\\"')}"]`)
+        );
+      else if (nameMatch) {
+        const target = nameMatch[1]!.trim().toLowerCase();
+        scopeMatches = Array.from(
+          document.querySelectorAll("main,aside,nav,header,footer,section,article,dialog,[role],[aria-label]")
+        ).filter((element) => accessibleScopeName(element).toLowerCase() === target);
+      }
+    }
+    scopeResult.count = scopeMatches.length;
+    scopeResult.matched = scopeMatches.length === 1;
+    scopeResult.ambiguous = scopeMatches.length > 1;
+    if (scopeResult.matched) scopeRoot = scopeMatches[0]!;
+  }
+  const textResult: RealmTextResult | undefined =
+    textOnly && scopeResult.matched
+      ? (() => {
+          const raw = (scopeRoot as HTMLElement).innerText ?? scopeRoot.textContent ?? "";
+          const normalized = raw.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+          const truncated = normalized.length > textMaxChars;
+          return { text: truncated ? normalized.slice(0, textMaxChars) : normalized, truncated };
+        })()
+      : undefined;
   const candidates: Array<{ element: HTMLElement; shadowContext: string[]; depth: number }> = [];
   const allElements: HTMLElement[] = [];
   type Pending = { element: HTMLElement; shadowContext: string[]; depth: number };
@@ -64,7 +138,7 @@ export function collectRealm({ full, legacyRefs, maxRecords = 2_000, maxWork = 5
     for (let index = selected - 1; index >= 0; index -= 1)
       pending.push({ element: children.item(index) as HTMLElement, shadowContext, depth });
   };
-  pushChildrenReverse(document.documentElement?.children ?? document.children, [], 0);
+  if (!scopeResult.requested || scopeResult.matched) pushChildrenReverse(scopeRoot.children, [], 0);
   while (pending.length > 0 && allElements.length < maxWork) {
     const current = pending.pop()!;
     const { element, shadowContext, depth } = current;
@@ -186,5 +260,6 @@ export function collectRealm({ full, legacyRefs, maxRecords = 2_000, maxWork = 5
   });
   return { realmToken: registry.token, url: location.href, title: document.title,
     viewport: { width: innerWidth, height: innerHeight }, focusedRef: records.find((record) => record.focused)?.ref || null,
-    records, truncated: traversalTruncated || candidates.length > maxRecords || allElements.length >= maxWork };
+    records, truncated: traversalTruncated || candidates.length > maxRecords || allElements.length >= maxWork,
+    scope: scopeResult, text: textResult };
 }
