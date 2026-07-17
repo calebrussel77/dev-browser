@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
+import { pageLeases } from "./sessions.js";
 
 const browserName = "react-input";
 
@@ -32,6 +33,8 @@ const FIXTURE_HTML = `<!doctype html>
     <button id="composer-note-send" disabled>Send note</button>
 
     <input id="truncating-input" aria-label="Truncating input" maxlength="5">
+
+    <input id="secret-composer" type="password" aria-label="Secret composer">
 
     <input id="disabled-composer-input" aria-label="Disabled composer input">
     <button id="disabled-composer-send" disabled aria-label="Disabled composer send">Send disabled</button>
@@ -190,6 +193,41 @@ describe.sequential("react-safe exact text entry", () => {
     await expect(page.locator("#composer-send").isDisabled()).resolves.toBe(true);
   });
 
+  it("appends deterministically at the end with clear: false on input and textarea", async () => {
+    const { page, pageName } = await freshPage();
+    const input = (await readElements(pageName)).find((element) => element.name === "Composer input")!;
+    await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: input.ref, text: "Hello", clear: true, delayMs: 0 })
+    );
+
+    const inputAgain = (await readElements(pageName)).find((element) => element.name === "Composer input")!;
+    const appended = await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: inputAgain.ref, text: " world", clear: false, delayMs: 0 })
+    );
+    expect(appended.inputStrategy).toBe("native-setter");
+    expect(appended.verifiedValue).toBe("Hello world");
+    await expect(page.locator("#composer-input").inputValue()).resolves.toBe("Hello world");
+    await expect(page.locator("#composer-send").isDisabled()).resolves.toBe(false);
+
+    const textarea = (await readElements(pageName)).find((element) => element.name === "Composer textarea")!;
+    await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: textarea.ref, text: "Line one", clear: true, delayMs: 0 })
+    );
+    const textareaAgain = (await readElements(pageName)).find(
+      (element) => element.name === "Composer textarea"
+    )!;
+    const appendedTextarea = await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: textareaAgain.ref, text: "\nLine two", clear: false, delayMs: 0 })
+    );
+    expect(appendedTextarea.verifiedValue).toBe("Line one\nLine two");
+    await expect(page.locator("#composer-textarea").inputValue()).resolves.toBe("Line one\nLine two");
+    await expect(page.locator("#composer-textarea-send").isDisabled()).resolves.toBe(false);
+  });
+
   it("enters exact accented multiline text into a controlled textarea", async () => {
     const { page, pageName } = await freshPage();
     const field = (await readElements(pageName)).find((element) => element.name === "Composer textarea")!;
@@ -236,6 +274,69 @@ describe.sequential("react-safe exact text entry", () => {
     await expect(page.locator("#composer-note").innerText()).resolves.toBe(text);
     await expect(page.locator("#composer-note-send").isDisabled()).resolves.toBe(false);
     await expect(page.evaluate(() => (window as unknown as { __noteState: string }).__noteState)).resolves.toBe(text);
+  });
+
+  it("rechecks leases between the contenteditable clear and insertText trusted inputs", async () => {
+    const { page, pageName } = await freshPage();
+    const setup = (await readElements(pageName)).find((element) => element.name === "Composer note")!;
+    await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: setup.ref, text: "Draft to be replaced", clear: true, delayMs: 0 })
+    );
+
+    // Contenteditable clear performs three trusted dispatches: mouse focus
+    // click, select-all+Backspace, insertText. Open a conflicting lease
+    // right before the third so the conflict arises BETWEEN the clear and
+    // the insert — it must be caught, not silently ridden through.
+    const field = (await readElements(pageName)).find((element) => element.name === "Composer note")!;
+    let dispatches = 0;
+    let lease: ReturnType<typeof pageLeases.open> | undefined;
+    try {
+      await expect(
+        executeInteractiveAction(
+          manager,
+          request(pageName, { kind: "type", ref: field.ref, text: "must-not-insert", clear: true, delayMs: 0 }),
+          {
+            beforeTrustedInput: () => {
+              dispatches += 1;
+              if (dispatches === 3) lease = pageLeases.open(browserName, pageName, 300);
+            },
+          }
+        )
+      ).rejects.toMatchObject({
+        code: "LEASE_CONFLICT",
+        details: {
+          attemptJournal: [
+            { inputMethod: "mouse", reason: "action-complete" },
+            { inputMethod: "keyboard", reason: "action-complete" },
+            { inputMethod: "keyboard", reason: "lease-conflict" },
+          ],
+        },
+      });
+    } finally {
+      if (lease) pageLeases.close(lease.sessionId);
+    }
+
+    // The clear ran (second dispatch) but the blocked insertText did not:
+    // the previous draft is gone (at most a residual <br> newline remains
+    // after clearing a contenteditable) and no new text was inserted.
+    const remaining = await page.locator("#composer-note").innerText();
+    expect(remaining.trim()).toBe("");
+    expect(remaining).not.toContain("must-not-insert");
+  });
+
+  it("redacts verifiedValue for password fields", async () => {
+    const { pageName } = await freshPage();
+    const secret = "hunter2-secret-value";
+    const field = (await readElements(pageName)).find((element) => element.name === "Secret composer")!;
+    const result = await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: field.ref, text: secret, clear: true, delayMs: 0 })
+    );
+
+    expect(result.inputStrategy).toBe("native-setter");
+    expect(result.verifiedValue).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it("returns typed INPUT_VALUE_MISMATCH instead of reporting success when the field rejects the value", async () => {

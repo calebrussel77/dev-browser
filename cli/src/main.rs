@@ -650,7 +650,7 @@ enum Command {
     },
     #[command(
         about = "Focus and type through trusted Playwright keyboard input",
-        long_about = "Focus an optional interactive ref with a real mouse click and type through page.keyboard. Use --clear to select and replace existing input or contenteditable text."
+        long_about = "Focus an optional interactive ref with a real mouse click and enter text with a React-safe, input-kind-specific strategy (native value setter for input/textarea, insertText for contenteditable, keyboard fallback otherwise); the entered value is reread and a mismatch fails with typed INPUT_VALUE_MISMATCH. Use --clear to replace existing input or contenteditable text; without --clear, input/textarea entry deterministically appends to the end of the existing value regardless of caret position. --delay applies only to the keyboard fallback strategy."
     )]
     Type {
         #[command(flatten)]

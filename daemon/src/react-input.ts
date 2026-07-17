@@ -12,9 +12,23 @@ import { AgentProtocolError } from "./agent-protocol.js";
  */
 export type InputStrategy = "native-setter" | "insert-text" | "keyboard";
 
+/**
+ * Wraps every discrete trusted browser input (a keyboard press, an
+ * insertText, or the setter+events evaluation) so the caller can revalidate
+ * leases / refs and journal each real input individually. Defaults to
+ * executing the input directly when the caller does not need that hook.
+ */
+export type TrustedInputDispatch = (input: () => Promise<void>) => Promise<void>;
+
 export interface EnterExactTextResult {
   strategy: InputStrategy;
-  verifiedValue: string;
+  /**
+   * The value/innerText reread from the live element after entry, verified
+   * to exactly match the expected text. Undefined for the "keyboard"
+   * fallback strategy, which has no site-agnostic value contract to reread
+   * and therefore reports the entry as unverified.
+   */
+  verifiedValue?: string;
 }
 
 export interface EnterExactTextOptions {
@@ -22,7 +36,9 @@ export interface EnterExactTextOptions {
   locator: Locator;
   text: string;
   clear: boolean;
+  /** Only applies to the "keyboard" fallback strategy's key-by-key typing. */
   delayMs?: number;
+  dispatch?: TrustedInputDispatch;
 }
 
 type ElementKind = "input" | "textarea" | "contenteditable" | "other";
@@ -92,14 +108,28 @@ async function applyNativeSetterValue(locator: Locator, nextValue: string): Prom
  * target using the input-kind-specific, React-safe strategy, then rereads
  * the live value/innerText to verify it matches exactly. Never reports
  * success on a mismatch: throws a typed INPUT_VALUE_MISMATCH instead.
+ *
+ * Semantics with `clear: false` on input/textarea are a deterministic
+ * append-at-end: the new value is `previous value + text`, independent of
+ * any caret position (unlike interactive typing, which inserts wherever the
+ * cursor happens to be). This keeps the exact-value verification contract
+ * well-defined. Contenteditable without `clear` likewise collapses the
+ * selection to the end before inserting, so it appends too.
+ *
+ * Every discrete trusted browser input runs through `options.dispatch`
+ * (when provided) so the caller can revalidate leases/refs and journal each
+ * real input individually — the contenteditable clear path performs two
+ * separate trusted inputs (select-all + Backspace, then insertText) and
+ * each goes through its own dispatch.
  */
 export async function enterExactText(options: EnterExactTextOptions): Promise<EnterExactTextResult> {
+  const dispatch: TrustedInputDispatch = options.dispatch ?? ((input) => input());
   const kind = await classifyElement(options.locator);
 
   if (kind === "input" || kind === "textarea") {
     const previous = await readControlValue(options.locator);
     const expected = options.clear ? options.text : previous + options.text;
-    await applyNativeSetterValue(options.locator, expected);
+    await dispatch(() => applyNativeSetterValue(options.locator, expected));
     const verifiedValue = await readControlValue(options.locator);
     if (verifiedValue !== expected) {
       throw new AgentProtocolError(
@@ -116,11 +146,16 @@ export async function enterExactText(options: EnterExactTextOptions): Promise<En
     await options.locator.evaluate((element) => (element as HTMLElement).focus());
     let previous = "";
     if (options.clear) {
-      await options.locator.evaluate((element) => {
-        const target = element as HTMLElement;
-        target.ownerDocument.getSelection()?.selectAllChildren(target);
+      // Select-all + Backspace is one discrete trusted input; the insertText
+      // below is a second one. Each gets its own dispatch so a lease
+      // conflict or stale ref arising between them is still caught.
+      await dispatch(async () => {
+        await options.locator.evaluate((element) => {
+          const target = element as HTMLElement;
+          target.ownerDocument.getSelection()?.selectAllChildren(target);
+        });
+        await options.page.keyboard.press("Backspace");
       });
-      await options.page.keyboard.press("Backspace");
     } else {
       previous = await readEditableText(options.locator);
       await options.locator.evaluate((element) => {
@@ -130,7 +165,7 @@ export async function enterExactText(options: EnterExactTextOptions): Promise<En
         selection?.collapseToEnd();
       });
     }
-    await options.page.keyboard.insertText(options.text);
+    await dispatch(() => options.page.keyboard.insertText(options.text));
     const verifiedValue = await readEditableText(options.locator);
     const expected = previous + options.text;
     if (verifiedValue !== expected) {
@@ -145,8 +180,8 @@ export async function enterExactText(options: EnterExactTextOptions): Promise<En
   }
 
   // Unrecognized element kind: no site-agnostic value/innerText contract to
-  // verify against, so keep the trusted keyboard fallback without asserting
-  // a mismatch.
-  await options.page.keyboard.type(options.text, { delay: options.delayMs });
-  return { strategy: "keyboard", verifiedValue: options.text };
+  // reread, so keep the trusted keyboard fallback and report the entry as
+  // unverified (verifiedValue stays undefined). delayMs applies here only.
+  await dispatch(() => options.page.keyboard.type(options.text, { delay: options.delayMs }));
+  return { strategy: "keyboard" };
 }

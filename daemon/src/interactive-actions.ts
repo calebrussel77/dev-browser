@@ -1405,17 +1405,34 @@ export async function executeInteractiveAction(
             // React-safe, input-kind-specific entry runs while the locator's
             // action-ref attribute is still attached (cleanup() below strips
             // it, so this must stay inside the try before cleanup runs).
-            await dispatchTypeInput("keyboard", async () => {
+            // Every discrete trusted input inside enterExactText goes through
+            // its own dispatchTypeInput so leases/refs are revalidated and
+            // journaled per real input (e.g. the contenteditable clear path
+            // is select-all+Backspace and insertText as separate dispatches).
+            try {
               const entry = await enterExactText({
                 page,
                 locator,
                 text: action.text,
                 clear: action.clear,
                 delayMs: action.delayMs,
+                dispatch: (input) => dispatchTypeInput("keyboard", input),
               });
               inputStrategy = entry.strategy;
               verifiedValue = entry.verifiedValue;
-            });
+            } catch (error) {
+              // Verification rereads happen outside the dispatch wrapper, so
+              // a mismatch is not yet journaled; attach the journal here.
+              // Dispatch-originated errors already carry their journal.
+              if (error instanceof AgentProtocolError && error.code === "INPUT_VALUE_MISMATCH") {
+                recordAttempt(
+                  journal,
+                  typeEntry("keyboard", "input-value-mismatch", new Date().toISOString())
+                );
+                throw withAttemptJournal(error, journal);
+              }
+              throw error;
+            }
           } finally {
             await cleanup();
           }

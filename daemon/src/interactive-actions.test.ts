@@ -783,7 +783,9 @@ describe.sequential("interactive Playwright actions", () => {
     ]);
     expect(result.inputStrategy).toBe("insert-text");
     expect(result.verifiedValue).toBe("Hello Naminsita");
-    expect(result.attemptJournal).toHaveLength(2);
+    // Three revalidated trusted dispatches: mouse focus click, contenteditable
+    // select-all+Backspace clear, then insertText.
+    expect(result.attemptJournal).toHaveLength(3);
   });
 
   it("writes a screenshot and returns its absolute path", async () => {
