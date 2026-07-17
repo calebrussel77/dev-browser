@@ -47,41 +47,41 @@ pub fn agent_schema() -> Value {
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
                 "navigate": { "required": ["url"], "optional": ["wait"] },
-                "back": { "required": [], "optional": ["wait"] },
-                "forward": { "required": [], "optional": ["wait"] },
-                "reload": { "required": [], "optional": ["wait"] },
+                "back": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
+                "forward": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
+                "reload": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "confirmToken:32..200 chars", "wait"] },
                 "read": { "required": [], "optional": ["limit:1..500", "depth:1..50"] },
                 "observe": { "required": [], "optional": ["full:boolean", "delta:boolean", "track:string", "maxNodes:1..1000", "maxChars:1..100000", "depth:1..50", "breadth:1..500", "continuation:string"] },
                 "find": { "required": [], "optional": ["query", "role", "name", "nameMode:exact|contains", "within", "near", "frame", "scope:visible|viewport|document", "states[]", "index", "limit:1..50"] },
-                "click": { "oneOf": [["ref"], ["x", "y"]], "optional": ["method:mouse|locator", "retry:never|safe|once", "fromState", "strictState", "expectText", "confirmToken", "wait"] },
-                "focus": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken"] },
-                "press": { "required": ["key"], "optional": ["ref", "fromState", "strictState", "confirmToken", "wait"] },
+                "click": { "oneOf": [["ref"], ["x>=0", "y>=0"]], "optional": ["method:mouse|locator (coordinates require mouse)", "retry:never|safe|once", "fromState", "strictState", "expectText", "waitForText", "confirmToken", "wait"] },
+                "focus": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "press": { "required": ["ref", "key:1..64 safe key chars"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "paste": { "required": ["ref", "text"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "scroll": { "oneOf": [["ref"], ["deltaX|deltaY"], ["direction", "pages"], ["until"]], "optional": ["maxSteps", "fromState", "strictState", "wait"] },
+                "scroll": { "oneOf": [["ref"], ["deltaX|deltaY:-100000..100000"], ["direction:up|down|left|right", "pages:1..50"], ["until:text:...|role:...", "maxSteps:1..50"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "select": { "required": ["ref"], "oneOf": [["value"], ["label"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "check": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "uncheck": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "hover": { "required": ["ref"], "optional": ["fromState", "strictState", "wait"] },
+                "hover": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "drag": { "required": ["from", "to"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "type": { "required": ["ref", "text"], "optional": ["clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
+                "type": { "required": ["text"], "optional": ["ref", "clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
                 "upload": { "required": ["ref", "file"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState"] },
-                "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState"] }
+                "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState", "confirmToken"] },
+                "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState", "confirmToken"] }
             }
         },
         "waitGrammar": {
             "spec": { "mode": "all|any", "timeoutMs": "1..120000", "conditions": "1..20 condition objects" },
             "conditions": {
-                "text": { "required": ["state:visible|hidden", "scope", "match:exact|contains|glob|safe-regex", "value"] },
+                "text": { "required": ["state:visible|hidden", "scope:body|dialog|toast", "match:exact|contains|glob|safe-regex", "value:1..2000 chars"] },
                 "url": { "required": ["match:exact|contains|glob|safe-regex", "value"] },
-                "ref": { "required": ["ref", "state:visible|hidden|enabled|disabled|checked|unchecked|focused|valueChanged|attributeChanged|stateChanged"], "optional": ["attribute", "expected"] },
+                "ref": { "required": ["ref", "state:attached|detached|visible|hidden|enabled|disabled|valueChanged|attributeChanged|stateChanged"], "optional": ["attribute (required for attributeChanged)", "expected"] },
                 "dialog": { "required": ["state:opened|closed"] },
                 "toast": { "required": ["state:opened|closed"] },
                 "popup": { "required": [] }, "download": { "required": [] }, "fileChooser": { "required": [] },
-                "navigation": { "required": ["state:url|document|same-document"] },
-                "response": { "required": ["match", "value"], "optional": ["method", "status"] },
+                "navigation": { "required": ["state:navigation|document"] },
+                "response": { "required": ["match", "value"], "optional": ["method:1..20 chars", "status:100..599"] },
                 "failedRequest": { "required": ["match", "value"], "optional": ["method"] },
-                "networkIdle": { "required": ["specialized:true"], "optional": ["idleMs:0..10000"] }
+                "networkIdle": { "required": ["specialized:true"], "optional": ["idleMs:1..30000 (default 500)"] }
             }
         },
         "responseGrammar": {
@@ -157,6 +157,27 @@ mod tests {
                 .unwrap()
                 .contains(&json!(code)));
         }
+        assert_eq!(
+            schema["interactiveRequest"]["actionGrammar"]["press"]["required"],
+            json!(["ref", "key:1..64 safe key chars"])
+        );
+        assert_eq!(
+            schema["interactiveRequest"]["actionGrammar"]["type"]["required"],
+            json!(["text"])
+        );
+        let wait = &schema["waitGrammar"]["conditions"];
+        assert!(wait["ref"]["required"][1]
+            .as_str()
+            .unwrap()
+            .contains("attached|detached"));
+        assert_eq!(
+            wait["navigation"]["required"],
+            json!(["state:navigation|document"])
+        );
+        assert_eq!(
+            wait["networkIdle"]["optional"],
+            json!(["idleMs:1..30000 (default 500)"])
+        );
     }
 
     #[test]
