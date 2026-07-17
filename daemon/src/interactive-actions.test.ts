@@ -9,6 +9,7 @@ import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
 import { pageLeases } from "./sessions.js";
+import { redactSensitive } from "./redaction.js";
 import {
   startAgentReliabilityFixture,
   type AgentReliabilityFixture,
@@ -884,11 +885,12 @@ describe.sequential("interactive Playwright actions", () => {
     );
 
     expect(confirmed.confirmation?.confirmed).toBe(true);
-    expect(confirmed.confirmation?.text).toContain("Naminsita Bakayoko");
+    expect(confirmed.confirmation).toMatchObject({ expected: "[redacted]", text: "[redacted]" });
+    expect(JSON.stringify(confirmed.confirmation)).not.toContain("Naminsita Bakayoko");
 
     await expect(
       executeInteractiveAction(manager, request({ kind: "confirm", expectText: "Wrong Recipient" }))
-    ).rejects.toThrow(/Wrong Recipient/);
+    ).rejects.toMatchObject({ code: "CONFIRMATION_INVALID" });
   });
 
   it("guards the final click with the current confirmation text", async () => {
@@ -908,7 +910,50 @@ describe.sequential("interactive Playwright actions", () => {
           expectText: "Wrong Recipient",
         })
       )
-    ).rejects.toThrow(/Wrong Recipient/);
+    ).rejects.toMatchObject({ code: "CONFIRMATION_INVALID" });
+  });
+
+  it("issues a scoped v2 token, consumes it once immediately before input, and rejects hook races", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.setContent(`<div role="dialog">Send invitation to Naminsita Bakayoko <button id="send">Send</button></div><script>window.sent=0;send.onclick=()=>window.sent++</script>`);
+    const observed = await executeInteractiveAction(manager, {
+      ...request({ kind: "observe", full: true, delta: false, track: "confirmation", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }),
+      protocolVersion: 2,
+    });
+    const ref = elements(observed).find((element) => element.name === "Send")!.ref;
+    const confirmation = await executeInteractiveAction(manager, {
+      ...request({ kind: "confirm", ref, expectText: "Naminsita Bakayoko", fromState: observed.stateId }),
+      protocolVersion: 2,
+    });
+    expect(confirmation.confirmationToken).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(JSON.stringify(redactSensitive(confirmation, { allowConfirmationToken: true, secrets: ["Naminsita Bakayoko"] }))).not.toContain("Naminsita Bakayoko");
+    const guarded = { kind: "click" as const, ref, method: "locator" as const, fromState: confirmation.stateId!, confirmToken: confirmation.confirmationToken! };
+    await executeInteractiveAction(manager, { ...request(guarded), protocolVersion: 2 });
+    expect(await page.evaluate(() => (window as any).sent)).toBe(1);
+    await expect(executeInteractiveAction(manager, { ...request(guarded), protocolVersion: 2 })).rejects.toMatchObject({ code: "CONFIRMATION_INVALID" });
+    expect(await page.evaluate(() => (window as any).sent)).toBe(1);
+
+    const noRetry = await executeInteractiveAction(manager, {
+      ...request({ kind: "confirm", ref, expectText: "Naminsita Bakayoko", fromState: confirmation.stateId }),
+      protocolVersion: 2,
+    });
+    await expect(executeInteractiveAction(manager, {
+      ...request({
+        kind: "click", ref, method: "locator", fromState: noRetry.stateId!, confirmToken: noRetry.confirmationToken!, retry: "once",
+        wait: { mode: "all", timeoutMs: 80, conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "Never appears" }] },
+      }),
+      protocolVersion: 2,
+    })).rejects.toMatchObject({ code: "WAIT_TIMEOUT", details: { attemptJournal: [expect.objectContaining({ retryDecision: "stop" })] } });
+    expect(await page.evaluate(() => (window as any).sent)).toBe(2);
+
+    const fresh = await executeInteractiveAction(manager, {
+      ...request({ kind: "confirm", ref, expectText: "Naminsita Bakayoko", fromState: confirmation.stateId }),
+      protocolVersion: 2,
+    });
+    await expect(executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref, method: "locator", fromState: fresh.stateId!, confirmToken: fresh.confirmationToken! }),
+      protocolVersion: 2,
+    }, { beforeTrustedInput: () => page.locator("#send").evaluate((button) => button.replaceWith(button.cloneNode(true))) })).rejects.toMatchObject({ code: "STALE_REF" });
   });
 
   it("rejects stale v2 decisions before trusted input and allows unrelated attributes", async () => {

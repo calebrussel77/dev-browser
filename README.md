@@ -60,14 +60,18 @@ dev-browser --connect find --page TARGET_ID --role button --name "Connect" --nam
 dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
 
 # Verify the recipient before the final irreversible action
-dev-browser --connect confirm --page TARGET_ID --expect "Naminsita Bakayoko" --shot confirm.png
+dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
 
 # Focus and type through trusted mouse + keyboard input
 dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
 
 # The final click is blocked unless the current dialog still contains the expected recipient
-dev-browser --connect click --page TARGET_ID --ref R14 --expect-text "Naminsita Bakayoko" --shot sent.png
+dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190 --confirm-token TOKEN --shot sent.png
 ```
+
+Protocol v2 confirmation tokens are daemon-scoped, expire after 30 seconds, bind to the observed page/document/target/URL, and are burned on the first consumption attempt. Results, typed errors, waits, journals, popup/download/network metadata, and diagnostics use the same bounded secret redactor. `--expect-text` remains available for protocol v1 compatibility.
+
+An invalid, expired, reused, or out-of-scope confirmation token returns the stable `CONFIRMATION_INVALID` error and process exit status `8`.
 
 Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `find` always takes a fresh snapshot and accepts either the compatible natural query or combinable `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--scope`, repeated `--state`, and explicit last-resort `--index` filters. Results include exact match reasons, confidence, score gap, ambiguity, landmark, nearby context, frame, box, and actionability state. `click`/`type` return the refreshed snapshot and refs automatically. Refs persist while the same DOM element remains alive; if a link ref wraps a button, `click` reports and targets that interactive descendant. Ref actions share bounded visibility, stability, enabled-state, scrolling, and obstruction checks before trusted input. `click` reports URL, snapshot, dialog, and `aria-expanded` changes. With `--wait-for TEXT`, it polls for the expected UI and retries exactly once only when the first click produced no observable change; guarded `--expect-text` clicks are never retried. `click` uses trusted Playwright input and never `HTMLElement.click()`. Screenshot pixels, ref boxes, and direct `--xy X,Y` all use the same CSS-pixel coordinate space, even when device pixel ratio is not 1.
 

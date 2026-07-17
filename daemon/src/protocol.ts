@@ -5,6 +5,7 @@ import {
   AgentProtocolVersionSchema,
   type AgentError,
 } from "./agent-protocol.js";
+import { redactSensitive } from "./redaction.js";
 
 const RequestBaseSchema = z.object({
   id: z.string().min(1),
@@ -16,6 +17,7 @@ const StateGuardSchema = z.object({
     .regex(/^doc-\d+:\d+$/)
     .optional(),
   strictState: z.boolean().default(false),
+  confirmToken: z.string().min(32).max(200).regex(/^[A-Za-z0-9_-]+$/).optional(),
 });
 
 const WAIT_MATCH_MAX_LENGTH = 2_000;
@@ -284,6 +286,7 @@ const InteractiveActionSchema = z.union([
   StateGuardSchema.extend({
     kind: z.literal("confirm"),
     expectText: z.string().min(1).optional(),
+    ref: ScopedRefSchema.optional(),
   }),
   StateGuardSchema.extend({
     kind: z.literal("shot"),
@@ -309,6 +312,17 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
 }).superRefine((value, context) => {
   if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["action"], message: "paste cannot create screenshots or annotations" });
+  }
+  if (value.protocolVersion === 2 && value.action.kind === "confirm" && (!value.action.ref || !value.action.expectText))
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["action"], message: "v2 confirmation requires ref and expectText" });
+  if ("confirmToken" in value.action && value.action.confirmToken) {
+    const trustedRefAction =
+      (value.action.kind === "click" && "ref" in value.action) ||
+      (value.action.kind === "type" && Boolean(value.action.ref)) ||
+      ["focus", "press", "paste", "select", "check", "uncheck", "hover", "drag", "upload"].includes(value.action.kind) ||
+      (value.action.kind === "scroll" && Boolean(value.action.ref));
+    if (value.protocolVersion !== 2 || !trustedRefAction || !value.action.fromState)
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["action", "confirmToken"], message: "confirmToken requires a v2 trusted ref action and fromState" });
   }
 });
 
@@ -532,5 +546,8 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
 }
 
 export function serialize(message: Response): string {
-  return `${JSON.stringify(ResponseSchema.parse(message))}\n`;
+  const parsed = ResponseSchema.parse(message);
+  const allowConfirmationToken = parsed.type === "result" &&
+    Boolean(parsed.data && typeof parsed.data === "object" && (parsed.data as { action?: unknown }).action === "confirm");
+  return `${JSON.stringify(redactSensitive(parsed, { allowConfirmationToken }))}\n`;
 }

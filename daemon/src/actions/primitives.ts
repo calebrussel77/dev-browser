@@ -18,7 +18,7 @@ export interface PrimitiveContext {
   action: PrimitiveAction;
   timeoutMs: number;
   resolve(ref: string, role?: "source" | "target"): Promise<ResolvedActionTarget>;
-  authorize(refs: string[]): Promise<void>;
+  authorize(refs: string[], targets: ResolvedActionTarget[]): Promise<void>;
 }
 export interface PrimitiveSummary {
   focusedRef?: string | null;
@@ -71,10 +71,10 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: method,
     sideEffects: emptyWaitEvents(), change: unchangedAttempt(), retryDecision: "stop", reason,
   });
-  const dispatch = async (method: InputMethod, refs: string[], input: () => Promise<void>) => {
+  const dispatch = async (method: InputMethod, refs: string[], input: () => Promise<void>, resolvedTargets: ResolvedActionTarget[] = []) => {
     const startedAt = new Date().toISOString();
     try {
-      await authorize(refs);
+      await authorize(refs, resolvedTargets);
       await input();
       recordAttempt(journal, { ...entry(method, "action-complete"), startedAt }, journalContext);
     } catch (error) {
@@ -104,7 +104,7 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
       const target = await resolve(action.ref);
       journalContext = attemptFrameContext(action.ref, target);
       try {
-        await dispatch("locator", [action.ref], () => target.locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }));
+        await dispatch("locator", [action.ref], () => target.locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }), [target]);
         targetMetadata = [actionTargetMetadata(target, "locator")];
       } finally { await target.cleanup(); }
     } else if (action.until) {
@@ -139,33 +139,33 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
   journalContext = attemptFrameContext(refs[0] ?? null, target);
   try {
     if (action.kind === "focus") {
-      await dispatch("focus", refs, () => target.locator.focus({ timeout: timeoutMs }));
+      await dispatch("focus", refs, () => target.locator.focus({ timeout: timeoutMs }), targets);
       return complete({ focusedRef: target.actualRef }, targets, "focus");
     }
     if (action.kind === "press") {
-      await dispatch("keyboard", refs, () => target.locator.press(action.key, { timeout: timeoutMs }));
+      await dispatch("keyboard", refs, () => target.locator.press(action.key, { timeout: timeoutMs }), targets);
       return complete({ focusedRef: target.actualRef, pressed: { ref: target.actualRef, key: action.key } }, targets, "keyboard");
     }
     if (action.kind === "paste") {
-      await dispatch("focus", refs, () => target.locator.focus({ timeout: timeoutMs }));
-      await dispatch("keyboard", refs, () => page.keyboard.insertText(action.text));
+      await dispatch("focus", refs, () => target.locator.focus({ timeout: timeoutMs }), targets);
+      await dispatch("keyboard", refs, () => page.keyboard.insertText(action.text), targets);
       return complete({ focusedRef: target.actualRef, pasted: { ref: target.actualRef, characters: Array.from(action.text).length, redacted: true } }, targets, "keyboard");
     }
     if (action.kind === "select") {
       let chosen: string[] = [];
-      await dispatch("select", refs, async () => { chosen = await target.locator.selectOption(action.value !== undefined ? { value: action.value } : { label: action.label! }, { timeout: timeoutMs }); });
+      await dispatch("select", refs, async () => { chosen = await target.locator.selectOption(action.value !== undefined ? { value: action.value } : { label: action.label! }, { timeout: timeoutMs }); }, targets);
       const label = await target.locator.locator("option:checked").textContent() ?? "";
       return complete({ selected: { ref: target.actualRef, value: chosen[0] ?? "", label } }, targets, "select");
     }
     if (action.kind === "check" || action.kind === "uncheck") {
-      await dispatch(action.kind, refs, () => target.locator[action.kind]({ timeout: timeoutMs }));
+      await dispatch(action.kind, refs, () => target.locator[action.kind]({ timeout: timeoutMs }), targets);
       return complete({ checked: { ref: target.actualRef, checked: await target.locator.isChecked() } }, targets, action.kind);
     }
     if (action.kind === "hover") {
-      await dispatch("hover", refs, () => target.locator.hover({ timeout: timeoutMs }));
+      await dispatch("hover", refs, () => target.locator.hover({ timeout: timeoutMs }), targets);
       return complete({ hovered: { ref: target.actualRef } }, targets, "hover");
     }
-    await dispatch("drag", refs, () => target.locator.dragTo(targets[1]!.locator, { timeout: timeoutMs }));
+    await dispatch("drag", refs, () => target.locator.dragTo(targets[1]!.locator, { timeout: timeoutMs }), targets);
     return complete({ dragged: { from: target.actualRef, to: targets[1]!.actualRef, method: "dragTo" } }, targets, "drag");
   } finally {
     await Promise.allSettled(targets.map((resolved) => resolved.cleanup()));

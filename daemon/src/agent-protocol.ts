@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redactSensitive } from "./redaction.js";
 
 export const AGENT_PROTOCOL_VERSION = 2 as const;
 export const AgentProtocolVersionSchema = z.union([z.literal(1), z.literal(2)]);
@@ -23,6 +24,7 @@ export const AgentErrorCodeSchema = z.enum([
   "RENDERER_UNRESPONSIVE",
   "DAEMON_VERSION_MISMATCH",
   "PROTOCOL_VERSION_MISMATCH",
+  "CONFIRMATION_INVALID",
 ]);
 
 export type AgentErrorCode = z.infer<typeof AgentErrorCodeSchema>;
@@ -80,7 +82,8 @@ export class AgentProtocolError extends Error {
   ) {
     super(message);
     this.name = "AgentProtocolError";
-    const parsed = AgentErrorSchema.parse({ code, message, recoverable, ...options });
+    const parsed = AgentErrorSchema.parse(redactSensitive({ code, message, recoverable, ...options }));
+    this.message = parsed.message;
     this.code = parsed.code;
     this.recoverable = parsed.recoverable;
     this.details = parsed.details;
@@ -113,7 +116,7 @@ export function toAgentError(
   const typed = AgentErrorSchema.safeParse(error);
   if (typed.success) return typed.data;
 
-  const rawMessage = error instanceof Error ? error.message : String(error);
+  const rawMessage = redactSensitive(error instanceof Error ? error.message : String(error)) as string;
 
   return AgentErrorSchema.parse({
     code: fallbackCode,
@@ -153,7 +156,7 @@ export function buildInteractiveSuccess(input: {
   action: string;
   result: Record<string, unknown>;
 }): InteractiveSuccess {
-  return InteractiveSuccessSchema.parse({
+  return InteractiveSuccessSchema.parse(redactSensitive({
     ...input.result,
     protocolVersion: AGENT_PROTOCOL_VERSION,
     ok: true,
@@ -161,7 +164,7 @@ export function buildInteractiveSuccess(input: {
     browser: input.browser,
     page: input.page,
     action: input.action,
-  });
+  }, { allowConfirmationToken: input.action === "confirm" }));
 }
 
 export function buildInteractiveFailure(input: {
@@ -171,7 +174,7 @@ export function buildInteractiveFailure(input: {
   action?: string;
   error: unknown;
 }): InteractiveFailure {
-  return InteractiveFailureSchema.parse({
+  return InteractiveFailureSchema.parse(redactSensitive({
     protocolVersion: AGENT_PROTOCOL_VERSION,
     ok: false,
     requestId: input.requestId,
@@ -179,7 +182,7 @@ export function buildInteractiveFailure(input: {
     page: input.page,
     action: input.action,
     error: toAgentError(input.error),
-  });
+  }));
 }
 
 export function parseInteractiveSuccess(value: unknown): InteractiveSuccess {
@@ -207,5 +210,6 @@ export function agentErrorExitCode(code: AgentErrorCode): number {
   if (code === "WAIT_TIMEOUT") return 4;
   if (code === "LEASE_CONFLICT") return 5;
   if (code === "DOWNLOAD_FAILED") return 7;
+  if (code === "CONFIRMATION_INVALID") return 8;
   return 6;
 }

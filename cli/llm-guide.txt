@@ -25,9 +25,9 @@ LLM USAGE GUIDE:
     dev-browser --connect read --page TARGET_ID --shot before.png
     dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
     dev-browser --connect click --page TARGET_ID --ref R12 --wait-for "Add a note" --shot modal.png
-    dev-browser --connect confirm --page TARGET_ID --expect "Naminsita Bakayoko" --shot confirm.png
+    dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
     dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
-    dev-browser --connect click --page TARGET_ID --ref R14 --expect-text "Naminsita Bakayoko" --shot sent.png
+    dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190 --confirm-token TOKEN --shot sent.png
 
     `read` returns the accessibility snapshot plus stable refs with role, name,
     visibility, viewport coordinates, and main/aside/dialog landmark paths.
@@ -48,8 +48,11 @@ LLM USAGE GUIDE:
     available image-viewing tool before the next consequential action. Screenshot
     pixels, ref boxes, and `--xy X,Y` are all CSS pixels, regardless of DPR. Refs
     remain valid while the same DOM element survives; use fresh returned refs.
-    Before irreversible actions, run `confirm --expect RECIPIENT`, then protect
-    the final click with the same `--expect-text RECIPIENT` value.
+    Before irreversible actions, run `confirm --ref REF --expect RECIPIENT`, then
+    consume its short-lived single-use token on the final ref action with
+    `--from-state STATE --confirm-token TOKEN`. `--expect-text` remains v1 compatibility.
+    Invalid, expired, reused, or out-of-scope tokens return
+    `CONFIRMATION_INVALID` with process exit status 8.
 
   Quick inspection:
     dev-browser --connect <<'EOF'

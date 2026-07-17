@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { parseRequest } from "./protocol.js";
+import { parseRequest, serialize } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("redacts every serialized response while revealing only the issued confirmation token field", () => {
+    const token = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    const expected = "recipient-secret";
+    const output = serialize({ id: "confirm", type: "result", data: {
+      action: "confirm", confirmationToken: token, expectedText: expected,
+      url: `https://example.test/?access_token=${expected}`,
+      title: `Copied ${expected}`,
+    } });
+    expect(output).toContain(token);
+    expect(output).not.toContain(expected);
+    expect(output).toContain("[redacted]");
+  });
   it("accepts scoped frame refs in actions and typed waits", () => {
     const parsed = parseRequest(JSON.stringify({
       id: "frame-ref", type: "interactive", protocolVersion: 2,
@@ -247,6 +259,28 @@ describe("interactive request protocol", () => {
         },
       });
     }
+  });
+
+  it("parses scoped v2 confirmation issuance and token consumption while preserving v1 expect-text", () => {
+    const issue = parseRequest(JSON.stringify({
+      id: "confirm-v2", type: "interactive", protocolVersion: 2, browser: "daily", page: "checkout",
+      action: { kind: "confirm", ref: "F2:R8", expectText: "Recipient", fromState: "doc-7:9" },
+    }));
+    expect(issue).toMatchObject({ success: true, request: { action: { kind: "confirm", ref: "F2:R8", expectText: "Recipient", fromState: "doc-7:9" } } });
+    const consume = parseRequest(JSON.stringify({
+      id: "click-v2", type: "interactive", protocolVersion: 2,
+      action: { kind: "click", ref: "F2:R8", method: "locator", fromState: "doc-7:10", confirmToken: "a".repeat(32) },
+    }));
+    expect(consume).toMatchObject({ success: true, request: { action: { kind: "click", confirmToken: "a".repeat(32), retry: "never" } } });
+    expect(parseRequest(JSON.stringify({
+      id: "invalid-token", type: "interactive", protocolVersion: 2,
+      action: { kind: "click", x: 1, y: 2, confirmToken: "a".repeat(32), fromState: "doc-7:10" },
+    }))).toMatchObject({ success: false });
+    const legacy = parseRequest(JSON.stringify({
+      id: "click-v1", type: "interactive", protocolVersion: 1,
+      action: { kind: "click", ref: "R8", expectText: "Recipient" },
+    }));
+    expect(legacy).toMatchObject({ success: true, request: { action: { expectText: "Recipient" } } });
   });
 
   it("parses a coordinate click", () => {

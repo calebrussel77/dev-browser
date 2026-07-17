@@ -103,4 +103,25 @@ describe("agent protocol v2", () => {
     expect(error.code).toBe("RENDERER_UNRESPONSIVE");
     expect(error.message).toHaveLength(4_000);
   });
+
+  it("stores the redacted error message after cross-field discovery", () => {
+    const error = new AgentProtocolError("RENDERER_UNRESPONSIVE", "Failure supersecret", false, {
+      details: { token: "supersecret" },
+    });
+    expect(error.message).toBe("Failure [redacted]");
+    expect(JSON.stringify(error.toAgentError())).not.toContain("supersecret");
+  });
+
+  it("preserves required envelope controls when a result exceeds discovery bounds", () => {
+    const envelope = buildInteractiveSuccess({
+      requestId: "observe-large",
+      browser: "default",
+      page: "main",
+      action: "observe",
+      result: {
+        entries: Array.from({ length: 2_001 }, (_, index) => ({ token: `secret-${index}` })),
+      },
+    });
+    expect(envelope).toMatchObject({ protocolVersion: 2, ok: true, action: "observe" });
+  });
 });

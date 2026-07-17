@@ -2,6 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { confirmationTokens } from "./confirmation-tokens.js";
 
 import {
   SelectiveCdpTransport,
@@ -446,6 +447,7 @@ export class BrowserManager {
     }
 
     this.browsers.delete(name);
+    confirmationTokens.reset();
     entry.pages.clear();
 
     try {

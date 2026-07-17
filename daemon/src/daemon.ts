@@ -7,6 +7,7 @@ import {
   agentErrorExitCode,
   buildInteractiveFailure,
   buildInteractiveSuccess,
+  toAgentError,
 } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
@@ -30,6 +31,7 @@ import {
 import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
+import { redactSensitive } from "./redaction.js";
 
 const BASE_DIR = getDevBrowserBaseDir();
 const SOCKET_PATH = getDaemonEndpoint();
@@ -253,13 +255,20 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
         success: true,
       });
     } catch (error) {
+      const action = request.action;
+      const secrets = [
+        action.kind === "confirm" || action.kind === "click" ? action.expectText : undefined,
+        action.kind === "paste" ? action.text : undefined,
+        action.kind === "type" ? action.text : undefined,
+        "confirmToken" in action ? action.confirmToken : undefined,
+      ].filter((value): value is string => Boolean(value));
       if (request.protocolVersion === 2) {
         const failure = buildInteractiveFailure({
           requestId: request.id,
           browser: request.browser,
           page: request.page,
           action: request.action.kind,
-          error,
+          error: redactSensitive(toAgentError(error), { secrets }),
         });
         await writeMessage(socket, {
           id: request.id,
@@ -274,7 +283,7 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
       await writeMessage(socket, {
         id: request.id,
         type: "error",
-        message: formatError(error),
+        message: redactSensitive(formatError(error), { secrets }) as string,
       });
     }
   });

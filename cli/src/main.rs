@@ -248,6 +248,13 @@ struct PageActionArgs {
 
     #[arg(long, value_name = "SESSION_ID")]
     session: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Consume a scoped single-use confirmation token immediately before trusted input"
+    )]
+    confirm_token: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -659,8 +666,10 @@ enum Command {
     Confirm {
         #[command(flatten)]
         output: PageActionArgs,
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
+        ref_id: String,
         #[arg(long, value_name = "TEXT")]
-        expect: Option<String>,
+        expect: String,
     },
     #[command(
         about = "Save a page screenshot and return its absolute PNG path",
@@ -1069,11 +1078,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
             apply_wait(&mut action, wait)?;
             run_page_action(&cli, output, action)
         }
-        Some(Command::Confirm { output, expect }) => {
-            let mut action = json!({ "kind": "confirm" });
-            if let Some(expect) = expect {
-                action["expectText"] = Value::String(expect.clone());
-            }
+        Some(Command::Confirm {
+            output,
+            ref_id,
+            expect,
+        }) => {
+            let action = json!({ "kind": "confirm", "ref": ref_id, "expectText": expect });
             run_page_action(&cli, output, action)
         }
         Some(Command::Shot {
@@ -1247,6 +1257,9 @@ fn run_page_action(
         output.from_state.as_deref(),
         output.strict_state,
     );
+    if let Some(confirm_token) = &output.confirm_token {
+        action["confirmToken"] = Value::String(confirm_token.clone());
+    }
     run_interactive(
         cli,
         &output.target.page,
@@ -1430,6 +1443,7 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
         Some("WAIT_TIMEOUT") => 4,
         Some("LEASE_CONFLICT") => 5,
         Some("DOWNLOAD_FAILED") => 7,
+        Some("CONFIRMATION_INVALID") => 8,
         Some(
             "PAGE_CLOSED"
             | "FRAME_DETACHED"
@@ -1601,6 +1615,7 @@ mod tests {
             ("CDP_ATTACH_FAILED", 6),
             ("PROTOCOL_VERSION_MISMATCH", 6),
             ("DOWNLOAD_FAILED", 7),
+            ("CONFIRMATION_INVALID", 8),
         ];
 
         for (code, expected) in cases {
@@ -2073,6 +2088,41 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn parses_scoped_confirmation_issue_and_consumption() {
+        let confirm = Cli::try_parse_from([
+            "dev-browser",
+            "confirm",
+            "--page",
+            "checkout",
+            "--ref",
+            "F2:R8",
+            "--expect",
+            "Naminsita Bakayoko",
+        ])
+        .unwrap();
+        assert!(
+            matches!(confirm.command, Some(Command::Confirm { ref ref_id, ref expect, .. }) if ref_id == "F2:R8" && expect == "Naminsita Bakayoko")
+        );
+
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--page",
+            "checkout",
+            "--ref",
+            "F2:R8",
+            "--from-state",
+            "doc-7:10",
+            "--confirm-token",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+        ])
+        .unwrap();
+        assert!(
+            matches!(click.command, Some(Command::Click { ref output, .. }) if output.confirm_token.as_deref() == Some("abcdefghijklmnopqrstuvwxyzABCDEF"))
+        );
     }
 
     #[test]

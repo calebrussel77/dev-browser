@@ -53,6 +53,8 @@ import {
 import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
 import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
+import { confirmationTokens, type ConfirmationScope } from "./confirmation-tokens.js";
+import { redactSensitive } from "./redaction.js";
 
 export type InteractiveElement = PerceptionElement;
 
@@ -97,9 +99,14 @@ export interface InteractiveResult {
   targets?: ActionTargetMetadata[];
   confirmation?: {
     confirmed: boolean;
-    expected: string | null;
-    text: string;
+    expected?: "[redacted]" | null;
+    text?: "[redacted]";
+    issuedAt?: string;
+    expiresAt?: string;
+    ref?: string;
+    actualRef?: string;
   };
+  confirmationToken?: string;
   screenshotPath?: string;
   artifacts?: VisualArtifacts;
   coordinateSpace?: {
@@ -360,11 +367,46 @@ async function readConfirmationText(page: Page): Promise<string> {
 async function requireExpectedText(page: Page, expected: string): Promise<string> {
   const text = await readConfirmationText(page);
   if (!normalizeText(text).includes(normalizeText(expected))) {
-    throw new Error(
-      `Confirmation text does not contain expected recipient/text "${expected}". Current text: ${text.slice(0, 500)}`
+    throw new AgentProtocolError(
+      "CONFIRMATION_INVALID",
+      "Current confirmation text does not match the expected recipient or action",
+      true
     );
   }
   return text;
+}
+
+function confirmationScope(
+  request: InteractiveRequest,
+  page: Page,
+  resolved: ResolvedActionTarget,
+  expectedText: string,
+  confirmationText: string,
+  stateId: string
+): ConfirmationScope {
+  return {
+    browser: request.browser,
+    pageName: request.page,
+    page,
+    documentId: stateId.split(":", 1)[0]!,
+    stateId,
+    originalRef: resolved.originalRef,
+    resolvedRef: resolved.actualRef,
+    targetFingerprint: JSON.stringify({
+      actualRef: resolved.actualRef,
+      resolvedBy: resolved.resolvedBy,
+      actual: resolved.actual,
+      frameId: resolved.frameId,
+      framePath: resolved.framePath,
+      shadowContext: resolved.shadowContext,
+    }),
+    frameId: resolved.frameId ?? "F0",
+    framePath: resolved.framePath ?? ["F0"],
+    shadowContext: resolved.shadowContext ?? [],
+    expectedText,
+    confirmationText,
+    url: page.url(),
+  };
 }
 
 function automaticScreenshotName(action: string): string {
@@ -564,6 +606,7 @@ export async function executeInteractiveAction(
     action: action.kind,
     page: request.page,
   };
+  const sensitiveValues: string[] = [];
 
   const authorizeTrustedMutation = async () => {
     await hooks.beforeTrustedInput?.();
@@ -740,6 +783,13 @@ export async function executeInteractiveAction(
         });
         await validateDecisionRefs([action.ref]);
         pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+        if (action.confirmToken) {
+          if (!action.fromState)
+            throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
+          confirmationTokens.consume(action.confirmToken, confirmationScope(
+            request, page, resolved, "", await readConfirmationText(page), action.fromState
+          ));
+        }
         await resolved.locator.setInputFiles({
           name: controlled.filename,
           mimeType: "application/octet-stream",
@@ -855,6 +905,8 @@ export async function executeInteractiveAction(
     case "click": {
       const openedPopups: Page[] = [];
       const startedDownloads: Download[] = [];
+      if (action.confirmToken && !("ref" in action))
+        throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation tokens require a ref target", true);
       if (action.expectText) {
         await requireExpectedText(page, action.expectText);
       }
@@ -862,9 +914,20 @@ export async function executeInteractiveAction(
       const revalidateClick = async () => {
         await validateDecisionRefs(["ref" in action ? action.ref : undefined]);
       };
-      const prepareClickInput = async () => {
+      let confirmationConsumed = false;
+      const prepareClickInput = async (resolved?: ResolvedActionTarget) => {
         await hooks.beforeTrustedInput?.();
         await revalidateClick();
+        pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+        if (action.confirmToken && !confirmationConsumed) {
+          if (!resolved || !action.fromState)
+            throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
+          const confirmationText = await readConfirmationText(page);
+          confirmationTokens.consume(action.confirmToken, confirmationScope(
+            request, page, resolved, "", confirmationText, action.fromState
+          ));
+          confirmationConsumed = true;
+        }
       };
       let clickFrameContext: AttemptJournalEntry["frameContext"] = attemptFrameContext("ref" in action ? action.ref : null);
       const clickOnce = async () => {
@@ -888,12 +951,10 @@ export async function executeInteractiveAction(
           };
           try {
             if (action.method === "locator") {
-              await prepareClickInput();
-              pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+              await prepareClickInput(resolved);
               await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
             } else {
-              await prepareClickInput();
-              pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+              await prepareClickInput(resolved);
               await page.mouse.click(point.x, point.y);
             }
           } finally {
@@ -913,7 +974,6 @@ export async function executeInteractiveAction(
           result.targets = [actionTargetMetadata(resolved, action.method)];
         } else {
           await prepareClickInput();
-          pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
           await page.mouse.click(action.x, action.y);
           result.clicked = {
             ref: null,
@@ -1075,7 +1135,7 @@ export async function executeInteractiveAction(
           const decision = retryDecision({
             policy,
             attempt,
-            guarded: Boolean(action.expectText),
+            guarded: Boolean(action.expectText || action.confirmToken),
             irreversibleIntent,
             sideEffects,
             change,
@@ -1134,6 +1194,7 @@ export async function executeInteractiveAction(
     case "type": {
       const journal: AttemptJournalEntry[] = [];
       let resolvedTypeTarget: ResolvedActionTarget | undefined;
+      let typeConfirmationConsumed = false;
       const typeEntry = (
         method: AttemptJournalEntry["inputMethod"],
         reason: string,
@@ -1157,6 +1218,14 @@ export async function executeInteractiveAction(
           await hooks.beforeTrustedInput?.();
           await validateDecisionRefs([action.ref]);
           pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+          if (action.confirmToken && !typeConfirmationConsumed) {
+            if (!resolvedTypeTarget || !action.fromState)
+              throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
+            confirmationTokens.consume(action.confirmToken, confirmationScope(
+              request, page, resolvedTypeTarget, "", await readConfirmationText(page), action.fromState
+            ));
+            typeConfirmationConsumed = true;
+          }
           await input();
           recordAttempt(journal, typeEntry(method, "action-complete", startedAt));
         } catch (error) {
@@ -1176,6 +1245,10 @@ export async function executeInteractiveAction(
             legacyRefs: protocolVersion === 1,
           });
           resolvedTypeTarget = resolved;
+          if (await resolved.locator.evaluate((element) =>
+            element instanceof HTMLInputElement &&
+            (element.type === "password" || /password|secret|token|credential/i.test(element.autocomplete || element.name || element.id))
+          ).catch(() => false)) sensitiveValues.push(action.text);
           const { box, cleanup } = resolved;
           try {
             await dispatchTypeInput("mouse", () =>
@@ -1235,6 +1308,7 @@ export async function executeInteractiveAction(
           : action.kind === "scroll"
             ? [action.ref]
             : [action.ref];
+      let primitiveConfirmationConsumed = false;
       const dispatch = async () => {
         await validateDecisionRefs(primitiveRefs);
         return executePrimitive({
@@ -1267,10 +1341,18 @@ export async function executeInteractiveAction(
               legacyRefs: protocolVersion === 1,
             });
           },
-          authorize: async (refs) => {
+          authorize: async (refs, targets) => {
             await hooks.beforeTrustedInput?.();
             await validateDecisionRefs(refs.length > 0 ? refs : [undefined]);
             pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
+            if (action.confirmToken && !primitiveConfirmationConsumed) {
+              if (!targets[0] || !action.fromState)
+                throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
+              confirmationTokens.consume(action.confirmToken, confirmationScope(
+                request, page, targets[0], "", await readConfirmationText(page), action.fromState
+              ));
+              primitiveConfirmationConsumed = true;
+            }
           },
         });
       };
@@ -1410,14 +1492,39 @@ export async function executeInteractiveAction(
     }
 
     case "confirm": {
-      const text = action.expectText
-        ? await requireExpectedText(page, action.expectText)
-        : await readConfirmationText(page);
-      result.confirmation = {
-        confirmed: action.expectText ? true : false,
-        expected: action.expectText ?? null,
-        text,
-      };
+      if (protocolVersion === 2) {
+        if (!action.expectText || !action.ref)
+          throw new AgentProtocolError("CONFIRMATION_INVALID", "Protocol v2 confirmation requires --ref and --expect", true);
+        await validateDecisionRefs([action.ref]);
+        const text = await requireExpectedText(page, action.expectText);
+        const perception = await perceive(page, {}, false);
+        applyPerception(result, perception, protocolVersion);
+        const resolved = await resolveRef(page, action.ref, {
+          pageName: request.page, timeoutMs: request.timeoutMs, scroll: false,
+          hitTest: false, applicability: "pointer", legacyRefs: false,
+        });
+        try {
+          const issued = confirmationTokens.issue(confirmationScope(
+            request, page, resolved, action.expectText, text, perception.stateId
+          ));
+          result.confirmationToken = issued.confirmationToken;
+          result.confirmation = {
+            confirmed: true,
+            issuedAt: issued.issuedAt,
+            expiresAt: issued.expiresAt,
+            ref: action.ref,
+            actualRef: resolved.actualRef,
+          };
+        } finally { await resolved.cleanup(); }
+      } else {
+        if (action.expectText) await requireExpectedText(page, action.expectText);
+        else await readConfirmationText(page);
+        result.confirmation = {
+          confirmed: Boolean(action.expectText),
+          expected: action.expectText ? "[redacted]" : null,
+          text: "[redacted]",
+        };
+      }
       break;
     }
 
@@ -1486,5 +1593,14 @@ export async function executeInteractiveAction(
       result.artifacts.annotatedScreenshot?.path ?? result.artifacts.screenshot?.path;
   }
 
-  return result;
+  const requestSecrets = [
+    action.kind === "confirm" || action.kind === "click" ? action.expectText : undefined,
+    action.kind === "paste" ? action.text : undefined,
+    "confirmToken" in action ? action.confirmToken : undefined,
+  ].filter((value): value is string => Boolean(value));
+  requestSecrets.push(...sensitiveValues);
+  return redactSensitive(result, {
+    allowConfirmationToken: action.kind === "confirm" && protocolVersion === 2,
+    secrets: requestSecrets,
+  }) as InteractiveResult;
 }
