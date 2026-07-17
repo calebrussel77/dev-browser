@@ -281,6 +281,22 @@ describe.sequential("visual artifacts", () => {
         screenshotName: `visual-tests/zoom-${Date.now()}.png`,
       });
       expect(result.screenshot!.coordinateSpace.zoom).toBeCloseTo(1.5, 1);
+      const png = await readFile(result.screenshot!.path);
+      const targetPixel = await page.evaluate(
+        async ({ url, x, y }) => {
+          const image = new Image();
+          image.src = url;
+          await image.decode();
+          const canvas = document.createElement("canvas");
+          canvas.width = image.width;
+          canvas.height = image.height;
+          const context = canvas.getContext("2d")!;
+          context.drawImage(image, 0, 0);
+          return Array.from(context.getImageData(Math.round(x), Math.round(y), 1, 1).data).slice(0, 3);
+        },
+        { url: `data:image/png;base64,${png.toString("base64")}`, x: target.box.x + 5, y: target.box.y + 5 }
+      );
+      expect(targetPixel).toEqual([0, 0, 255]);
       await page.mouse.click(target.box.x + target.box.width / 2, target.box.y + target.box.height / 2);
       await expect(page.locator("output").textContent()).resolves.toBe("clicks:1");
       await rm(result.screenshot!.path, { force: true });

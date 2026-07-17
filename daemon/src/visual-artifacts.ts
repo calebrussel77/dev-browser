@@ -136,11 +136,8 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return chunk;
 }
 
-function cropPng(
-  png: Buffer,
-  requested: { x: number; y: number; width: number; height: number }
-): Buffer {
-  const { width: sourceWidth, height: sourceHeight } = pngDimensions(png);
+function decodePng(png: Buffer): { header: Buffer; pixels: Buffer; width: number; height: number; bytesPerPixel: number } {
+  const { width, height } = pngDimensions(png);
   let offset = 8;
   let header: Buffer | undefined;
   const compressed: Buffer[] = [];
@@ -153,41 +150,68 @@ function cropPng(
     offset += 12 + length;
     if (type === "IEND") break;
   }
-  if (!header || header[8] !== 8 || header[12] !== 0) {
-    throw new Error("Unsupported PNG format for focused screenshot crop");
-  }
+  if (!header || header[8] !== 8 || header[12] !== 0) throw new Error("Unsupported PNG screenshot format");
   const bytesPerPixel = ({ 0: 1, 2: 3, 4: 2, 6: 4 } as Record<number, number>)[header[9]!];
-  if (!bytesPerPixel) throw new Error("Unsupported PNG color type for focused screenshot crop");
-
-  const stride = sourceWidth * bytesPerPixel;
+  if (!bytesPerPixel) throw new Error("Unsupported PNG screenshot color type");
+  const stride = width * bytesPerPixel;
   const filtered = inflateSync(Buffer.concat(compressed));
-  const pixels = Buffer.alloc(sourceHeight * stride);
+  const pixels = Buffer.alloc(height * stride);
   let inputOffset = 0;
-  for (let y = 0; y < sourceHeight; y += 1) {
+  for (let y = 0; y < height; y += 1) {
     const filter = filtered[inputOffset++]!;
     for (let x = 0; x < stride; x += 1) {
       const encoded = filtered[inputOffset++]!;
       const outputOffset = y * stride + x;
       const left = x >= bytesPerPixel ? pixels[outputOffset - bytesPerPixel]! : 0;
       const above = y > 0 ? pixels[outputOffset - stride]! : 0;
-      const upperLeft =
-        y > 0 && x >= bytesPerPixel ? pixels[outputOffset - stride - bytesPerPixel]! : 0;
-      const predictor =
-        filter === 0
-          ? 0
-          : filter === 1
-            ? left
-            : filter === 2
-              ? above
-              : filter === 3
-                ? Math.floor((left + above) / 2)
-                : filter === 4
-                  ? paeth(left, above, upperLeft)
-                  : -1;
+      const upperLeft = y > 0 && x >= bytesPerPixel ? pixels[outputOffset - stride - bytesPerPixel]! : 0;
+      const predictor = filter === 0 ? 0 : filter === 1 ? left : filter === 2 ? above : filter === 3 ? Math.floor((left + above) / 2) : filter === 4 ? paeth(left, above, upperLeft) : -1;
       if (predictor < 0) throw new Error(`Unsupported PNG row filter ${filter}`);
       pixels[outputOffset] = (encoded + predictor) & 0xff;
     }
   }
+  return { header, pixels, width, height, bytesPerPixel };
+}
+
+function encodePng(signature: Buffer, header: Buffer, pixels: Buffer, width: number, height: number, bytesPerPixel: number): Buffer {
+  const stride = width * bytesPerPixel;
+  const filtered = Buffer.alloc(height * (stride + 1));
+  for (let row = 0; row < height; row += 1) {
+    const outputOffset = row * (stride + 1);
+    filtered[outputOffset] = 0;
+    pixels.copy(filtered, outputOffset + 1, row * stride, (row + 1) * stride);
+  }
+  const outputHeader = Buffer.from(header);
+  outputHeader.writeUInt32BE(width, 0);
+  outputHeader.writeUInt32BE(height, 4);
+  return Buffer.concat([signature, pngChunk("IHDR", outputHeader), pngChunk("IDAT", deflateSync(filtered)), pngChunk("IEND", Buffer.alloc(0))]);
+}
+
+function resizePng(png: Buffer, scale: number): Buffer {
+  if (!Number.isFinite(scale) || scale <= 0 || Math.abs(scale - 1) < 0.001) return png;
+  const decoded = decodePng(png);
+  const width = Math.max(1, Math.round(decoded.width / scale));
+  const height = Math.max(1, Math.round(decoded.height / scale));
+  const pixels = Buffer.alloc(width * height * decoded.bytesPerPixel);
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(decoded.height - 1, Math.floor(y * scale));
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(decoded.width - 1, Math.floor(x * scale));
+      const source = (sourceY * decoded.width + sourceX) * decoded.bytesPerPixel;
+      const target = (y * width + x) * decoded.bytesPerPixel;
+      decoded.pixels.copy(pixels, target, source, source + decoded.bytesPerPixel);
+    }
+  }
+  return encodePng(png.subarray(0, 8), decoded.header, pixels, width, height, decoded.bytesPerPixel);
+}
+
+function cropPng(
+  png: Buffer,
+  requested: { x: number; y: number; width: number; height: number }
+): Buffer {
+  const decoded = decodePng(png);
+  const { width: sourceWidth, height: sourceHeight, header, pixels, bytesPerPixel } = decoded;
+  const stride = sourceWidth * bytesPerPixel;
 
   const x = Math.max(0, Math.floor(requested.x));
   const y = Math.max(0, Math.floor(requested.y));
@@ -206,15 +230,9 @@ function cropPng(
       (y + row) * stride + (x + width) * bytesPerPixel
     );
   }
-  const croppedHeader = Buffer.from(header);
-  croppedHeader.writeUInt32BE(width, 0);
-  croppedHeader.writeUInt32BE(height, 4);
-  return Buffer.concat([
-    png.subarray(0, 8),
-    pngChunk("IHDR", croppedHeader),
-    pngChunk("IDAT", deflateSync(cropped)),
-    pngChunk("IEND", Buffer.alloc(0)),
-  ]);
+  const rawPixels = Buffer.alloc(width * height * bytesPerPixel);
+  for (let row = 0; row < height; row += 1) cropped.copy(rawPixels, row * croppedStride, row * (croppedStride + 1) + 1, row * (croppedStride + 1) + 1 + croppedStride);
+  return encodePng(png.subarray(0, 8), header, rawPixels, width, height, bytesPerPixel);
 }
 
 export async function captureVisualArtifacts(
@@ -300,9 +318,9 @@ export async function captureVisualArtifacts(
   const takeScreenshot = async (): Promise<Buffer> => {
     if (crop && sourceKind === "document") {
       const fullPage = Buffer.from(await page.screenshot({ scale: "css", fullPage: true }));
-      return cropPng(fullPage, crop);
+      return cropPng(resizePng(fullPage, zoom), crop);
     }
-    return Buffer.from(await page.screenshot(screenshotOptions));
+    return resizePng(Buffer.from(await page.screenshot(screenshotOptions)), zoom);
   };
   let screenshot: ScreenshotArtifact | null = null;
   if (options.screenshotName) {
