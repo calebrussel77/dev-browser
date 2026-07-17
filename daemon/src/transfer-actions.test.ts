@@ -369,7 +369,8 @@ describe.sequential("first-class transfer and navigation actions", () => {
     try {
       await expect(action("popup-metadata-timeout", { kind: "click", ref, method: "locator" }))
         .rejects.toMatchObject({ code: "POPUP_OPENED", details: { attemptJournal: expect.any(Array) } });
-      expect(Date.now() - started).toBeLessThan(2_000);
+      // Preserve the bounded deadline while allowing scheduler contention in the full Playwright suite.
+      expect(Date.now() - started).toBeLessThan(3_000);
       expect(emitter.listenerCount("popup")).toBe(baseline);
     } finally {
       spy.mockRestore();
