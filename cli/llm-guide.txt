@@ -212,8 +212,9 @@ LLM USAGE GUIDE:
          or ask the user to recover the original tab instead of retrying indefinitely.
       6. If Playwright logs `<ws connected>` and then times out, raw Chrome/CDP
          may be reachable while Playwright failed during attach. Use a short
-         timeout such as `--timeout 10` and run `dev-browser stop` before retrying
-         after upgrades or environment changes.
+         timeout such as `--timeout 10`, then run `dev-browser doctor --connect --json`.
+         Follow its typed recovery command; stop the daemon only when doctor
+         explicitly recommends it as recovery.
       7. `--timeout SECONDS` controls both the Playwright CDP attach timeout and
          the script execution timeout.
 
