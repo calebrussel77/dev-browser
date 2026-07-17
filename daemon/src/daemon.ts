@@ -36,7 +36,7 @@ import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 import { redactSensitive } from "./redaction.js";
-import { traceStore } from "./trace-store.js";
+import { traceCapabilityWarnings, traceSecretsForAction, traceStore } from "./trace-store.js";
 import {
   buildRuntimeHandshake,
   currentProcessHash,
@@ -247,12 +247,11 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
     const startedAt = new Date().toISOString();
     const started = Date.now();
     const traceId = request.trace ? traceStore.allocateId() : undefined;
+    const traceSecrets = traceSecretsForAction(request.action as unknown as Record<string, unknown>);
     let tracePage: Awaited<ReturnType<BrowserManager["getPage"]>> | undefined;
     let before: Record<string, unknown> | undefined;
     let beforeScreenshot: string | undefined;
-    const traceWarnings: string[] = request.connect
-      ? ["External CDP tracing is best-effort; browser-context tracing may be unavailable"]
-      : [];
+    const traceWarnings: string[] = [];
     const diagnostics = {
       consoleErrors: [] as unknown[], pageErrors: [] as unknown[], failedRequests: [] as unknown[],
       responses: [] as unknown[], popup: [] as unknown[], download: [] as unknown[],
@@ -299,12 +298,13 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
         error: error ? toAgentError(error) : undefined,
         recoveryHints: error ? toAgentError(error).nextCommands : result?.warnings,
         warnings: traceWarnings,
-      }, traceId);
+      }, traceId, traceSecrets);
       return { id: record.id, path: record.path, nextCommand: `dev-browser trace show ${record.id}` };
     };
     try {
       await prepareBrowser(request);
       if (traceId) {
+        traceWarnings.push(...traceCapabilityWarnings(manager.getBrowser(request.browser)?.type));
         tracePage = await manager.getPage(request.browser, request.page);
         before = { url: tracePage.url(), stateId: getLatestStateId(tracePage) };
         for (const [event, listener] of Object.entries(listeners)) tracePage.on(event as never, listener as never);
@@ -351,12 +351,7 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
       try { trace = await finishTrace(undefined, error); }
       catch { detachTraceListeners(); }
       const action = request.action;
-      const secrets = [
-        action.kind === "confirm" || action.kind === "click" ? action.expectText : undefined,
-        action.kind === "paste" ? action.text : undefined,
-        action.kind === "type" ? action.text : undefined,
-        "confirmToken" in action ? action.confirmToken : undefined,
-      ].filter((value): value is string => Boolean(value));
+      const secrets = traceSecrets;
       if (request.protocolVersion === 2) {
         const agentError = toAgentError(error);
         if (trace) agentError.details = { ...(agentError.details ?? {}), trace };
