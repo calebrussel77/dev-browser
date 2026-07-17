@@ -39,7 +39,9 @@ pub fn agent_schema() -> Value {
             "observeMaxChars": 100000,
             "findMatches": 50,
             "refLength": 32,
-            "confirmationTokenSeconds": 30
+            "confirmationTokenSeconds": 30,
+            "shotTimeoutMsRange": "250..120000, defaults to min(timeoutMs, 8000)",
+            "consoleJsonMaxBytes": 65536
         },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
@@ -115,7 +117,8 @@ pub fn compact_capabilities() -> Value {
         "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
         "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],
         "runtimeHandshake": true,
-        "quickjs": true
+        "quickjs": true,
+        "scripting": ["console.json"]
     })
 }
 

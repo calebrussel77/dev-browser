@@ -70,6 +70,80 @@ LLM USAGE GUIDE:
     and available with `dev-browser trace show LAST`. External CDP tracing is
     best-effort and reports a warning when full context tracing is unavailable.
 
+  Screenshots have a hard deadline:
+    `--shot-timeout MILLISECONDS` (250..120000, default min(--timeout, 8000))
+    applies to `shot`, `observe --shot`, and action screenshots. Capture
+    prefers a single CDP Page.captureScreenshot call so it never waits on
+    perpetual CSS animations, a blinking caret, or document.fonts.ready;
+    Playwright's page.screenshot() is used only once, as a fallback, and
+    never after a CDP deadline has already elapsed. Result metadata reports
+    captureMode: "cdp" | "playwright".
+
+  Scope observe/text/assert instead of re-reading the whole page:
+    `observe`, `text`, and `assert` share find's --within grammar: a landmark
+    substring (main/aside/dialog), role:<role>, or name:<exact name>. Scoping
+    keeps node/character/depth/breadth budgets focused on the relevant
+    subtree, not repeated chrome around it.
+      dev-browser observe --page TARGET_ID --within main --max-nodes 300
+      dev-browser text --page TARGET_ID --ref R42
+      dev-browser assert --page TARGET_ID --within main --text "Jane Doe" --match contains
+    `observe --root REF` scopes to a specific ref's subtree instead
+    (mutually exclusive with --within). `observe --text-only` returns bounded
+    normalized innerText with truncation metadata. `assert` never attempts
+    trusted input; on failure it returns the typed ASSERTION_FAILED error
+    (exit 3) instead of silently proceeding.
+
+  Virtualized/infinite-scroll containers need container-relative scrolling:
+    A recycled virtual list keeps only a handful of DOM nodes for dozens or
+    hundreds of logical rows, so a single snapshot cannot see them all.
+      dev-browser scroll --page TARGET_ID --ref R2 --until "text:Conversation 47" --max-steps 20
+      dev-browser find --page TARGET_ID --name "Conversation 47" --scroll-container R2 --max-steps 20
+    `find --scroll-container` repeats fresh find -> one container scroll ->
+    fresh find until confident, exhausted, or --max-steps. It never
+    auto-clicks the result. The response includes scrollMetrics: { steps,
+    uniqueItems, newItems, exhausted, positions[] }.
+
+  React-safe exact text entry (`type`):
+    `type` invokes the resolved field's native value setter and dispatches
+    composed bubbling beforeinput/input/change events for input/textarea
+    (so React-style controlled components commit the change), or
+    page.keyboard.insertText for contenteditable. It returns
+    { typed, inputStrategy, verifiedValue } where inputStrategy is
+    native-setter, insert-text, or keyboard. The field is reread afterward;
+    a mismatch returns the typed INPUT_VALUE_MISMATCH error (exit 3) instead
+    of reporting success. --clear (default false) controls whether the
+    existing content is replaced or appended to.
+
+  Error codes (exit status 3 unless noted): STALE_REF, STALE_STATE,
+    AMBIGUOUS_TARGET, TARGET_MISSING, TARGET_HIDDEN, TARGET_OBSCURED,
+    TARGET_DISABLED, ASSERTION_FAILED, INPUT_VALUE_MISMATCH. WAIT_TIMEOUT is
+    exit 4, LEASE_CONFLICT is exit 5, CONFIRMATION_INVALID is exit 8. See
+    `dev-browser schema --json` for the authoritative, versioned list.
+
+  Two site-agnostic recipes for messaging-style UIs:
+    1. Detect an unavailable send button before clicking it:
+         dev-browser find --page TARGET_ID --role button --name "Send" --state disabled
+         dev-browser click --page TARGET_ID --ref R9   # returns TARGET_DISABLED (exit 3)
+    2. Verify a thread actually opened before composing into it. A deep link
+       into an SPA conversation view can resolve the URL before the panel
+       hydrates, so do a real click, then assert rather than trusting the
+       click alone:
+         dev-browser click --page TARGET_ID --ref R14 --wait-url "contains,/thread/"
+         dev-browser assert --page TARGET_ID --within main --text "Jane Doe" --match contains
+         dev-browser type --page TARGET_ID --ref R13 --text "Hello" --clear
+
+  console.json for scripted output:
+    Inside a piped script, console.json(value) emits value as exactly one
+    bounded, parseable JSON line (serialized with the sandbox's own
+    JSON.stringify, so circular references are rejected instead of hanging
+    the sandbox). Oversized values (over 64 KiB serialized) are rejected with
+    a short, bounded diagnostic instead of being emitted truncated. Prefer it
+    over console.log(JSON.stringify(...)) when a caller must parse exactly
+    one line of output.
+      dev-browser <<'EOF'
+      console.json({ ok: true, count: 3 });
+      EOF
+
   Quick inspection:
     dev-browser --connect <<'EOF'
     const tabs = await browser.listPages();
