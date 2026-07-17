@@ -11,6 +11,9 @@ dirs = "5"
 libc = "0.2"
 dialoguer = "0.12"
 interprocess = "2.2.3"
+sha2 = "0.10"
+regex = "1"
+url = "2"
 
 [profile.release]
 opt-level = 3

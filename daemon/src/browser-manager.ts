@@ -2,6 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { confirmationTokens } from "./confirmation-tokens.js";
 
 import {
   SelectiveCdpTransport,
@@ -334,6 +335,26 @@ export class BrowserManager {
     return entry.context.newPage();
   }
 
+  async registerPageTarget(browserName: string, page: Page): Promise<string> {
+    const entry = this.getBrowserEntry(browserName);
+    if (page.isClosed()) throw new Error("Popup page closed before registration");
+    const targetId = await this.getPageTargetId(page.context(), page);
+    if (!targetId) throw new Error("Popup target id is unavailable");
+    this.registerNamedPage(entry, targetId, page);
+    return targetId;
+  }
+
+  registerKnownPageTarget(browserName: string, targetId: string, page: Page): void {
+    if (!TARGET_ID_PATTERN.test(targetId)) throw new Error("Popup target id is invalid");
+    const entry = this.getBrowserEntry(browserName);
+    if (page.isClosed()) throw new Error("Popup page closed before registration");
+    this.registerNamedPage(entry, targetId, page);
+  }
+
+  isNamedPage(browserName: string, pageName: string, page: Page): boolean {
+    return this.getBrowserEntry(browserName).pages.get(pageName) === page;
+  }
+
   async listPages(browserName: string): Promise<BrowserPageSummary[]> {
     const entry = this.browsers.get(browserName);
     if (!entry || !entry.browser.isConnected()) {
@@ -426,6 +447,7 @@ export class BrowserManager {
     }
 
     this.browsers.delete(name);
+    confirmationTokens.reset();
     entry.pages.clear();
 
     try {

@@ -9,6 +9,9 @@ import { removeDirectoryWithRetries } from "../../test-cleanup.js";
 import { runScript } from "../script-runner-quickjs.js";
 import { ensureSandboxClientBundle } from "./bundle-test-helpers.js";
 
+const LOCAL_PAGE_URL =
+  "data:text/html,%3Ctitle%3EExample%20Domain%3C/title%3E%3Ch1%3EExample%20Domain%3C/h1%3E";
+
 interface CapturedOutput {
   stdout: string[];
   stderr: string[];
@@ -62,7 +65,7 @@ describe.sequential("QuickJS sandbox integration", () => {
     await runScript(
       `
         const page = await browser.getPage("nav");
-        await page.goto("https://example.com");
+        await page.goto(${JSON.stringify(LOCAL_PAGE_URL)});
         console.log(await page.title());
       `,
       manager,
@@ -83,7 +86,7 @@ describe.sequential("QuickJS sandbox integration", () => {
     await runScript(
       `
         const page = await browser.getPage("locator");
-        await page.goto("https://example.com");
+        await page.goto(${JSON.stringify(LOCAL_PAGE_URL)});
         console.log(await page.locator("h1").textContent());
       `,
       manager,
@@ -103,7 +106,7 @@ describe.sequential("QuickJS sandbox integration", () => {
     await runScript(
       `
         const page = await browser.getPage("evaluate");
-        await page.goto("https://example.com");
+        await page.goto(${JSON.stringify(LOCAL_PAGE_URL)});
         console.log(await page.evaluate(() => document.title));
       `,
       manager,

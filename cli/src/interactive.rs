@@ -45,16 +45,66 @@ pub struct InteractiveRequestOptions<'a> {
     pub browser: &'a str,
     pub page: &'a str,
     pub shot: Option<&'a str>,
+    pub annotate: bool,
+    pub full_page: bool,
     pub connect: Option<&'a str>,
     pub headless: bool,
     pub ignore_https_errors: bool,
     pub timeout_ms: u64,
+    pub session: Option<&'a str>,
+    pub trace: bool,
+}
+
+pub struct ObserveActionOptions<'a> {
+    pub full: bool,
+    pub delta: bool,
+    pub track: &'a str,
+    pub max_nodes: u16,
+    pub max_chars: u32,
+    pub depth: u8,
+    pub breadth: u16,
+    pub continuation: Option<&'a str>,
+}
+
+pub fn build_observe_action(options: ObserveActionOptions<'_>) -> Value {
+    let mut action = json!({
+        "kind": "observe",
+        "full": options.full,
+        "delta": options.delta,
+        "track": options.track,
+        "maxNodes": options.max_nodes,
+        "maxChars": options.max_chars,
+        "depth": options.depth,
+        "breadth": options.breadth,
+    });
+    if let Some(continuation) = options.continuation {
+        action["continuation"] = Value::String(continuation.to_string());
+    }
+    action
+}
+
+pub fn apply_state_guard(action: &mut Value, from_state: Option<&str>, strict_state: bool) {
+    if let Some(from_state) = from_state {
+        action["fromState"] = Value::String(from_state.to_string());
+    }
+    if strict_state {
+        action["strictState"] = Value::Bool(true);
+    }
+}
+
+pub fn build_primitive_action(kind: &str, fields: &[(&str, Value)]) -> Value {
+    let mut action = json!({ "kind": kind });
+    for (name, value) in fields {
+        action[*name] = value.clone();
+    }
+    action
 }
 
 pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action: Value) -> Value {
     let mut request = json!({
         "id": options.id,
         "type": "interactive",
+        "protocolVersion": 2,
         "browser": options.browser,
         "page": options.page,
         "action": action,
@@ -63,6 +113,12 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
 
     if let Some(shot) = options.shot {
         request["shot"] = Value::String(shot.to_string());
+    }
+    if options.annotate {
+        request["annotate"] = Value::Bool(true);
+    }
+    if options.full_page {
+        request["fullPage"] = Value::Bool(true);
     }
     if let Some(connect) = options.connect {
         request["connect"] = Value::String(connect.to_string());
@@ -73,13 +129,22 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if options.ignore_https_errors {
         request["ignoreHTTPSErrors"] = Value::Bool(true);
     }
+    if let Some(session) = options.session {
+        request["session"] = Value::String(session.to_string());
+    }
+    if options.trace {
+        request["trace"] = Value::Bool(true);
+    }
 
     request
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_interactive_request, Coordinates, InteractiveRequestOptions};
+    use super::{
+        apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
+        Coordinates, InteractiveRequestOptions, ObserveActionOptions,
+    };
     use serde_json::json;
 
     #[test]
@@ -101,19 +166,120 @@ mod tests {
                 browser: "daily",
                 page: "TARGET",
                 shot: Some("state.png"),
+                annotate: true,
+                full_page: true,
                 connect: Some("auto"),
                 headless: false,
                 ignore_https_errors: false,
                 timeout_ms: 15_000,
+                session: Some("opaque-session"),
+                trace: true,
             },
             json!({ "kind": "read", "limit": 100, "depth": 12 }),
         );
 
         assert_eq!(request["type"], "interactive");
+        assert_eq!(request["protocolVersion"], 2);
         assert_eq!(request["browser"], "daily");
         assert_eq!(request["page"], "TARGET");
         assert_eq!(request["connect"], "auto");
         assert_eq!(request["shot"], "state.png");
+        assert_eq!(request["annotate"], true);
+        assert_eq!(request["fullPage"], true);
         assert_eq!(request["action"]["kind"], "read");
+        assert_eq!(request["session"], "opaque-session");
+        assert_eq!(request["trace"], true);
+    }
+
+    #[test]
+    fn builds_observe_json_with_every_perception_flag() {
+        let action = build_observe_action(ObserveActionOptions {
+            full: true,
+            delta: true,
+            track: "checkout",
+            max_nodes: 999,
+            max_chars: 99_999,
+            depth: 49,
+            breadth: 499,
+            continuation: Some("eyJ2IjoxLCJvZmZzZXQiOjN9"),
+        });
+
+        assert_eq!(
+            action,
+            json!({
+                "kind": "observe",
+                "full": true,
+                "delta": true,
+                "track": "checkout",
+                "maxNodes": 999,
+                "maxChars": 99_999,
+                "depth": 49,
+                "breadth": 499,
+                "continuation": "eyJ2IjoxLCJvZmZzZXQiOjN9",
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_read_still_uses_the_v2_request_envelope() {
+        let request = build_interactive_request(
+            InteractiveRequestOptions {
+                id: "read-1".to_string(),
+                browser: "default",
+                page: "main",
+                shot: None,
+                annotate: false,
+                full_page: false,
+                connect: None,
+                headless: false,
+                ignore_https_errors: false,
+                timeout_ms: 10_000,
+                session: None,
+                trace: false,
+            },
+            json!({ "kind": "read", "limit": 100, "depth": 12 }),
+        );
+
+        assert_eq!(request["protocolVersion"], 2);
+        assert_eq!(request["action"]["kind"], "read");
+    }
+
+    #[test]
+    fn adds_state_guards_to_trusted_actions() {
+        let mut action = json!({ "kind": "click", "ref": "R7" });
+        apply_state_guard(&mut action, Some("doc-4:9"), true);
+        assert_eq!(action["fromState"], "doc-4:9");
+        assert_eq!(action["strictState"], true);
+    }
+
+    #[test]
+    fn builds_json_for_every_interaction_primitive_without_echo_helpers() {
+        let cases = [
+            ("focus", vec![("ref", json!("R1"))]),
+            ("press", vec![("ref", json!("R1")), ("key", json!("Enter"))]),
+            (
+                "paste",
+                vec![("ref", json!("R1")), ("text", json!("secret"))],
+            ),
+            (
+                "scroll",
+                vec![("deltaY", json!(600)), ("deltaX", json!(-10))],
+            ),
+            (
+                "select",
+                vec![("ref", json!("R1")), ("label", json!("Nigeria"))],
+            ),
+            ("check", vec![("ref", json!("R1"))]),
+            ("uncheck", vec![("ref", json!("R1"))]),
+            ("hover", vec![("ref", json!("R1"))]),
+            ("drag", vec![("from", json!("R1")), ("to", json!("R2"))]),
+        ];
+        for (kind, fields) in cases {
+            let action = build_primitive_action(kind, &fields);
+            assert_eq!(action["kind"], kind);
+            for (name, value) in fields {
+                assert_eq!(action[name], value);
+            }
+        }
     }
 }

@@ -3,6 +3,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createProtocolBridge, type ProtocolBridge } from "../protocol-bridge.js";
 import type { PlaywrightClientLike } from "../playwright-internals.js";
 
+const LOCAL_PAGE_URL =
+  "data:text/html,%3Ctitle%3EExample%20Domain%3C/title%3E%3Ch1%3EExample%20Domain%3C/h1%3E";
+
 describe.sequential("protocol bridge", () => {
   let bridge: ProtocolBridge;
   let playwright: PlaywrightClientLike;
@@ -34,7 +37,7 @@ describe.sequential("protocol bridge", () => {
     browser = await playwright.chromium.launch({ headless: true });
     page = await browser.newPage();
 
-    await page.goto("https://example.com");
+    await page.goto(LOCAL_PAGE_URL);
 
     await expect(page.title()).resolves.toBe("Example Domain");
     await expect(page.locator("h1").textContent()).resolves.toBe("Example Domain");

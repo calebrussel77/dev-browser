@@ -1,15 +1,22 @@
 mod connection;
 mod daemon;
+mod discovery;
 mod interactive;
 mod skill;
+#[path = "wait-grammar.rs"]
+mod wait_grammar;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use connection::{connect_to_daemon, read_line, send_message};
 use daemon::{
-    current_daemon_pid, ensure_daemon, install_daemon_runtime, is_daemon_running,
+    current_daemon_pid, doctor_report, ensure_daemon, install_daemon_runtime, is_daemon_running,
     wait_for_daemon_exit,
 };
-use interactive::{build_interactive_request, Coordinates, InteractiveRequestOptions};
+use discovery::{agent_schema, compact_capabilities, focused_example};
+use interactive::{
+    apply_state_guard, build_interactive_request, build_observe_action, build_primitive_action,
+    Coordinates, InteractiveRequestOptions, ObserveActionOptions,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use skill::install_skill;
@@ -18,7 +25,33 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wait_grammar::WaitArgs;
 
+fn parse_ref_id(value: &str) -> Result<String, String> {
+    if value.len() > 32 {
+        return Err("ref must be at most 32 characters".into());
+    }
+    let local = if let Some((frame, local)) = value.split_once(':') {
+        if !frame.starts_with('F')
+            || frame.len() < 2
+            || !frame[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Err("ref must match R# or F#:R#".into());
+        }
+        local
+    } else {
+        value
+    };
+    if !local.starts_with('R')
+        || local.len() < 2
+        || !local[1..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("ref must match R# or F#:R#".into());
+    }
+    Ok(value.to_owned())
+}
+
+#[allow(dead_code)]
 const CLI_LONG_ABOUT: &str = r###"Dev Browser is a CLI for controlling local or external browsers with JavaScript scripts.
 Scripts run in a sandboxed QuickJS runtime (not Node.js). Top-level `await` is
 available, along with a preconnected `browser` global and standard `console` output.
@@ -108,6 +141,7 @@ Pages returned by `browser.getPage()` and `browser.newPage()` are full Playwrigh
 Page objects — you get the same API (goto, click, fill, locator, evaluate, etc.):
   https://playwright.dev/docs/api/class-page"###;
 
+#[allow(dead_code)]
 const CLI_AFTER_LONG_HELP: &str = include_str!("../llm-guide.txt");
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
@@ -115,8 +149,9 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 #[derive(Parser)]
 #[command(name = "dev-browser")]
 #[command(about = "Control browsers with JavaScript automation scripts")]
-#[command(long_about = CLI_LONG_ABOUT)]
-#[command(after_long_help = CLI_AFTER_LONG_HELP)]
+#[command(
+    long_about = "Agent-friendly browser automation with persistent pages, trusted interactive actions, and sandboxed QuickJS scripts. Run `dev-browser schema --json` for the machine contract, `dev-browser capabilities --compact` for feature discovery, or `dev-browser examples COMMAND` for a focused recipe."
+)]
 #[command(subcommand_precedence_over_arg = true)]
 struct Cli {
     #[arg(
@@ -130,6 +165,14 @@ struct Cli {
 
     #[arg(
         long,
+        value_name = "SESSION_ID",
+        help = "Authorize script execution while this browser has a writer lease"
+    )]
+    session: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
         num_args = 0..=1,
         default_missing_value = "auto",
         value_name = "URL",
@@ -162,6 +205,9 @@ struct Cli {
     )]
     timeout: u32,
 
+    #[arg(long, global = true, help = "Persist a bounded redacted action trace")]
+    trace: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -190,6 +236,64 @@ struct PageActionArgs {
         help = "Save the resulting page screenshot and return its absolute path"
     )]
     shot: Option<String>,
+
+    #[arg(
+        long,
+        help = "Draw deterministic ref labels on the returned screenshot"
+    )]
+    annotate: bool,
+
+    #[arg(
+        long,
+        help = "Capture document CSS pixels instead of the current viewport"
+    )]
+    full_page: bool,
+
+    #[arg(long, value_name = "STATE")]
+    from_state: Option<String>,
+
+    #[arg(long)]
+    strict_state: bool,
+
+    #[arg(long, value_name = "SESSION_ID")]
+    session: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Consume a scoped single-use confirmation token immediately before trusted input"
+    )]
+    confirm_token: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    Open {
+        #[arg(long, default_value = "default")]
+        browser: String,
+        #[arg(long, value_name = "TARGET")]
+        page: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(1..=3600))]
+        ttl: u16,
+    },
+    Renew {
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(1..=3600))]
+        ttl: u16,
+    },
+    Close {
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    Show {
+        #[arg(value_name = "ID_OR_LAST")]
+        trace_id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -207,8 +311,104 @@ impl ClickMethod {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum RetryPolicy {
+    Never,
+    Safe,
+    Once,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum NameMode {
+    Exact,
+    Contains,
+}
+impl NameMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Contains => "contains",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum FindScope {
+    Visible,
+    Viewport,
+    Document,
+}
+impl FindScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Viewport => "viewport",
+            Self::Document => "document",
+        }
+    }
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum FindState {
+    Enabled,
+    Disabled,
+    Checked,
+    Unchecked,
+    Expanded,
+    Collapsed,
+    Selected,
+}
+impl FindState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Checked => "checked",
+            Self::Unchecked => "unchecked",
+            Self::Expanded => "expanded",
+            Self::Collapsed => "collapsed",
+            Self::Selected => "selected",
+        }
+    }
+}
+impl ScrollDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+impl RetryPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Safe => "safe",
+            Self::Once => "once",
+        }
+    }
+}
+
+fn apply_retry_policy(action: &mut Value, retry: RetryPolicy) {
+    action["retry"] = Value::String(retry.as_str().to_string());
+}
+
 #[derive(Subcommand)]
 enum Command {
+    #[command(
+        subcommand,
+        about = "Open, renew, or close an optional page writer lease"
+    )]
+    Session(SessionCommand),
     #[command(
         about = "Run a script file against the browser",
         long_about = "Run a script file against the browser.\n\nThe file is executed the same way as stdin input: as top-level JavaScript with `await`, `browser`, and `console` available.\n\nUse top-level flags before `run`, for example `dev-browser --browser my-project run script.js`."
@@ -236,6 +436,48 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
     },
+    Back {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Forward {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Reload {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    #[command(
+        about = "Observe a compact, actionable page state",
+        long_about = "Return the protocol v2 page state with stable inline refs, coordinate metadata, deterministic truncation, and optional deltas."
+    )]
+    Observe {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        delta: bool,
+        #[arg(long, default_value = "default", value_name = "KEY")]
+        track: String,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        max_nodes: u16,
+        #[arg(long, default_value_t = 12_000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+        max_chars: u32,
+        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u8).range(1..=50))]
+        depth: u8,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+        breadth: u16,
+        #[arg(long, value_name = "CURSOR")]
+        continuation: Option<String>,
+    },
     #[command(
         about = "Read the accessibility snapshot and interactive refs for a page",
         long_about = "Return an accessibility snapshot plus stable DOM refs for interactive elements. Each ref includes role, name, visibility, viewport coordinates, and its main/aside/dialog landmark path. Run read again after a rerender before using old refs."
@@ -252,17 +494,36 @@ enum Command {
         about = "Find interactive refs by accessible name, role, and landmark",
         long_about = "Take a fresh accessibility snapshot, then rank visible interactive elements against a natural-language query. Names, roles, and landmarks such as main.profile-card or aside are scored separately so duplicate labels can be disambiguated."
     )]
+    #[command(group(clap::ArgGroup::new("find_target").required(true).multiple(true)))]
     Find {
-        #[arg(value_name = "QUERY")]
-        query: String,
+        #[arg(value_name = "QUERY", group = "find_target")]
+        query: Option<String>,
         #[command(flatten)]
         output: PageActionArgs,
+        #[arg(long, group = "find_target")]
+        role: Option<String>,
+        #[arg(long, group = "find_target")]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value = "exact", requires = "name")]
+        name_mode: NameMode,
+        #[arg(long, group = "find_target")]
+        within: Option<String>,
+        #[arg(long, group = "find_target")]
+        near: Option<String>,
+        #[arg(long, group = "find_target")]
+        frame: Option<String>,
+        #[arg(long, value_enum, default_value = "visible")]
+        scope: FindScope,
+        #[arg(long = "state", value_enum, action = clap::ArgAction::Append, group = "find_target")]
+        states: Vec<FindState>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=999))]
+        index: Option<u16>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
     },
     #[command(
         about = "Click through trusted Playwright mouse or locator input",
-        long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). --wait-for TEXT polls for expected UI and retries once only when the first click caused no observable change. --expect-text guards irreversible actions and disables retry. Screenshot pixels and --xy coordinates both use CSS pixels."
+        long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). Retries default to never; --retry safe permits one retry only with strong evidence that no side effect or page change began, while --retry once is explicit but remains blocked for guarded or irreversible actions. Screenshot pixels and --xy coordinates both use CSS pixels."
     )]
     Click {
         #[command(flatten)]
@@ -270,6 +531,7 @@ enum Command {
         #[arg(
             long = "ref",
             value_name = "REF",
+            value_parser = parse_ref_id,
             conflicts_with = "xy",
             required_unless_present = "xy"
         )]
@@ -283,10 +545,14 @@ enum Command {
         xy: Option<Coordinates>,
         #[arg(long, value_enum, default_value = "mouse")]
         method: ClickMethod,
+        #[arg(long, value_enum, default_value = "never")]
+        retry: RetryPolicy,
         #[arg(long, value_name = "TEXT")]
         expect_text: Option<String>,
         #[arg(long, value_name = "TEXT")]
         wait_for: Option<String>,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
     #[command(
         about = "Focus and type through trusted Playwright keyboard input",
@@ -295,7 +561,7 @@ enum Command {
     Type {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_name = "REF")]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
         #[arg(long, value_name = "TEXT")]
         text: String,
@@ -303,6 +569,112 @@ enum Command {
         clear: bool,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
         delay: u16,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Focus {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Press {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[arg(long)]
+        key: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Paste {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[arg(long, required = true, conflicts_with_all = ["shot", "annotate"])]
+        text_stdin: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Scroll {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction", "until"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        ref_id: Option<String>,
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
+        delta_y: Option<f64>,
+        #[arg(long, allow_hyphen_values = true, requires = "delta_y")]
+        delta_x: Option<f64>,
+        #[arg(long, value_enum, conflicts_with_all = ["ref_id", "delta_y", "until"], requires = "pages", required_unless_present_any = ["ref_id", "delta_y", "until"])]
+        direction: Option<ScrollDirection>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "direction")]
+        pages: Option<u8>,
+        #[arg(long, conflicts_with_all = ["ref_id", "delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
+        until: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
+        max_steps: Option<u8>,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Select {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[arg(long, conflicts_with = "label", required_unless_present = "label")]
+        value: Option<String>,
+        #[arg(long, conflicts_with = "value", required_unless_present = "value")]
+        label: Option<String>,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Check {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Uncheck {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Hover {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_parser = parse_ref_id)]
+        ref_id: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Drag {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long, value_parser = parse_ref_id)]
+        from: String,
+        #[arg(long, value_parser = parse_ref_id)]
+        to: String,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    Upload {
+        #[command(flatten)]
+        output: PageActionArgs,
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id, required = true)]
+        ref_id: String,
+        #[arg(long, value_name = "TEMP_FILE", required = true)]
+        file: String,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
     #[command(
         about = "Read and verify the current confirmation or dialog text",
@@ -311,8 +683,10 @@ enum Command {
     Confirm {
         #[command(flatten)]
         output: PageActionArgs,
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
+        ref_id: String,
         #[arg(long, value_name = "TEXT")]
-        expect: Option<String>,
+        expect: String,
     },
     #[command(
         about = "Save a page screenshot and return its absolute PNG path",
@@ -323,7 +697,43 @@ enum Command {
         target: PageTargetArgs,
         #[arg(value_name = "FILE", default_value = "auto")]
         file: String,
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
+        ref_id: Option<String>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(0..=1000))]
+        padding: u16,
+        #[arg(long)]
+        full_page: bool,
+        #[arg(long)]
+        annotate: bool,
+        #[arg(long, value_name = "STATE")]
+        from_state: Option<String>,
+        #[arg(long)]
+        strict_state: bool,
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
     },
+    #[command(about = "Diagnose CLI, daemon, browser, and CDP runtime health")]
+    Doctor {
+        #[arg(long, help = "Emit a machine-readable diagnostic report")]
+        json: bool,
+    },
+    #[command(about = "Print the authoritative machine-readable agent contract")]
+    Schema {
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "List compact agent capabilities")]
+    Capabilities {
+        #[arg(long, help = "Emit compact one-line JSON")]
+        compact: bool,
+    },
+    #[command(about = "Print a focused copy/paste recipe for one command")]
+    Examples {
+        #[arg(value_name = "COMMAND")]
+        command: String,
+    },
+    #[command(subcommand, about = "Read a bounded redacted action trace")]
+    Trace(TraceCommand),
     #[command(
         about = "Install Playwright browsers (Chromium)",
         long_about = "Install Playwright browsers (Chromium).\n\nDownloads the Chromium build used for daemon-managed browser instances."
@@ -395,11 +805,18 @@ fn main() {
         Ok(code) => code,
         Err(error) => {
             eprintln!("Error: {error}");
-            1
+            cli_error_exit_code(error.as_ref())
         }
     };
 
     process::exit(exit_code);
+}
+
+fn cli_error_exit_code(error: &(dyn Error + 'static)) -> i32 {
+    match error.downcast_ref::<io::Error>().map(io::Error::kind) {
+        Some(io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData) => 2,
+        _ => 6,
+    }
 }
 
 fn run() -> Result<i32, Box<dyn Error>> {
@@ -410,40 +827,107 @@ fn run() -> Result<i32, Box<dyn Error>> {
             let script = fs::read_to_string(file)?;
             run_script(&cli, script)
         }
-        Some(Command::Pages) => run_interactive(&cli, "main", None, json!({ "kind": "pages" })),
-        Some(Command::Navigate { url, output }) => run_interactive(
+        Some(Command::Pages) => run_interactive(
             &cli,
-            &output.target.page,
-            output.shot.as_deref(),
-            json!({ "kind": "navigate", "url": url }),
+            "main",
+            None,
+            false,
+            false,
+            json!({ "kind": "pages" }),
+            None,
+        ),
+        Some(Command::Navigate { url, output }) => {
+            run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
+        }
+        Some(Command::Back { output, wait }) => {
+            let mut action = json!({ "kind": "back" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Forward { output, wait }) => {
+            let mut action = json!({ "kind": "forward" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Reload { output, wait }) => {
+            let mut action = json!({ "kind": "reload" });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Observe {
+            output,
+            full,
+            delta,
+            track,
+            max_nodes,
+            max_chars,
+            depth,
+            breadth,
+            continuation,
+        }) => run_page_action(
+            &cli,
+            output,
+            build_observe_action(ObserveActionOptions {
+                full: *full,
+                delta: *delta,
+                track,
+                max_nodes: *max_nodes,
+                max_chars: *max_chars,
+                depth: *depth,
+                breadth: *breadth,
+                continuation: continuation.as_deref(),
+            }),
         ),
         Some(Command::Read {
             output,
             limit,
             depth,
-        }) => run_interactive(
+        }) => run_page_action(
             &cli,
-            &output.target.page,
-            output.shot.as_deref(),
+            output,
             json!({ "kind": "read", "limit": limit, "depth": depth }),
         ),
         Some(Command::Find {
             query,
             output,
+            role,
+            name,
+            name_mode,
+            within,
+            near,
+            frame,
+            scope,
+            states,
+            index,
             limit,
-        }) => run_interactive(
-            &cli,
-            &output.target.page,
-            output.shot.as_deref(),
-            json!({ "kind": "find", "query": query, "limit": limit }),
-        ),
+        }) => {
+            let action = build_find_action(
+                query.as_deref(),
+                role.as_deref(),
+                name.as_deref(),
+                name_mode.as_str(),
+                within.as_deref(),
+                near.as_deref(),
+                frame.as_deref(),
+                scope.as_str(),
+                &states
+                    .iter()
+                    .map(|state| state.as_str())
+                    .collect::<Vec<_>>(),
+                *index,
+                *limit,
+            );
+            run_page_action(&cli, output, action)
+        }
         Some(Command::Click {
             output,
             ref_id,
             xy,
             method,
+            retry,
             expect_text,
             wait_for,
+            wait,
         }) => {
             if xy.is_some() && matches!(method, ClickMethod::Locator) {
                 return Err(io::Error::new(
@@ -456,6 +940,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 "kind": "click",
                 "method": method.as_str(),
             });
+            apply_retry_policy(&mut action, *retry);
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
             }
@@ -469,7 +954,13 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(wait_for) = wait_for {
                 action["waitForText"] = Value::String(wait_for.clone());
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+            if let Some(spec) = wait
+                .build_spec(wait_for.as_deref())
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+            {
+                action["wait"] = spec;
+            }
+            run_page_action(&cli, output, action)
         }
         Some(Command::Type {
             output,
@@ -477,6 +968,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             text,
             clear,
             delay,
+            wait,
         }) => {
             let mut action = json!({
                 "kind": "type",
@@ -487,17 +979,197 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
-        }
-        Some(Command::Confirm { output, expect }) => {
-            let mut action = json!({ "kind": "confirm" });
-            if let Some(expect) = expect {
-                action["expectText"] = Value::String(expect.clone());
+            if let Some(spec) = wait
+                .build_spec(None)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+            {
+                action["wait"] = spec;
             }
-            run_interactive(&cli, &output.target.page, output.shot.as_deref(), action)
+            run_page_action(&cli, output, action)
         }
-        Some(Command::Shot { target, file }) => {
-            run_interactive(&cli, &target.page, Some(file), json!({ "kind": "shot" }))
+        Some(Command::Focus {
+            output,
+            ref_id,
+            wait,
+        }) => {
+            let mut action = build_primitive_action("focus", &[("ref", json!(ref_id))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Press {
+            output,
+            ref_id,
+            key,
+            wait,
+        }) => {
+            let mut action =
+                build_primitive_action("press", &[("ref", json!(ref_id)), ("key", json!(key))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Paste {
+            output,
+            ref_id,
+            text_stdin: _,
+            wait,
+        }) => {
+            let text = read_script_from_stdin()?;
+            let mut action =
+                build_primitive_action("paste", &[("ref", json!(ref_id)), ("text", json!(text))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Scroll {
+            output,
+            ref_id,
+            delta_y,
+            delta_x,
+            direction,
+            pages,
+            until,
+            max_steps,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "scroll" });
+            if let Some(value) = ref_id {
+                action["ref"] = json!(value);
+            }
+            if let Some(value) = delta_y {
+                action["deltaY"] = json!(value);
+            }
+            if let Some(value) = delta_x {
+                action["deltaX"] = json!(value);
+            }
+            if let Some(value) = direction {
+                action["direction"] = json!(value.as_str());
+            }
+            if let Some(value) = pages {
+                action["pages"] = json!(value);
+            }
+            if let Some(value) = until {
+                action["until"] = json!(value);
+            }
+            if let Some(value) = max_steps {
+                action["maxSteps"] = json!(value);
+            }
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Select {
+            output,
+            ref_id,
+            value,
+            label,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "select", "ref": ref_id });
+            if let Some(value) = value {
+                action["value"] = json!(value);
+            }
+            if let Some(label) = label {
+                action["label"] = json!(label);
+            }
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Check {
+            output,
+            ref_id,
+            wait,
+        })
+        | Some(Command::Uncheck {
+            output,
+            ref_id,
+            wait,
+        })
+        | Some(Command::Hover {
+            output,
+            ref_id,
+            wait,
+        }) => {
+            let kind = match &cli.command {
+                Some(Command::Check { .. }) => "check",
+                Some(Command::Uncheck { .. }) => "uncheck",
+                _ => "hover",
+            };
+            let mut action = json!({ "kind": kind, "ref": ref_id });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Drag {
+            output,
+            from,
+            to,
+            wait,
+        }) => {
+            let mut action = json!({ "kind": "drag", "from": from, "to": to });
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Upload {
+            output,
+            ref_id,
+            file,
+            wait,
+        }) => {
+            let mut action =
+                build_primitive_action("upload", &[("ref", json!(ref_id)), ("file", json!(file))]);
+            apply_wait(&mut action, wait)?;
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Confirm {
+            output,
+            ref_id,
+            expect,
+        }) => {
+            let action = json!({ "kind": "confirm", "ref": ref_id, "expectText": expect });
+            run_page_action(&cli, output, action)
+        }
+        Some(Command::Shot {
+            target,
+            file,
+            ref_id,
+            padding,
+            full_page,
+            annotate,
+            from_state,
+            strict_state,
+            session,
+        }) => {
+            let mut action = json!({ "kind": "shot", "padding": padding });
+            if let Some(ref_id) = ref_id {
+                action["ref"] = Value::String(ref_id.clone());
+            }
+            if let Some(from_state) = from_state {
+                action["fromState"] = Value::String(from_state.clone());
+            }
+            if *strict_state {
+                action["strictState"] = Value::Bool(true);
+            }
+            run_interactive(
+                &cli,
+                &target.page,
+                Some(file),
+                *annotate,
+                *full_page,
+                action,
+                session.as_deref(),
+            )
+        }
+        Some(Command::Session(command)) => {
+            ensure_daemon()?;
+            let request = match command {
+                SessionCommand::Open { browser, page, ttl } => {
+                    json!({ "id": request_id("session-open"), "type": "session", "action": "open", "browser": browser, "page": page, "ttl": ttl })
+                }
+                SessionCommand::Renew { session, ttl } => {
+                    json!({ "id": request_id("session-renew"), "type": "session", "action": "renew", "session": session, "ttl": ttl })
+                }
+                SessionCommand::Close { session } => {
+                    json!({ "id": request_id("session-close"), "type": "session", "action": "close", "session": session })
+                }
+            };
+            send_request(request, ResultMode::Json)
         }
         Some(Command::Browsers) => {
             ensure_daemon()?;
@@ -512,6 +1184,74 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Install) => {
             install_daemon_runtime()?;
             Ok(0)
+        }
+        Some(Command::Doctor { json }) => {
+            let (report, exit_code) =
+                doctor_report(&cli.browser, cli.connect.as_deref(), timeout_ms(&cli)?)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "dev-browser doctor: {}",
+                    if report["ok"] == true {
+                        "ok"
+                    } else {
+                        "issues found"
+                    }
+                );
+                println!(
+                    "daemon: {}",
+                    report["daemon"]["runtime"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "playwright: {}",
+                    report["playwright"]["installedVersion"]
+                        .as_str()
+                        .unwrap_or("missing")
+                );
+                if let Some(codes) = report["codes"].as_array() {
+                    for item in codes {
+                        println!(
+                            "{}: {}",
+                            item["severity"].as_str().unwrap_or("info"),
+                            item["code"].as_str().unwrap_or("UNKNOWN")
+                        );
+                    }
+                }
+            }
+            Ok(exit_code)
+        }
+        Some(Command::Schema { json: _ }) => {
+            println!("{}", serde_json::to_string_pretty(&agent_schema())?);
+            Ok(0)
+        }
+        Some(Command::Capabilities { compact }) => {
+            let capabilities = compact_capabilities();
+            if *compact {
+                println!("{}", serde_json::to_string(&capabilities)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&capabilities)?);
+            }
+            Ok(0)
+        }
+        Some(Command::Examples { command }) => {
+            let example = focused_example(command).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("No focused example for `{command}`; run `dev-browser schema --json`"),
+                )
+            })?;
+            println!("{example}");
+            Ok(0)
+        }
+        Some(Command::Trace(TraceCommand::Show { trace_id })) => {
+            ensure_daemon()?;
+            send_request(
+                json!({ "id": request_id("trace-show"), "type": "trace", "action": "show", "traceId": trace_id }),
+                ResultMode::Json,
+            )
         }
         Some(Command::InstallSkill { claude, agents }) => {
             install_skill(*claude, *agents)?;
@@ -571,13 +1311,13 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
 
     let timeout_ms = timeout_ms(cli)?;
 
-    let mut request = json!({
-        "id": request_id("execute"),
-        "type": "execute",
-        "browser": cli.browser,
-        "script": script,
-        "timeoutMs": timeout_ms,
-    });
+    let mut request = build_execute_request(
+        request_id("execute"),
+        &cli.browser,
+        script,
+        timeout_ms,
+        cli.session.as_deref(),
+    );
 
     if cli.headless {
         request["headless"] = Value::Bool(true);
@@ -594,11 +1334,108 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
     send_request(request, ResultMode::Json)
 }
 
+fn build_execute_request(
+    id: String,
+    browser: &str,
+    script: String,
+    timeout_ms: u64,
+    session: Option<&str>,
+) -> Value {
+    let mut request = json!({
+        "id": id,
+        "type": "execute",
+        "browser": browser,
+        "script": script,
+        "timeoutMs": timeout_ms,
+    });
+    if let Some(session) = session {
+        request["session"] = Value::String(session.to_string());
+    }
+    request
+}
+
+fn run_page_action(
+    cli: &Cli,
+    output: &PageActionArgs,
+    mut action: Value,
+) -> Result<i32, Box<dyn Error>> {
+    apply_state_guard(
+        &mut action,
+        output.from_state.as_deref(),
+        output.strict_state,
+    );
+    if let Some(confirm_token) = &output.confirm_token {
+        action["confirmToken"] = Value::String(confirm_token.clone());
+    }
+    run_interactive(
+        cli,
+        &output.target.page,
+        output.shot.as_deref(),
+        output.annotate,
+        output.full_page,
+        action,
+        output.session.as_deref(),
+    )
+}
+
+fn apply_wait(action: &mut Value, wait: &WaitArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(spec) = wait
+        .build_spec(None)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+    {
+        action["wait"] = spec;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_find_action(
+    query: Option<&str>,
+    role: Option<&str>,
+    name: Option<&str>,
+    name_mode: &str,
+    within: Option<&str>,
+    near: Option<&str>,
+    frame: Option<&str>,
+    scope: &str,
+    states: &[&str],
+    index: Option<u16>,
+    limit: u8,
+) -> Value {
+    let mut action = json!({ "kind": "find", "scope": scope, "states": states, "limit": limit });
+    if let Some(value) = query {
+        action["query"] = json!(value);
+    }
+    if let Some(value) = role {
+        action["role"] = json!(value);
+    }
+    if let Some(value) = name {
+        action["name"] = json!(value);
+        action["nameMode"] = json!(name_mode);
+    }
+    if let Some(value) = within {
+        action["within"] = json!(value);
+    }
+    if let Some(value) = near {
+        action["near"] = json!(value);
+    }
+    if let Some(value) = frame {
+        action["frame"] = json!(value);
+    }
+    if let Some(value) = index {
+        action["index"] = json!(value);
+    }
+    action
+}
+
 fn run_interactive(
     cli: &Cli,
     page: &str,
     shot: Option<&str>,
+    annotate: bool,
+    full_page: bool,
     action: Value,
+    session: Option<&str>,
 ) -> Result<i32, Box<dyn Error>> {
     ensure_daemon()?;
     let action_name = action
@@ -611,10 +1448,14 @@ fn run_interactive(
             browser: &cli.browser,
             page,
             shot,
+            annotate,
+            full_page,
             connect: cli.connect.as_deref(),
             headless: cli.headless,
             ignore_https_errors: cli.ignore_https_errors,
             timeout_ms: timeout_ms(cli)?,
+            session,
+            trace: cli.trace,
         },
         action,
     );
@@ -667,10 +1508,61 @@ fn stream_responses<R: BufRead>(
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown daemon error");
                 eprintln!("{error_message}");
-                return Ok(1);
+                return Ok(daemon_error_exit_code(&message));
             }
             _ => {}
         }
+    }
+}
+
+/// Stable process statuses for daemon failures. Explicit daemon statuses win,
+/// followed by Agent Reliability v2 typed codes; legacy errors remain status 1.
+fn daemon_error_exit_code(message: &Value) -> i32 {
+    if let Some(exit_code) = message
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .filter(|code| (1..=255).contains(code))
+    {
+        return exit_code as i32;
+    }
+
+    let code = message
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .or_else(|| {
+            message
+                .get("data")
+                .and_then(|data| data.get("error"))
+                .and_then(|error| error.get("code"))
+        })
+        .and_then(Value::as_str);
+
+    match code {
+        Some(
+            "STALE_REF"
+            | "STALE_STATE"
+            | "AMBIGUOUS_TARGET"
+            | "TARGET_MISSING"
+            | "TARGET_HIDDEN"
+            | "TARGET_OBSCURED"
+            | "TARGET_DISABLED"
+            | "UNSUPPORTED_CONTEXT",
+        ) => 3,
+        Some("WAIT_TIMEOUT") => 4,
+        Some("LEASE_CONFLICT") => 5,
+        Some("DOWNLOAD_FAILED") => 7,
+        Some("CONFIRMATION_INVALID") => 8,
+        Some(
+            "PAGE_CLOSED"
+            | "FRAME_DETACHED"
+            | "POPUP_OPENED"
+            | "CDP_DISCOVERY_FAILED"
+            | "CDP_ATTACH_FAILED"
+            | "RENDERER_UNRESPONSIVE"
+            | "DAEMON_VERSION_MISMATCH"
+            | "PROTOCOL_VERSION_MISMATCH",
+        ) => 6,
+        _ => 1,
     }
 }
 
@@ -769,8 +1661,12 @@ fn print_status(data: &Value) -> Result<(), Box<dyn Error>> {
 }
 
 fn read_script_from_stdin() -> io::Result<String> {
+    read_text_stream(&mut io::stdin())
+}
+
+fn read_text_stream(reader: &mut impl Read) -> io::Result<String> {
     let mut script = String::new();
-    io::stdin().read_to_string(&mut script)?;
+    reader.read_to_string(&mut script)?;
     Ok(script)
 }
 
@@ -803,8 +1699,61 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{
+        apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
+        cli_error_exit_code, read_text_stream, stream_responses, Cli, Command, ResultMode,
+        SessionCommand, TraceCommand,
+    };
     use clap::Parser;
+    use serde_json::json;
+    use std::io::Cursor;
+
+    fn response_exit_code(response: &str) -> i32 {
+        stream_responses(&mut Cursor::new(response.as_bytes()), ResultMode::None).unwrap()
+    }
+
+    #[test]
+    fn maps_typed_agent_errors_to_stable_exit_codes() {
+        let cases = [
+            ("STALE_REF", 3),
+            ("AMBIGUOUS_TARGET", 3),
+            ("TARGET_DISABLED", 3),
+            ("WAIT_TIMEOUT", 4),
+            ("LEASE_CONFLICT", 5),
+            ("CDP_ATTACH_FAILED", 6),
+            ("PROTOCOL_VERSION_MISMATCH", 6),
+            ("DOWNLOAD_FAILED", 7),
+            ("CONFIRMATION_INVALID", 8),
+        ];
+
+        for (code, expected) in cases {
+            let response = format!(
+                "{{\"type\":\"error\",\"message\":\"failed\",\"error\":{{\"code\":\"{code}\",\"message\":\"failed\",\"recoverable\":false}}}}\n"
+            );
+            assert_eq!(response_exit_code(&response), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn prefers_explicit_exit_code_and_preserves_legacy_errors() {
+        assert_eq!(
+            response_exit_code("{\"type\":\"error\",\"message\":\"failed\",\"exitCode\":7}\n"),
+            7
+        );
+        assert_eq!(
+            response_exit_code("{\"type\":\"error\",\"message\":\"legacy failure\"}\n"),
+            1
+        );
+    }
+
+    #[test]
+    fn maps_local_validation_and_runtime_errors() {
+        let validation = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid target");
+        let runtime = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "offline");
+
+        assert_eq!(cli_error_exit_code(&validation), 2);
+        assert_eq!(cli_error_exit_code(&runtime), 6);
+    }
 
     #[test]
     fn parses_interactive_agent_commands() {
@@ -870,6 +1819,268 @@ mod tests {
     }
 
     #[test]
+    fn parses_navigation_and_upload_commands_with_required_targets() {
+        for args in [
+            vec!["dev-browser", "back", "--page", "TARGET"],
+            vec!["dev-browser", "forward", "--page", "TARGET"],
+            vec!["dev-browser", "reload", "--page", "TARGET"],
+            vec![
+                "dev-browser",
+                "upload",
+                "--ref",
+                "R14",
+                "--file",
+                "C:\\Users\\tester\\.dev-browser\\tmp\\fixture.txt",
+                "--page",
+                "TARGET",
+            ],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+        assert!(Cli::try_parse_from(["dev-browser", "upload", "--ref", "R1"]).is_err());
+        assert!(Cli::try_parse_from(["dev-browser", "upload", "--file", "fixture.txt"]).is_err());
+    }
+
+    #[test]
+    fn preserves_scoped_frame_refs_for_interactive_commands() {
+        let cli = Cli::try_parse_from(["dev-browser", "click", "--ref", "F12:R34"])
+            .expect("scoped frame ref should parse");
+        match cli.command {
+            Some(Command::Click { ref_id, .. }) => assert_eq!(ref_id.as_deref(), Some("F12:R34")),
+            _ => panic!("expected click command"),
+        }
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            &format!("F{}:R1", "1".repeat(40))
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_every_observe_flag() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "observe",
+            "--page",
+            "TARGET",
+            "--full",
+            "--delta",
+            "--track",
+            "checkout",
+            "--max-nodes",
+            "999",
+            "--max-chars",
+            "99999",
+            "--depth",
+            "49",
+            "--breadth",
+            "499",
+            "--continuation",
+            "eyJ2IjoxLCJvZmZzZXQiOjN9",
+            "--annotate",
+            "--full-page",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Observe {
+                full: true,
+                delta: true,
+                ref track,
+                max_nodes: 999,
+                max_chars: 99_999,
+                depth: 49,
+                breadth: 499,
+                continuation: Some(_),
+                ref output,
+                ..
+            }) if track == "checkout" && output.annotate && output.full_page
+        ));
+    }
+
+    #[test]
+    fn parses_every_wait_flag_on_trusted_actions() {
+        let flags = [
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--wait-mode",
+            "any",
+            "--wait-timeout",
+            "1200",
+            "--wait-text",
+            "visible,body,contains,Saved",
+            "--wait-url",
+            "glob,**/done",
+            "--wait-ref",
+            "R7,attributeChanged,aria-expanded,true",
+            "--wait-dialog",
+            "opened",
+            "--wait-toast",
+            "closed",
+            "--wait-popup",
+            "--wait-download",
+            "--wait-file-chooser",
+            "--wait-navigation",
+            "document",
+            "--wait-response",
+            "contains,/api,POST,200",
+            "--wait-failed-request",
+            "contains,/failure,GET",
+            "--wait-network-idle",
+            "250",
+        ];
+        let parsed = Cli::try_parse_from(flags).unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Click { ref wait, .. }) if wait.build_spec(None).unwrap().unwrap()["conditions"].as_array().unwrap().len() == 12)
+        );
+
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "type",
+            "--text",
+            "x",
+            "--wait-mode",
+            "sometimes",
+            "--wait-popup"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R1",
+            "--wait-timeout",
+            "120001",
+            "--wait-popup"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_and_serializes_every_click_retry_policy() {
+        for policy in ["never", "safe", "once"] {
+            let parsed =
+                Cli::try_parse_from(["dev-browser", "click", "--ref", "R2", "--retry", policy])
+                    .unwrap();
+            let Some(Command::Click { retry, .. }) = parsed.command else {
+                panic!("expected click command");
+            };
+            let mut action = serde_json::json!({ "kind": "click" });
+            apply_retry_policy(&mut action, retry);
+            assert_eq!(action["retry"], policy);
+        }
+        assert!(
+            Cli::try_parse_from(["dev-browser", "click", "--ref", "R2", "--retry", "always"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_action_annotation_and_focused_shot_options() {
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--annotate",
+            "--full-page",
+        ])
+        .unwrap();
+        assert!(matches!(
+            click.command,
+            Some(Command::Click { ref output, .. }) if output.annotate && output.full_page
+        ));
+
+        let shot = Cli::try_parse_from([
+            "dev-browser",
+            "shot",
+            "focused.png",
+            "--page",
+            "TARGET",
+            "--ref",
+            "R7",
+            "--padding",
+            "32",
+            "--full-page",
+        ])
+        .unwrap();
+        assert!(matches!(
+            shot.command,
+            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, .. })
+                if ref_id.as_deref() == Some("R7")
+        ));
+    }
+
+    #[test]
+    fn parses_state_session_flags_and_all_session_commands() {
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--from-state",
+            "doc-1:7",
+            "--strict-state",
+            "--session",
+            "opaque-session",
+        ])
+        .unwrap();
+        assert!(
+            matches!(click.command, Some(Command::Click { ref output, .. })
+            if output.from_state.as_deref() == Some("doc-1:7") && output.strict_state
+                && output.session.as_deref() == Some("opaque-session"))
+        );
+
+        for args in [
+            vec![
+                "dev-browser",
+                "session",
+                "open",
+                "--browser",
+                "default",
+                "--page",
+                "TARGET",
+                "--ttl",
+                "300",
+            ],
+            vec![
+                "dev-browser",
+                "session",
+                "renew",
+                "--session",
+                "opaque",
+                "--ttl",
+                "60",
+            ],
+            vec!["dev-browser", "session", "close", "--session", "opaque"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+
+        let opened =
+            Cli::try_parse_from(["dev-browser", "session", "open", "--page", "TARGET"]).unwrap();
+        assert!(matches!(
+            opened.command,
+            Some(Command::Session(SessionCommand::Open { ttl: 300, .. }))
+        ));
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "session",
+            "open",
+            "--page",
+            "TARGET",
+            "--ttl",
+            "0"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn rejects_ambiguous_clicks() {
         let parsed = Cli::try_parse_from(["dev-browser", "click", "--page", "main"]);
         assert!(parsed.is_err());
@@ -889,7 +2100,251 @@ mod tests {
 
     #[test]
     fn preserves_script_commands() {
-        let parsed = Cli::try_parse_from(["dev-browser", "run", "script.js"]).unwrap();
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "--session", "opaque", "run", "script.js"])
+                .unwrap();
+        assert_eq!(parsed.session.as_deref(), Some("opaque"));
         assert!(matches!(parsed.command, Some(Command::Run { .. })));
+
+        let request = build_execute_request(
+            "execute-1".to_string(),
+            "default",
+            "await browser.listPages()".to_string(),
+            30_000,
+            Some("opaque"),
+        );
+        assert_eq!(request["session"], "opaque");
+    }
+
+    #[test]
+    fn parses_every_interaction_primitive_and_enforces_exclusivity() {
+        for args in [
+            vec!["dev-browser", "focus", "--ref", "R1"],
+            vec!["dev-browser", "press", "--ref", "R1", "--key", "Enter"],
+            vec!["dev-browser", "paste", "--ref", "R1", "--text-stdin"],
+            vec!["dev-browser", "scroll", "--ref", "R1"],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--delta-y",
+                "600",
+                "--delta-x",
+                "-10",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--direction",
+                "down",
+                "--pages",
+                "2",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--until",
+                "text:Done",
+                "--max-steps",
+                "50",
+            ],
+            vec!["dev-browser", "select", "--ref", "R1", "--value", "ci"],
+            vec!["dev-browser", "select", "--ref", "R1", "--label", "Nigeria"],
+            vec!["dev-browser", "check", "--ref", "R1"],
+            vec!["dev-browser", "uncheck", "--ref", "R1"],
+            vec!["dev-browser", "hover", "--ref", "R1"],
+            vec!["dev-browser", "drag", "--from", "R1", "--to", "R2"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+        for args in [
+            vec!["dev-browser", "paste", "--ref", "R1"],
+            vec![
+                "dev-browser",
+                "paste",
+                "--ref",
+                "R1",
+                "--text-stdin",
+                "--shot",
+            ],
+            vec![
+                "dev-browser",
+                "paste",
+                "--ref",
+                "R1",
+                "--text-stdin",
+                "--annotate",
+            ],
+            vec![
+                "dev-browser",
+                "select",
+                "--ref",
+                "R1",
+                "--value",
+                "ci",
+                "--label",
+                "CI",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--until",
+                "text:Done",
+                "--max-steps",
+                "51",
+            ],
+            vec!["dev-browser", "scroll", "--ref", "R1", "--delta-y", "10"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_scoped_confirmation_issue_and_consumption() {
+        let confirm = Cli::try_parse_from([
+            "dev-browser",
+            "confirm",
+            "--page",
+            "checkout",
+            "--ref",
+            "F2:R8",
+            "--expect",
+            "Naminsita Bakayoko",
+        ])
+        .unwrap();
+        assert!(
+            matches!(confirm.command, Some(Command::Confirm { ref ref_id, ref expect, .. }) if ref_id == "F2:R8" && expect == "Naminsita Bakayoko")
+        );
+
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--page",
+            "checkout",
+            "--ref",
+            "F2:R8",
+            "--from-state",
+            "doc-7:10",
+            "--confirm-token",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+        ])
+        .unwrap();
+        assert!(
+            matches!(click.command, Some(Command::Click { ref output, .. }) if output.confirm_token.as_deref() == Some("abcdefghijklmnopqrstuvwxyzABCDEF"))
+        );
+    }
+
+    #[test]
+    fn paste_consumes_exact_stdin_once_and_builds_only_a_paste_action() {
+        let parsed =
+            Cli::try_parse_from(["dev-browser", "paste", "--ref", "R7", "--text-stdin"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Paste { .. })));
+        let mut stdin = std::io::Cursor::new(b"secret\nwith newline".to_vec());
+        let text = read_text_stream(&mut stdin).unwrap();
+        assert_eq!(text, "secret\nwith newline");
+        let action =
+            build_primitive_action("paste", &[("ref", json!("R7")), ("text", json!(text))]);
+        assert_eq!(
+            action,
+            json!({ "kind": "paste", "ref": "R7", "text": "secret\nwith newline" })
+        );
+        assert_eq!(stdin.position(), 19);
+    }
+
+    #[test]
+    fn parses_and_serializes_every_structured_find_filter() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--role",
+            "button",
+            "--name",
+            "Connect",
+            "--name-mode",
+            "contains",
+            "--within",
+            "main",
+            "--near",
+            "Profile",
+            "--frame",
+            "F0",
+            "--scope",
+            "document",
+            "--state",
+            "enabled",
+            "--state",
+            "collapsed",
+            "--index",
+            "1",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Some(Command::Find { ref role, ref name, ref states, index: Some(1), .. }) if role.as_deref() == Some("button") && name.as_deref() == Some("Connect") && states.len() == 2)
+        );
+        let action = build_find_action(
+            None,
+            Some("button"),
+            Some("Connect"),
+            "contains",
+            Some("main"),
+            Some("Profile"),
+            Some("F0"),
+            "document",
+            &["enabled", "collapsed"],
+            Some(1),
+            5,
+        );
+        assert_eq!(
+            action,
+            json!({ "kind": "find", "role": "button", "name": "Connect", "nameMode": "contains", "within": "main", "near": "Profile", "frame": "F0", "scope": "document", "states": ["enabled", "collapsed"], "index": 1, "limit": 5 })
+        );
+        assert!(Cli::try_parse_from(["dev-browser", "find"]).is_err());
+        assert!(Cli::try_parse_from(["dev-browser", "find", "--name-mode", "contains"]).is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--role",
+            "button",
+            "--index",
+            "1000"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_doctor_schema_capabilities_and_examples() {
+        let doctor = Cli::try_parse_from(["dev-browser", "doctor", "--connect", "--json"]).unwrap();
+        assert_eq!(doctor.connect.as_deref(), Some("auto"));
+        assert!(matches!(
+            doctor.command,
+            Some(Command::Doctor { json: true })
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "schema", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Schema { json: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "capabilities", "--compact"])
+                .unwrap()
+                .command,
+            Some(Command::Capabilities { compact: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "examples", "click"]).unwrap().command,
+            Some(Command::Examples { command }) if command == "click"
+        ));
+        let traced =
+            Cli::try_parse_from(["dev-browser", "click", "--ref", "R1", "--trace"]).unwrap();
+        assert!(traced.trace);
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "trace", "show", "LAST"])
+                .unwrap()
+                .command,
+            Some(Command::Trace(TraceCommand::Show { trace_id })) if trace_id == "LAST"
+        ));
     }
 }
