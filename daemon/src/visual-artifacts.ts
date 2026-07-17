@@ -122,7 +122,7 @@ function withDeadline<T>(operation: Promise<T>, timeoutMs: number, description: 
 
 function isUnsupportedCdpScreenshot(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /method not found|wasn't found|not supported|not implemented|unknown method/i.test(message);
+  return /method not found|wasn't found|not supported|not implemented|unknown method|only available in/i.test(message);
 }
 
 async function addCaptureStabilityStyle(page: Page): Promise<string> {
@@ -241,36 +241,6 @@ function resizePng(png: Buffer, scale: number): Buffer {
   return encodePng(png.subarray(0, 8), decoded.header, pixels, width, height, decoded.bytesPerPixel);
 }
 
-function cropPng(
-  png: Buffer,
-  requested: { x: number; y: number; width: number; height: number }
-): Buffer {
-  const decoded = decodePng(png);
-  const { width: sourceWidth, height: sourceHeight, header, pixels, bytesPerPixel } = decoded;
-  const stride = sourceWidth * bytesPerPixel;
-
-  const x = Math.max(0, Math.floor(requested.x));
-  const y = Math.max(0, Math.floor(requested.y));
-  const width = Math.min(sourceWidth - x, Math.ceil(requested.width));
-  const height = Math.min(sourceHeight - y, Math.ceil(requested.height));
-  if (width <= 0 || height <= 0) throw new Error("Focused screenshot crop is empty");
-  const croppedStride = width * bytesPerPixel;
-  const cropped = Buffer.alloc(height * (croppedStride + 1));
-  for (let row = 0; row < height; row += 1) {
-    const outputOffset = row * (croppedStride + 1);
-    cropped[outputOffset] = 0;
-    pixels.copy(
-      cropped,
-      outputOffset + 1,
-      (y + row) * stride + x * bytesPerPixel,
-      (y + row) * stride + (x + width) * bytesPerPixel
-    );
-  }
-  const rawPixels = Buffer.alloc(width * height * bytesPerPixel);
-  for (let row = 0; row < height; row += 1) cropped.copy(rawPixels, row * croppedStride, row * (croppedStride + 1) + 1, row * (croppedStride + 1) + 1 + croppedStride);
-  return encodePng(png.subarray(0, 8), header, rawPixels, width, height, bytesPerPixel);
-}
-
 export async function captureVisualArtifacts(
   page: Page,
   perception: PagePerception,
@@ -355,6 +325,7 @@ export async function captureVisualArtifacts(
   const timeoutMs = options.timeoutMs ?? 8_000;
   const takeScreenshot = async (): Promise<{ png: Buffer; captureMode: ScreenshotArtifact["captureMode"] }> => {
     const startedAt = Date.now();
+    const remainingBudgetMs = () => Math.max(1, timeoutMs - (Date.now() - startedAt));
     let session: CDPSession | undefined;
     try {
       session = await withDeadline(page.context().newCDPSession(page), timeoutMs, "Screenshot capture");
@@ -365,7 +336,7 @@ export async function captureVisualArtifacts(
           captureBeyondViewport: options.fullPage,
           clip: crop ? { ...crop, scale: 1 } : undefined,
         }),
-        timeoutMs,
+        remainingBudgetMs(),
         "Screenshot capture"
       );
       return { png: resizePng(Buffer.from(response.data, "base64"), zoom), captureMode: "cdp" };

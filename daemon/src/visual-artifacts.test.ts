@@ -138,6 +138,60 @@ describe.sequential("visual artifacts", () => {
     }
   });
 
+  it("shares one deadline across CDP session creation and capture", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setContent("<button>Deadline target</button>");
+    const state = await collectPageState(page);
+    const session = {
+      send: vi.fn().mockImplementation(() => new Promise(() => {})),
+      detach: vi.fn().mockResolvedValue(undefined),
+    };
+    const newSession = vi
+      .spyOn(page.context(), "newCDPSession")
+      .mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(session as never), 300))
+      );
+    const screenshot = vi.spyOn(page, "screenshot").mockImplementation(() => new Promise(() => {}));
+    try {
+      const started = Date.now();
+      await expect(
+        captureVisualArtifacts(page, state, {
+          screenshotName: `visual-tests/deadline-${Date.now()}.png`,
+          timeoutMs: 500,
+        })
+      ).rejects.toThrow(/Screenshot capture timed out/);
+      expect(Date.now() - started).toBeLessThan(700);
+      expect(screenshot).not.toHaveBeenCalled();
+    } finally {
+      screenshot.mockRestore();
+      newSession.mockRestore();
+    }
+  });
+
+  it("never falls back to Playwright after a CDP capture deadline", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setContent("<button>No fallback target</button>");
+    const state = await collectPageState(page);
+    const session = {
+      send: vi.fn().mockImplementation(() => new Promise(() => {})),
+      detach: vi.fn().mockResolvedValue(undefined),
+    };
+    const newSession = vi.spyOn(page.context(), "newCDPSession").mockResolvedValue(session as never);
+    const screenshot = vi.spyOn(page, "screenshot").mockImplementation(() => new Promise(() => {}));
+    try {
+      await expect(
+        captureVisualArtifacts(page, state, {
+          screenshotName: `visual-tests/no-fallback-${Date.now()}.png`,
+          timeoutMs: 250,
+        })
+      ).rejects.toThrow(/Screenshot capture timed out/);
+      expect(screenshot).not.toHaveBeenCalled();
+    } finally {
+      screenshot.mockRestore();
+      newSession.mockRestore();
+    }
+  });
+
   it("draws deterministic non-overlapping labels and cleans the temporary overlay", async () => {
     const page = await manager.getPage("visual", "main");
     await page.setViewportSize({ width: 320, height: 180 });
