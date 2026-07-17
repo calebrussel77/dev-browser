@@ -3,6 +3,11 @@ import { describe, expect, it } from "vitest";
 import { parseRequest, serialize } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("parses opt-in traces and bounded trace lookup requests", () => {
+    expect(parseRequest(JSON.stringify({ id: "click-trace", type: "interactive", protocolVersion: 2, trace: true, action: { kind: "click", ref: "R1" } }))).toMatchObject({ success: true, request: { trace: true } });
+    expect(parseRequest(JSON.stringify({ id: "trace-last", type: "trace", action: "show", traceId: "LAST" }))).toMatchObject({ success: true, request: { traceId: "LAST" } });
+    expect(parseRequest(JSON.stringify({ id: "trace-bad", type: "trace", action: "show", traceId: "../daemon.pid" }))).toMatchObject({ success: false });
+  });
   it("redacts every serialized response while revealing only the issued confirmation token field", () => {
     const token = "abcdefghijklmnopqrstuvwxyzABCDEF";
     const expected = "recipient-secret";

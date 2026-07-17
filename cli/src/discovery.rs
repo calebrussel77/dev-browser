@@ -11,7 +11,7 @@ pub fn agent_schema() -> Value {
             "find", "click", "focus", "press", "paste", "scroll", "select", "check",
             "uncheck", "hover", "drag", "type", "confirm", "shot", "upload",
             "session", "browsers", "install", "status", "stop", "doctor", "schema",
-            "capabilities", "examples", "install-skill"
+            "capabilities", "examples", "trace", "install-skill"
         ],
         "interactiveActions": [
             "pages", "navigate", "back", "forward", "reload", "read", "observe", "find",
@@ -60,7 +60,7 @@ pub fn compact_capabilities() -> Value {
         "perception": ["observe", "delta", "refs", "annotated-screenshot", "frames", "open-shadow-dom"],
         "safety": ["state-guards", "target-fingerprints", "leases", "typed-waits", "safe-retry", "confirmation-tokens", "redaction"],
         "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
-        "discovery": ["doctor", "schema", "capabilities", "examples"],
+        "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],
         "runtimeHandshake": true,
         "quickjs": true
     })
@@ -77,6 +77,7 @@ pub fn focused_example(command: &str) -> Option<&'static str> {
         "doctor" => Some("dev-browser doctor --connect --json"),
         "schema" => Some("dev-browser schema --json"),
         "capabilities" => Some("dev-browser capabilities --compact"),
+        "trace" => Some("dev-browser click --page TARGET --ref R7 --trace && dev-browser trace show LAST"),
         _ => None,
     }
 }

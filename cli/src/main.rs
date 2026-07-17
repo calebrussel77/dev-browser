@@ -205,6 +205,9 @@ struct Cli {
     )]
     timeout: u32,
 
+    #[arg(long, global = true, help = "Persist a bounded redacted action trace")]
+    trace: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -282,6 +285,14 @@ enum SessionCommand {
     Close {
         #[arg(long, value_name = "SESSION_ID")]
         session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    Show {
+        #[arg(value_name = "ID_OR_LAST")]
+        trace_id: String,
     },
 }
 
@@ -721,6 +732,8 @@ enum Command {
         #[arg(value_name = "COMMAND")]
         command: String,
     },
+    #[command(subcommand, about = "Read a bounded redacted action trace")]
+    Trace(TraceCommand),
     #[command(
         about = "Install Playwright browsers (Chromium)",
         long_about = "Install Playwright browsers (Chromium).\n\nDownloads the Chromium build used for daemon-managed browser instances."
@@ -1233,6 +1246,13 @@ fn run() -> Result<i32, Box<dyn Error>> {
             println!("{example}");
             Ok(0)
         }
+        Some(Command::Trace(TraceCommand::Show { trace_id })) => {
+            ensure_daemon()?;
+            send_request(
+                json!({ "id": request_id("trace-show"), "type": "trace", "action": "show", "traceId": trace_id }),
+                ResultMode::Json,
+            )
+        }
         Some(Command::InstallSkill { claude, agents }) => {
             install_skill(*claude, *agents)?;
             Ok(0)
@@ -1435,6 +1455,7 @@ fn run_interactive(
             ignore_https_errors: cli.ignore_https_errors,
             timeout_ms: timeout_ms(cli)?,
             session,
+            trace: cli.trace,
         },
         action,
     );
@@ -1681,7 +1702,7 @@ mod tests {
     use super::{
         apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
         cli_error_exit_code, read_text_stream, stream_responses, Cli, Command, ResultMode,
-        SessionCommand,
+        SessionCommand, TraceCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2315,6 +2336,15 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["dev-browser", "examples", "click"]).unwrap().command,
             Some(Command::Examples { command }) if command == "click"
+        ));
+        let traced =
+            Cli::try_parse_from(["dev-browser", "click", "--ref", "R1", "--trace"]).unwrap();
+        assert!(traced.trace);
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "trace", "show", "LAST"])
+                .unwrap()
+                .command,
+            Some(Command::Trace(TraceCommand::Show { trace_id })) if trace_id == "LAST"
         ));
     }
 }

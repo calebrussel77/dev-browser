@@ -11,6 +11,7 @@ import {
 } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
+import { getLatestStateId } from "./page-state.js";
 import { authorizeExecuteRequest } from "./execute-policy.js";
 import { createKeyedLock, createMutex } from "./lock.js";
 import {
@@ -28,12 +29,14 @@ import {
   type InteractiveRequest,
   type RestartRequest,
   type SessionRequest,
+  type TraceRequest,
   type Response,
 } from "./protocol.js";
 import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 import { redactSensitive } from "./redaction.js";
+import { traceStore } from "./trace-store.js";
 import {
   buildRuntimeHandshake,
   currentProcessHash,
@@ -241,9 +244,89 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
 
 async function handleInteractive(socket: net.Socket, request: InteractiveRequest): Promise<void> {
   await withBrowserLock(request.browser, async () => {
+    const startedAt = new Date().toISOString();
+    const started = Date.now();
+    const traceId = request.trace ? traceStore.allocateId() : undefined;
+    let tracePage: Awaited<ReturnType<BrowserManager["getPage"]>> | undefined;
+    let before: Record<string, unknown> | undefined;
+    let beforeScreenshot: string | undefined;
+    const traceWarnings: string[] = request.connect
+      ? ["External CDP tracing is best-effort; browser-context tracing may be unavailable"]
+      : [];
+    const diagnostics = {
+      consoleErrors: [] as unknown[], pageErrors: [] as unknown[], failedRequests: [] as unknown[],
+      responses: [] as unknown[], popup: [] as unknown[], download: [] as unknown[],
+      fileChooser: [] as unknown[], navigation: [] as unknown[],
+    };
+    const boundedPush = (items: unknown[], value: unknown) => { if (items.length < 20) items.push(value); };
+    const responseConditions = "wait" in request.action
+      ? request.action.wait?.conditions.filter((condition) => condition.kind === "response") ?? []
+      : [];
+    const matchesResponseWait = (url: string, method: string, status: number) => responseConditions.some((condition) => {
+      const urlMatches = condition.match === "exact" ? url === condition.value : url.includes(condition.value.replaceAll("*", ""));
+      return urlMatches && (!condition.method || condition.method === method) && (!condition.status || condition.status === status);
+    });
+    const listeners = {
+      console: (message: { type(): string; text(): string }) => { if (message.type() === "error") boundedPush(diagnostics.consoleErrors, message.text()); },
+      pageerror: (error: Error) => boundedPush(diagnostics.pageErrors, error.message),
+      requestfailed: (failed: { url(): string; method(): string; failure(): { errorText: string } | null }) => boundedPush(diagnostics.failedRequests, { url: failed.url(), method: failed.method(), error: failed.failure()?.errorText }),
+      response: (response: { url(): string; status(): number; request(): { method(): string } }) => { const method = response.request().method(); if (response.status() >= 400 || matchesResponseWait(response.url(), method, response.status())) boundedPush(diagnostics.responses, { url: response.url(), status: response.status(), method }); },
+      popup: (popup: { url(): string }) => boundedPush(diagnostics.popup, { url: popup.url() }),
+      download: (download: { suggestedFilename(): string }) => boundedPush(diagnostics.download, { filename: download.suggestedFilename() }),
+      filechooser: () => boundedPush(diagnostics.fileChooser, { opened: true }),
+      framenavigated: (frame: { url(): string; parentFrame(): unknown }) => { if (!frame.parentFrame()) boundedPush(diagnostics.navigation, { url: frame.url() }); },
+    };
+    const detachTraceListeners = () => {
+      if (!tracePage) return;
+      for (const [event, listener] of Object.entries(listeners)) tracePage.off(event as never, listener as never);
+    };
+    const finishTrace = async (result?: Record<string, unknown>, error?: unknown) => {
+      if (!traceId) return undefined;
+      detachTraceListeners();
+      const after = tracePage && !tracePage.isClosed()
+        ? { url: tracePage.url(), stateId: getLatestStateId(tracePage) }
+        : { closed: true };
+      const record = await traceStore.save({
+        actionId: request.id, action: request.action.kind, startedAt,
+        finishedAt: new Date().toISOString(), durationMs: Date.now() - started,
+        page: { browser: request.browser, target: request.page, before, after },
+        resolvedTarget: result?.clicked ?? result?.typed ?? result?.uploaded ?? result?.targets,
+        inputMethod: (result?.clicked as { method?: string } | undefined)?.method ?? (result?.attemptJournal as Array<{ inputMethod?: string }> | undefined)?.at(-1)?.inputMethod,
+        screenshots: { requested: Boolean(request.shot), before: beforeScreenshot, after: result?.screenshotPath, artifacts: result?.artifacts },
+        diagnostics, waitResult: result?.waitResult,
+        attempts: result?.attemptJournal,
+        events: { popup: result?.popup, download: result?.download, navigation: result?.navigation },
+        error: error ? toAgentError(error) : undefined,
+        recoveryHints: error ? toAgentError(error).nextCommands : result?.warnings,
+        warnings: traceWarnings,
+      }, traceId);
+      return { id: record.id, path: record.path, nextCommand: `dev-browser trace show ${record.id}` };
+    };
     try {
       await prepareBrowser(request);
+      if (traceId) {
+        tracePage = await manager.getPage(request.browser, request.page);
+        before = { url: tracePage.url(), stateId: getLatestStateId(tracePage) };
+        for (const [event, listener] of Object.entries(listeners)) tracePage.on(event as never, listener as never);
+        if (request.shot) {
+          try {
+            beforeScreenshot = await traceStore.artifactPath(traceId, "before.png");
+            await tracePage.screenshot({ path: beforeScreenshot, type: "png" });
+          } catch (screenshotError) {
+            beforeScreenshot = undefined;
+            traceWarnings.push(`Before screenshot unavailable: ${redactSensitive(formatError(screenshotError)) as string}`);
+          }
+        }
+      }
       const result = await executeInteractiveAction(manager, request);
+      if (traceWarnings.length) result.warnings = [...(result.warnings ?? []), ...traceWarnings];
+      let trace;
+      try { trace = await finishTrace(result as unknown as Record<string, unknown>); }
+      catch (traceError) {
+        detachTraceListeners();
+        result.warnings = [...(result.warnings ?? []), `Trace unavailable: ${redactSensitive(formatError(traceError)) as string}`];
+      }
+      if (trace) (result as unknown as Record<string, unknown>).trace = trace;
       await writeMessage(socket, {
         id: request.id,
         type: "result",
@@ -264,6 +347,9 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
         success: true,
       });
     } catch (error) {
+      let trace: Awaited<ReturnType<typeof finishTrace>>;
+      try { trace = await finishTrace(undefined, error); }
+      catch { detachTraceListeners(); }
       const action = request.action;
       const secrets = [
         action.kind === "confirm" || action.kind === "click" ? action.expectText : undefined,
@@ -272,12 +358,14 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
         "confirmToken" in action ? action.confirmToken : undefined,
       ].filter((value): value is string => Boolean(value));
       if (request.protocolVersion === 2) {
+        const agentError = toAgentError(error);
+        if (trace) agentError.details = { ...(agentError.details ?? {}), trace };
         const failure = buildInteractiveFailure({
           requestId: request.id,
           browser: request.browser,
           page: request.page,
           action: request.action.kind,
-          error: redactSensitive(toAgentError(error), { secrets }),
+          error: redactSensitive(agentError, { secrets }),
         });
         await writeMessage(socket, {
           id: request.id,
@@ -320,6 +408,21 @@ async function handleSession(socket: net.Socket, request: SessionRequest): Promi
       exitCode: agentErrorExitCode(failure.error.code),
       error: failure.error,
       data: failure,
+    });
+  }
+}
+
+async function handleTrace(socket: net.Socket, request: TraceRequest): Promise<void> {
+  try {
+    const data = await traceStore.read(request.traceId);
+    await writeMessage(socket, { id: request.id, type: "result", data });
+    await writeMessage(socket, { id: request.id, type: "complete", success: true });
+  } catch (error) {
+    await writeMessage(socket, {
+      id: request.id,
+      type: "error",
+      message: redactSensitive(formatError(error)) as string,
+      exitCode: 2,
     });
   }
 }
@@ -495,6 +598,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
 
       case "session":
         await handleSession(socket, request);
+        return;
+
+      case "trace":
+        await handleTrace(socket, request);
         return;
 
       case "browsers":

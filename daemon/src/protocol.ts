@@ -369,6 +369,7 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   connect: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
   session: z.string().min(1).max(500).optional(),
+  trace: z.boolean().default(false),
 }).superRefine((value, context) => {
   if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
     context.addIssue({
@@ -461,6 +462,12 @@ const RestartRequestSchema = RequestBaseSchema.extend({
   ifIdle: z.literal(true),
 });
 
+const TraceRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("trace"),
+  action: z.literal("show"),
+  traceId: z.union([z.literal("LAST"), z.string().regex(/^[a-z0-9-]{8,80}$/)]),
+});
+
 const RequestSchema = z.union([
   ExecuteRequestSchema,
   InteractiveRequestSchema,
@@ -472,6 +479,7 @@ const RequestSchema = z.union([
   HandshakeRequestSchema,
   RestartRequestSchema,
   SessionRequestSchema,
+  TraceRequestSchema,
 ]);
 
 const ResponseBaseSchema = z.object({
@@ -519,6 +527,7 @@ export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 export type SessionRequest = z.infer<typeof SessionRequestSchema>;
 export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
 export type RestartRequest = z.infer<typeof RestartRequestSchema>;
+export type TraceRequest = z.infer<typeof TraceRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }
@@ -548,11 +557,12 @@ type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   : never;
 export type InteractiveRequest = Omit<
   z.infer<typeof InteractiveRequestSchema>,
-  "protocolVersion" | "annotate" | "fullPage" | "action"
+  "protocolVersion" | "annotate" | "fullPage" | "trace" | "action"
 > & {
   protocolVersion?: 1 | 2;
   annotate?: boolean;
   fullPage?: boolean;
+  trace?: boolean;
   action: InputInteractiveAction;
 };
 export type Response = z.infer<typeof ResponseSchema>;
