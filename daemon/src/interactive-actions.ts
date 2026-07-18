@@ -32,7 +32,7 @@ import {
   type PerceptionElement,
 } from "./perception/collector.js";
 import type { InteractiveRequest, WaitSpec } from "./protocol.js";
-import { discardValidationState, getLatestStateId } from "./page-state.js";
+import { discardValidationState, getLatestStateId, getRecordedState } from "./page-state.js";
 import { validateObservedDecision } from "./ref-state.js";
 import {
   retryDecision,
@@ -676,7 +676,25 @@ export async function executeInteractiveAction(
   const validateDecisionRefs = async (refs: Array<string | undefined>) => {
     if (protocolVersion !== 2) return;
     const previousLatestStateId = getLatestStateId(page);
-    const latest = await perceive(page, {}, false);
+    // Revalidate against the same scoped collection that produced the refs:
+    // on heavy pages an unscoped default-budget walk never reaches mid-page
+    // elements, so refs from a scoped observe would always read as stale.
+    const sourceStateId = ("fromState" in action ? action.fromState : undefined) ?? previousLatestStateId;
+    const sourceScope = sourceStateId ? getRecordedState(page, sourceStateId)?.scope : undefined;
+    let latest: PagePerception;
+    try {
+      latest = await perceive(page, sourceScope ? { scope: sourceScope } : {}, false);
+    } catch (error) {
+      // The scope root itself is gone or ambiguous now; fall back to the
+      // unscoped walk so the per-ref check reports staleness normally.
+      if (
+        sourceScope &&
+        error instanceof AgentProtocolError &&
+        (error.code === "TARGET_MISSING" || error.code === "AMBIGUOUS_TARGET")
+      ) {
+        latest = await perceive(page, {}, false);
+      } else throw error;
+    }
     try {
       for (const ref of refs) {
         result.warnings = [
@@ -988,7 +1006,34 @@ export async function executeInteractiveAction(
       const findLimit = action.limit ?? DEFAULT_FIND_LIMIT;
 
       if (!action.scrollContainer) {
-        const perception = await perceive(page, {}, protocolVersion === 1);
+        // Scope the collection itself when --within names a resolvable
+        // container, so the node budget is spent inside the requested
+        // landmark instead of on page chrome that starves mid-page elements.
+        // Landmarks stay absolute under scoped collection, so the within
+        // post-filter in findTargets keeps matching.
+        const collectWithin =
+          action.within && !action.frame && isValidWithinScope(action.within)
+            ? action.within
+            : undefined;
+        let perception: PagePerception;
+        try {
+          perception = await perceive(
+            page,
+            collectWithin ? { scope: { within: collectWithin } } : {},
+            protocolVersion === 1
+          );
+        } catch (error) {
+          // find's within filter tolerates zero or many containers; only a
+          // unique root can scope collection, so fall back to the unscoped
+          // walk with post-collection filtering.
+          if (
+            collectWithin &&
+            error instanceof AgentProtocolError &&
+            (error.code === "TARGET_MISSING" || error.code === "AMBIGUOUS_TARGET")
+          ) {
+            perception = await perceive(page, {}, protocolVersion === 1);
+          } else throw error;
+        }
         applyPerception(result, perception, protocolVersion, protocolVersion === 1);
         const targeted = findTargets(
           perception.elements.filter((element) => element.actionable),

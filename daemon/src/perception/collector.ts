@@ -559,7 +559,15 @@ export async function collectPageState(
   const maxDepth = bounded(options.depth, DEFAULTS.depth, 50);
   const breadth = bounded(options.breadth, DEFAULTS.breadth, 500);
   const maxChars = bounded(options.maxChars, DEFAULTS.maxChars, 100_000);
-  const scope = options.scope && (options.scope.ref || options.scope.within) ? options.scope : undefined;
+  // Normalize away undefined keys: the scope object is recorded on the state
+  // snapshot and embedded in typed error details, which must stay JSON-safe.
+  const scope =
+    options.scope && (options.scope.ref || options.scope.within)
+      ? {
+          ...(options.scope.ref ? { ref: options.scope.ref } : {}),
+          ...(options.scope.within ? { within: options.scope.within } : {}),
+        }
+      : undefined;
   // Refs arrive in scoped `F#:R#` (or bare `R#`) form; the realm registry is
   // keyed by the local `R#` part, so parse before the in-page lookup.
   let realmScope: { ref?: string; within?: string } | undefined = scope;
@@ -669,6 +677,7 @@ export async function collectPageState(
     url: top.url, title: top.title,
     focusedRef: records.find((record) => record.focused)?.ref || null,
     elements: records,
+    scope,
   }, options.delta ?? false);
   const viewport = top.viewport;
   const coordinate = await page.evaluate(() => ({ devicePixelRatio, scroll: { x: scrollX, y: scrollY } }));

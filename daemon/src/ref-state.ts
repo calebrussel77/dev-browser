@@ -44,8 +44,14 @@ export function validateObservedDecision(
   if (ref) {
     const sourceState = fromState ? getRecordedState(page, fromState) : previousLatestStateId ? getRecordedState(page, previousLatestStateId) : undefined;
     const expected = sourceState?.elements.get(ref);
-    const current = latest.elements.find((element) => element.ref === ref);
-    if (!expected || !current || semanticFingerprint(current) !== expected) {
+    // Look the current fingerprint up in the recorded snapshot (all collected
+    // records) rather than latest.elements, which is capped at the display
+    // maxNodes budget and would read refs beyond it as stale.
+    const currentElement = latest.elements.find((element) => element.ref === ref);
+    const current = currentElement
+      ? semanticFingerprint(currentElement)
+      : getRecordedState(page, latest.stateId)?.elements.get(ref);
+    if (!expected || !current || current !== expected) {
       stale(pageName, "STALE_REF", `Element ref "${ref}" is stale or semantically changed`, latest);
     }
   }

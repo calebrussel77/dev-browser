@@ -17,6 +17,10 @@ export interface Snapshot {
   focusedRef: string | null;
   elements: Map<string, string>;
   signature: string;
+  // The content scope the producing collection ran under, when any. Action-time
+  // ref revalidation replays the same scope so refs from a scoped observe are
+  // resolved against the same bounded collection that produced them.
+  scope?: { ref?: string; within?: string };
 }
 
 interface PageHistory {
