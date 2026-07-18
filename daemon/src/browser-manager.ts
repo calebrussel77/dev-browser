@@ -12,6 +12,7 @@ import {
 
 type SelectiveCdpTransportLike = Pick<
   SelectiveCdpTransport,
+  | "activateTarget"
   | "attachToTarget"
   | "close"
   | "detachFromTarget"
@@ -142,6 +143,7 @@ function isWebSocketEndpoint(endpoint: string): boolean {
 
 export class BrowserManager {
   private readonly browsers = new Map<string, BrowserEntry>();
+  private readonly targetPages = new WeakMap<BrowserEntry, Map<string, Page>>();
   private readonly baseDir: string;
   private readonly dependencies: BrowserManagerDependencies;
   private readonly supportsSelectiveTransport: boolean;
@@ -439,53 +441,65 @@ export class BrowserManager {
 
   async getPage(browserName: string, pageNameOrId: string): Promise<Page> {
     const entry = this.getBrowserEntry(browserName);
-    const existingPage = entry.pages.get(pageNameOrId);
-
-    if (existingPage && !existingPage.isClosed()) {
-      return existingPage;
-    }
-
-    entry.pages.delete(pageNameOrId);
 
     if (TARGET_ID_PATTERN.test(pageNameOrId)) {
+      const registeredPage = this.getRegisteredTargetPage(entry, pageNameOrId);
+      if (registeredPage) {
+        return registeredPage;
+      }
+
       let page = await this.findPageByTargetId(entry, pageNameOrId);
       if (page) {
         return page;
       }
 
       if (entry.selectiveTransport) {
-        const rawTarget = (await entry.selectiveTransport.listPageTargets()).find(
+        const availableTargets = await entry.selectiveTransport.listPageTargets();
+        const rawTarget = availableTargets.find(
           (target) => target.id === pageNameOrId
         );
+        const availableTargetIds = availableTargets.map((target) => target.id).sort();
+        if (!rawTarget) {
+          throw new Error(
+            `targetId "${pageNameOrId}" not found; available: ${JSON.stringify(availableTargetIds)}`
+          );
+        }
+
+        const pagesBeforeAttach = new Set(
+          this.getContextPages(entry).map(({ page: existingPage }) => existingPage)
+        );
+        await entry.selectiveTransport.activateTarget(pageNameOrId);
         await entry.selectiveTransport.attachToTarget(pageNameOrId);
         const attachTimeoutMs =
           entry.targetAttachTimeoutMs ?? SELECTIVE_TARGET_ATTACH_TIMEOUT_MS;
-        page = await this.waitForPageByTargetId(
+        page = await this.waitForNewPageAfterAttach(
           entry,
-          pageNameOrId,
+          pagesBeforeAttach,
           Math.min(attachTimeoutMs, SELECTIVE_TARGET_REUSE_TIMEOUT_MS)
         );
         if (page) {
+          this.registerTargetPage(entry, pageNameOrId, page);
           return page;
         }
 
         await entry.selectiveTransport.detachFromTarget(pageNameOrId).catch(() => undefined);
-        if (!rawTarget) {
-          throw new Error(`Chrome target "${pageNameOrId}" no longer exists`);
-        }
-
-        const fallbackPage = await entry.context.newPage();
-        this.registerNamedPage(entry, pageNameOrId, fallbackPage);
-        if (rawTarget.url && rawTarget.url !== "about:blank") {
-          await fallbackPage.goto(rawTarget.url, {
-            timeout: attachTimeoutMs,
-            waitUntil: "domcontentloaded",
-          });
-        }
-        return fallbackPage;
+        throw new Error(
+          `targetId "${pageNameOrId}" could not be resolved; available: ${JSON.stringify(availableTargetIds)}`
+        );
       }
+
+      const availableTargetIds = await this.listAttachedPageTargetIds(entry);
+      throw new Error(
+        `targetId "${pageNameOrId}" not found; available: ${JSON.stringify(availableTargetIds)}`
+      );
     }
 
+    const existingPage = entry.pages.get(pageNameOrId);
+    if (existingPage && !existingPage.isClosed()) {
+      return existingPage;
+    }
+
+    entry.pages.delete(pageNameOrId);
     const page = await entry.context.newPage();
     this.registerNamedPage(entry, pageNameOrId, page);
     return page;
@@ -501,6 +515,7 @@ export class BrowserManager {
     if (page.isClosed()) throw new Error("Popup page closed before registration");
     const targetId = await this.getPageTargetId(page.context(), page);
     if (!targetId) throw new Error("Popup target id is unavailable");
+    this.registerTargetPage(entry, targetId, page);
     this.registerNamedPage(entry, targetId, page);
     return targetId;
   }
@@ -509,6 +524,7 @@ export class BrowserManager {
     if (!TARGET_ID_PATTERN.test(targetId)) throw new Error("Popup target id is invalid");
     const entry = this.getBrowserEntry(browserName);
     if (page.isClosed()) throw new Error("Popup page closed before registration");
+    this.registerTargetPage(entry, targetId, page);
     this.registerNamedPage(entry, targetId, page);
   }
 
@@ -523,6 +539,7 @@ export class BrowserManager {
     }
 
     this.pruneClosedPages(entry);
+    this.pruneClosedTargetPages(entry);
     const namesByPage = this.getNamedPagesByPage(entry);
     const summaries = new Map<string, BrowserPageSummary>();
 
@@ -534,9 +551,13 @@ export class BrowserManager {
     }
 
     for (const { context, page } of this.getContextPages(entry)) {
-      const id = await this.getPageTargetId(context, page);
+      const registeredTargetId = this.getRegisteredTargetId(entry, page);
+      const id = registeredTargetId ?? (await this.getPageTargetId(context, page));
       if (!id) {
         continue;
+      }
+      if (!registeredTargetId) {
+        this.registerTargetPage(entry, id, page);
       }
 
       let title = "";
@@ -1333,6 +1354,71 @@ export class BrowserManager {
     });
   }
 
+  private registerTargetPage(entry: BrowserEntry, targetId: string, page: Page): void {
+    const pages = this.getTargetPages(entry);
+    const existingPage = pages.get(targetId);
+    if (existingPage === page) {
+      return;
+    }
+    if (existingPage && !existingPage.isClosed()) {
+      throw new Error(`targetId "${targetId}" is already bound to another Playwright page`);
+    }
+    for (const [registeredTargetId, registeredPage] of pages) {
+      if (registeredTargetId !== targetId && registeredPage === page && !page.isClosed()) {
+        throw new Error(
+          `Playwright page is already bound to targetId "${registeredTargetId}", refusing "${targetId}"`
+        );
+      }
+    }
+    pages.set(targetId, page);
+
+    page.on("close", () => {
+      if (pages.get(targetId) === page) {
+        pages.delete(targetId);
+      }
+    });
+  }
+
+  private getTargetPages(entry: BrowserEntry): Map<string, Page> {
+    let pages = this.targetPages.get(entry);
+    if (!pages) {
+      pages = new Map();
+      this.targetPages.set(entry, pages);
+    }
+    return pages;
+  }
+
+  private getRegisteredTargetPage(entry: BrowserEntry, targetId: string): Page | null {
+    const pages = this.getTargetPages(entry);
+    const page = pages.get(targetId);
+    if (!page) {
+      return null;
+    }
+    if (page.isClosed()) {
+      pages.delete(targetId);
+      return null;
+    }
+    return page;
+  }
+
+  private getRegisteredTargetId(entry: BrowserEntry, page: Page): string | null {
+    for (const [targetId, registeredPage] of this.getTargetPages(entry)) {
+      if (registeredPage === page && !page.isClosed()) {
+        return targetId;
+      }
+    }
+    return null;
+  }
+
+  private pruneClosedTargetPages(entry: BrowserEntry): void {
+    const pages = this.getTargetPages(entry);
+    for (const [targetId, page] of pages) {
+      if (page.isClosed()) {
+        pages.delete(targetId);
+      }
+    }
+  }
+
   private pruneClosedPages(entry: BrowserEntry): void {
     for (const [pageName, page] of entry.pages.entries()) {
       if (page.isClosed()) {
@@ -1401,6 +1487,7 @@ export class BrowserManager {
     for (const { context, page } of this.getContextPages(entry)) {
       const pageTargetId = await this.getPageTargetId(context, page);
       if (pageTargetId === targetId) {
+        this.registerTargetPage(entry, targetId, page);
         return page;
       }
     }
@@ -1408,16 +1495,35 @@ export class BrowserManager {
     return null;
   }
 
-  private async waitForPageByTargetId(
+  private async listAttachedPageTargetIds(entry: BrowserEntry): Promise<string[]> {
+    const targetIds = new Set<string>();
+    for (const { context, page } of this.getContextPages(entry)) {
+      const targetId =
+        this.getRegisteredTargetId(entry, page) ?? (await this.getPageTargetId(context, page));
+      if (targetId) {
+        targetIds.add(targetId);
+      }
+    }
+    return Array.from(targetIds).sort();
+  }
+
+  private async waitForNewPageAfterAttach(
     entry: BrowserEntry,
-    targetId: string,
+    pagesBeforeAttach: Set<Page>,
     timeoutMs: number
   ): Promise<Page | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const page = await this.findPageByTargetId(entry, targetId);
-      if (page) {
-        return page;
+      const newPages = this.getContextPages(entry)
+        .map(({ page }) => page)
+        .filter((page) => !pagesBeforeAttach.has(page));
+      if (newPages.length === 1) {
+        return newPages[0] ?? null;
+      }
+      if (newPages.length > 1) {
+        throw new Error(
+          `CDP attach produced ${newPages.length} Playwright pages; exact target identity is ambiguous`
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }

@@ -28,7 +28,7 @@ class MockCDPSession {
 
 class MockPage extends EventEmitter {
   private closed = false;
-  readonly targetId: string;
+  targetId: string;
   readonly pageTitle: string;
   pageUrl: string;
 
@@ -257,6 +257,7 @@ describe("BrowserManager auto-connect", () => {
     const context = new MockContext();
     const browser = new MockBrowser([context]);
     const transport = {
+      activateTarget: vi.fn(),
       attachToTarget: vi.fn(),
       close: vi.fn(),
       detachFromTarget: vi.fn(async () => undefined),
@@ -297,11 +298,15 @@ describe("BrowserManager auto-connect", () => {
       title: "LinkedIn",
       url: "https://www.linkedin.com/feed/",
     });
+    const activateTarget = vi.fn(async (targetId: string) => {
+      expect(targetId).toBe(requestedPage.targetId);
+    });
     const attachToTarget = vi.fn(async (targetId: string) => {
       expect(targetId).toBe(requestedPage.targetId);
       context.pagesList.push(requestedPage);
     });
     const transport = {
+      activateTarget,
       attachToTarget,
       close: vi.fn(),
       detachFromTarget: vi.fn(async () => undefined),
@@ -352,15 +357,31 @@ describe("BrowserManager auto-connect", () => {
     );
     expect(attachToTarget).toHaveBeenCalledTimes(1);
     expect(context.pages()).toEqual([requestedPage]);
+    expect(activateTarget).toHaveBeenCalledTimes(1);
+    expect(activateTarget.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY).toBeLessThan(
+      attachToTarget.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+    );
+
+    // A later CDP lookup may observe another process's active target. Once the
+    // requested target has been resolved, getPage must retain the exact Page
+    // object instead of consulting shared focus state again.
+    requestedPage.targetId = "cccccccccccccccccccccccccccccccc";
+    await expect(manager.getPage("attached", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).resolves.toBe(
+      requestedPage
+    );
+    expect(attachToTarget).toHaveBeenCalledTimes(1);
+    expect(activateTarget).toHaveBeenCalledTimes(1);
   });
 
-  it("opens a fresh authenticated-profile tab when an existing target is unresponsive", async () => {
+  it("rejects an existing target id that cannot resolve to its exact Playwright page", async () => {
     const context = new MockContext();
     const browser = new MockBrowser([context]);
     const targetId = "dddddddddddddddddddddddddddddddd";
     const attachToTarget = vi.fn(async () => undefined);
+    const activateTarget = vi.fn(async () => undefined);
     const detachFromTarget = vi.fn(async () => undefined);
     const transport = {
+      activateTarget,
       attachToTarget,
       close: vi.fn(),
       detachFromTarget,
@@ -385,12 +406,38 @@ describe("BrowserManager auto-connect", () => {
       { connectTimeoutMs: 1 }
     );
 
-    const page = await manager.getPage("attached", targetId);
+    await expect(manager.getPage("attached", targetId)).rejects.toThrow(
+      `targetId "${targetId}" could not be resolved; available: ["${targetId}"]`
+    );
 
     expect(attachToTarget).toHaveBeenCalledWith(targetId);
+    expect(activateTarget).toHaveBeenCalledWith(targetId);
     expect(detachFromTarget).toHaveBeenCalledWith(targetId);
-    expect(page.url()).toBe("https://crm.example.test/people");
-    expect(context.newPageCalls).toBe(1);
+    expect(context.newPageCalls).toBe(0);
+  });
+
+  it("rejects a missing target id instead of opening a named fallback page", async () => {
+    const availablePage = new MockPage({
+      targetId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      title: "Sales Inbox",
+      url: "https://www.linkedin.com/sales/inbox/",
+    });
+    const requestedTargetId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const context = new MockContext([availablePage]);
+    const browser = new MockBrowser([context]);
+    const { manager } = createManager({
+      connectOverCDP: vi.fn(async () => browser),
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session"
+    );
+
+    await expect(manager.getPage("attached", requestedTargetId)).rejects.toThrow(
+      `targetId "${requestedTargetId}" not found; available: ["${availablePage.targetId}"]`
+    );
+    expect(context.newPageCalls).toBe(0);
   });
 
   it("passes ignoreHTTPSErrors to launched browsers and only relaunches when it changes", async () => {

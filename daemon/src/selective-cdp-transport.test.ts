@@ -113,6 +113,20 @@ describe("SelectiveCdpTransport", () => {
     ]);
   });
 
+  it("activates one exact target before Playwright attaches it", async () => {
+    const { socket, transport } = await createTransport();
+
+    const activation = transport.activateTarget("page-2");
+    const command = socket.sent.at(-1);
+    expect(command).toMatchObject({
+      method: "Target.activateTarget",
+      params: { targetId: "page-2" },
+    });
+    socket.receive({ id: command?.id, result: {} });
+
+    await expect(activation).resolves.toBeUndefined();
+  });
+
   it("explicitly attaches one requested target", async () => {
     const { socket, transport } = await createTransport();
     const messages: CdpMessage[] = [];

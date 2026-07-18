@@ -174,6 +174,10 @@ export class SelectiveCdpTransport implements ConnectOverCDPTransport {
     });
   }
 
+  async activateTarget(targetId: string): Promise<void> {
+    await this.sendInternalCommand("Target.activateTarget", { targetId });
+  }
+
   async attachToTarget(targetId: string): Promise<void> {
     const targetInfoResult = await this.sendInternalCommand("Target.getTargetInfo", {
       targetId,
