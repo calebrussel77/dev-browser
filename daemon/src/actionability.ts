@@ -101,6 +101,14 @@ const fail = (
 };
 const offsets = (page: Page) => page.evaluate(() => ({ x: scrollX, y: scrollY }));
 
+// Per-sample movement at or above this (px) is real motion, not compositing noise.
+const STABLE_JITTER_PX = 1;
+// Total wander from the first sample still treated as "in place" when the budget
+// elapses without two calm samples. A target that only jitters sub-pixel around a
+// fixed spot on a perpetually-repainting page (ads, presence dots, live timers)
+// stays well inside this; a genuine layout shift, scroll, or slide-in blows past it.
+const STABLE_DRIFT_PX = 5;
+
 async function stableBox(
   locator: Locator,
   timeoutMs: number,
@@ -108,41 +116,66 @@ async function stableBox(
 ): Promise<{ x: number; y: number; width: number; height: number }> {
   const budgetMs = Math.min(Math.max(timeoutMs, 200), 500);
   const box = await locator.evaluate(
-    (element, budget) =>
+    (element, config) =>
       new Promise<{ x: number; y: number; width: number; height: number } | null>((resolve) => {
-        let previous: { x: number; y: number; width: number; height: number } | null = null;
+        type Box = { x: number; y: number; width: number; height: number };
+        const read = (): Box => {
+          const rect = element.getBoundingClientRect();
+          return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        };
+        const movedBy = (a: Box, b: Box, tolerance: number) =>
+          (["x", "y", "width", "height"] as const).some(
+            (key) => Math.abs(a[key] - b[key]) >= tolerance
+          );
+        const anchor = read();
+        // Track the full extent every sample sweeps through, so the timeout path can
+        // tell a target jittering in place (tiny extent) from one genuinely travelling
+        // across the page (large extent), independent of where each sample happens to land.
+        const min = { ...anchor };
+        const max = { ...anchor };
+        const widen = (box: Box) => {
+          (["x", "y", "width", "height"] as const).forEach((key) => {
+            if (box[key] < min[key]) min[key] = box[key];
+            if (box[key] > max[key]) max[key] = box[key];
+          });
+        };
+        let previous: Box | null = null;
+        let last = anchor;
         let stable = 0;
         let settled = false;
+        const finish = (value: Box | null) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          resolve(value);
+        };
         const timeout = window.setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            resolve(null);
-          }
-        }, budget);
+          // Budget elapsed without two consecutive calm samples. On a page that
+          // repaints forever the target itself is effectively in place, so proceed
+          // with its latest box — but only when the whole sampled sweep stayed within
+          // the drift bound. A genuinely moving target (scroll/slide/layout shift, fast
+          // oscillation) sweeps a wide extent and is still rejected.
+          const settledInPlace = (["x", "y", "width", "height"] as const).every(
+            (key) => max[key] - min[key] < config.drift
+          );
+          finish(settledInPlace ? last : null);
+        }, config.budget);
         const sample = () => {
           if (settled) return;
-          const rect = element.getBoundingClientRect();
-          const current = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-          if (
-            previous &&
-            (["x", "y", "width", "height"] as const).every(
-              (key) => Math.abs(current[key] - previous![key]) < 0.25
-            )
-          )
-            stable += 1;
+          last = read();
+          widen(last);
+          if (previous && !movedBy(last, previous, config.jitter)) stable += 1;
           else stable = 0;
           if (stable >= 2) {
-            settled = true;
-            window.clearTimeout(timeout);
-            resolve(current);
+            finish(last);
             return;
           }
-          previous = current;
+          previous = last;
           window.setTimeout(sample, 25);
         };
         sample();
       }),
-    budgetMs
+    { budget: budgetMs, jitter: STABLE_JITTER_PX, drift: STABLE_DRIFT_PX }
   );
   if (!box)
     return fail(

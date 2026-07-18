@@ -38,6 +38,70 @@ describe("shared actionability pipeline", () => {
     }
   });
 
+  it("resolves a static target while a sibling animates and text updates forever", async () => {
+    await page.setContent(`
+      <style>
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .noisy { width: 40px; height: 40px; animation: spin 0.4s linear infinite; }
+      </style>
+      <div class="noisy"></div>
+      <button data-testid="target">Connect</button>
+      <span id="clock"></span>
+      <script>
+        // Force continuous layout/paint churn next to the target, like LinkedIn's
+        // presence dots and relative timestamps, without moving the target itself.
+        // Self-clear once setContent swaps the DOM so the timer cannot leak into later tests.
+        const clock = document.getElementById("clock");
+        const h = setInterval(() => {
+          if (!document.body.contains(clock)) { clearInterval(h); return; }
+          clock.textContent = String(performance.now());
+        }, 16);
+      </script>
+    `);
+    const target = await resolveActionTarget(page, await observedRef("target"), {
+      timeoutMs: 500,
+      scroll: false,
+      hitTest: true,
+      applicability: "pointer",
+    });
+    try {
+      expect(target.box.width).toBeGreaterThan(0);
+      expect(target.box.height).toBeGreaterThan(0);
+    } finally {
+      await target.cleanup();
+    }
+  });
+
+  it("resolves a target that only micro-jitters in place on a repainting page", async () => {
+    await page.setContent(`
+      <button data-testid="target" style="position:relative;left:0;top:0;width:120px">Jitter</button>
+      <script>
+        // Never-settling sub-few-pixel wobble around a fixed spot, like a LinkedIn row
+        // or composer nudged by constant repaints — the box never holds two identical
+        // samples yet stays put. This must resolve via the bounded-drift fallback.
+        const el = document.querySelector('[data-testid="target"]');
+        let n = 0;
+        const h = setInterval(() => {
+          if (!document.body.contains(el)) { clearInterval(h); return; }
+          n += 1;
+          el.style.left = (n % 2 ? 2 : 0) + "px";
+          el.style.top = (n % 3 ? 1 : 0) + "px";
+        }, 16);
+      </script>
+    `);
+    const target = await resolveActionTarget(page, await observedRef("target"), {
+      timeoutMs: 500,
+      scroll: false,
+      hitTest: true,
+      applicability: "pointer",
+    });
+    try {
+      expect(target.box.width).toBeGreaterThan(0);
+    } finally {
+      await target.cleanup();
+    }
+  });
+
   it("returns bounded obstruction metadata without overlay text", async () => {
     await page.setContent(
       `<button data-testid="target">Target</button><div id="overlay" role="dialog" aria-label="Blocking dialog" style="position:fixed;inset:0;z-index:9">VERY_SECRET_OVERLAY_TEXT</div>`
