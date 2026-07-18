@@ -4,10 +4,14 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -516,26 +520,166 @@ fn daemon_has_exited(_pid: i32, daemon_unreachable: bool) -> bool {
 }
 
 fn spawn_daemon(command: &DaemonCommand) -> io::Result<()> {
-    let mut process = Command::new(&command.program);
-    process.args(&command.args);
-    process.current_dir(&command.current_dir);
-    process.stdin(Stdio::null());
-    process.stdout(Stdio::null());
-    process.stderr(Stdio::null());
-    process.env("DEV_BROWSER_PROCESS_ENTRY", &command.entry_path);
+    #[cfg(windows)]
+    return spawn_windows_daemon(command);
 
     #[cfg(unix)]
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    {
+        let mut process = Command::new(&command.program);
+        process.args(&command.args);
+        process.current_dir(&command.current_dir);
+        process.stdin(Stdio::null());
+        process.stdout(Stdio::null());
+        process.stderr(Stdio::null());
+        process.env("DEV_BROWSER_PROCESS_ENTRY", &command.entry_path);
+
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let _child = process.spawn()?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_daemon_creation_flags() -> u32 {
+    // CREATE_BREAKAWAY_FROM_JOB keeps agent/CI process supervisors from
+    // treating the long-lived daemon as part of the one-shot CLI command.
+    // CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP also isolate it from the
+    // caller's console and control signals without leaving a console handle
+    // for output-capturing shells to follow.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+
+    CREATE_BREAKAWAY_FROM_JOB
+        | CREATE_NO_WINDOW
+        | CREATE_NEW_PROCESS_GROUP
+        | CREATE_UNICODE_ENVIRONMENT
+}
+
+#[cfg(windows)]
+fn spawn_windows_daemon(command: &DaemonCommand) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let mut command_line = windows_command_line(&command.program, &command.args);
+    let current_dir = windows_wide_null(command.current_dir.as_os_str());
+    let mut environment = windows_environment_block(
+        OsStr::new("DEV_BROWSER_PROCESS_ENTRY"),
+        command.entry_path.as_os_str(),
+    );
+    let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup_info.cb = size_of::<STARTUPINFOW>() as u32;
+    let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // No daemon handle may be inherited from a one-shot CLI invocation. In
+    // particular, output-capturing agent runners keep waiting while any child
+    // owns their internal pipeline handle, even when stdout/stderr are NUL.
+    let created = unsafe {
+        CreateProcessW(
+            null(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            windows_daemon_creation_flags(),
+            environment.as_mut_ptr().cast(),
+            current_dir.as_ptr(),
+            &mut startup_info,
+            &mut process_info,
+        )
+    };
+
+    if created == 0 {
+        return Err(io::Error::last_os_error());
     }
 
-    let _child = process.spawn()?;
+    unsafe {
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_command_line(program: &str, args: &[String]) -> Vec<u16> {
+    let mut command_line = Vec::new();
+    for argument in std::iter::once(OsStr::new(program)).chain(args.iter().map(OsStr::new)) {
+        if !command_line.is_empty() {
+            command_line.push(b' ' as u16);
+        }
+        append_windows_quoted_argument(&mut command_line, argument);
+    }
+    command_line.push(0);
+    command_line
+}
+
+#[cfg(windows)]
+fn append_windows_quoted_argument(output: &mut Vec<u16>, argument: &OsStr) {
+    let units: Vec<u16> = argument.encode_wide().collect();
+    let needs_quotes = units.is_empty()
+        || units
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16 || *unit == b'"' as u16);
+    if !needs_quotes {
+        output.extend(units);
+        return;
+    }
+
+    output.push(b'"' as u16);
+    let mut backslashes = 0;
+    for unit in units {
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if unit == b'"' as u16 {
+            output.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+        } else {
+            output.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        }
+        backslashes = 0;
+        output.push(unit);
+    }
+    output.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    output.push(b'"' as u16);
+}
+
+#[cfg(windows)]
+fn windows_environment_block(override_key: &OsStr, override_value: &OsStr) -> Vec<u16> {
+    let override_name = override_key.to_string_lossy();
+    let mut variables: Vec<(OsString, OsString)> = env::vars_os()
+        .filter(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case(&override_name))
+        .collect();
+    variables.push((override_key.to_os_string(), override_value.to_os_string()));
+    variables.sort_by_key(|(key, _)| key.to_string_lossy().to_ascii_lowercase());
+
+    let mut block = Vec::new();
+    for (key, value) in variables {
+        block.extend(key.encode_wide());
+        block.push(b'=' as u16);
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+#[cfg(windows)]
+fn windows_wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
 fn daemon_pid() -> Option<i32> {
@@ -1135,6 +1279,28 @@ mod tests {
         assert_eq!(
             child_process_path(PathBuf::from(r"\\?\UNC\server\share\daemon.ts")),
             PathBuf::from(r"\\server\share\daemon.ts")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_spawn_breaks_away_from_the_callers_windows_job() {
+        assert_eq!(windows_daemon_creation_flags(), 0x0900_0600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_command_line_preserves_windows_paths_with_spaces() {
+        let encoded = windows_command_line(
+            "node",
+            &[
+                r"C:\Program Files\dev-browser\daemon.mjs".to_string(),
+                "plain".to_string(),
+            ],
+        );
+        assert_eq!(
+            String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
+            r#"node "C:\Program Files\dev-browser\daemon.mjs" plain"#
         );
     }
 
