@@ -39,6 +39,28 @@ works; window-scoped budgets honored.
 4. **Minimized-window capture** (T1 caveat): consider `fromSurface: false` fallback or an explicit
    diagnostic ("window may be minimized") when CDP capture hits the deadline.
 
+## Re-run after the four follow-up fixes (same day, commits 35cabae..ee237f3)
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| `--connect http://127.0.0.1:9223` | **FIXED** | `pages` answers in 480 ms, bounded by `--timeout` (previously hung 10+ min). |
+| `find --within` scoped collection | **FIXED** | `find --name Milka --name-mode contains --within main` → 2 matches (row div + options button); previously 0 everywhere. |
+| Scroll-container refs | **FIXED** | The conversation list `ul` and the thread panel now carry refs and a scrollable flag. |
+| Virtualized enumeration (T2 full) | **PASS** | `find --scroll-container R403 --max-steps 8` on the live list: 7 steps, positions 227→3169 then stable, `uniqueItems: 34` (≥ 20), `exhausted: true`, no click. |
+| Ref-based `click` / `type` | **STILL BLOCKED — new gate** | Ref revalidation now succeeds (no more STALE_REF), but every ref-based action fails with "Target bounding box did not stabilize within the bounded interval" (exit 3) — on list rows AND the stationary composer. Live LinkedIn never stops micro-animating, so the pre-action stability check never converges. Workaround: `click --xy` + ref-less `type`. Filed as follow-up (bound the gate with a jitter epsilon / animation suppression, same class of fix as bounded screenshots). |
+
+## Authorized real-account sends (T6, T7) — 2026-07-18, explicit per-target user consent
+
+| Test | Verdict | Evidence |
+|---|---|---|
+| T6 répondre à une conversation (cible: Djoko Christian, autorisée) | **PASS** | New-message compose: recipient combobox typed "Djoko", suggestion "Djoko Christian • CEO chez DNA Trading Company" selected (chip "Supprimer Djoko Christian" present), `assert --within main --text "Djoko Christian"` passed, message typed, send button enabled, clicked. `text --within main` after send confirmed the message under "Vous :" in the thread. No wrong-thread send. |
+| T7 invitation de connexion avec note (cible: /in/kelly-ketchang-zintchem, note autorisée) | **PASS** | Se connecter → Ajouter une note → note field typed the exact 239-char authorized note (counter 239/300, Envoyer enabled) → Envoyer. Verified in invitation-manager/sent: "Kelly Ketchang Zintchem … Envoyé aujourd'hui" with the note text. |
+| T9 quota d'invitations | **SKIPPED** (user declined — real-account risk) | Not run. |
+
+Coordinate lesson: modal/eyeballed clicks must convert screenshot pixels → CSS px (this session DPR 1.25 → multiply by 0.8). `observe`-derived boxes are already CSS px and need no conversion. Mixing the two silently mis-clicked the invitation modal (closed it) until corrected.
+
+Incidental observation (not caused by automation): LinkedIn showed a red account banner "Un problème est survenu lors du traitement de votre paiement — mettez à jour vos modes de paiement" (Premium billing issue on the user's account).
+
 ## Session hygiene
 
 Search input cleared (verified ""), composer cleared (placeholder restored, send button gone),
