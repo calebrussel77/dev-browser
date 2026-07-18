@@ -24,8 +24,10 @@ export interface EnterExactTextResult {
   strategy: InputStrategy;
   /**
    * The value/innerText reread from the live element after entry, verified
-   * to exactly match the expected text. Undefined for the "keyboard"
-   * fallback strategy, which has no site-agnostic value contract to reread
+   * to exactly match the expected text. Populated for native-setter,
+   * insert-text, and the contenteditable keyboard fallback (all reread and
+   * verified). Undefined only for the last-resort "keyboard" entry into an
+   * unrecognized target, which has no site-agnostic value contract to reread
    * and therefore reports the entry as unverified.
    */
   verifiedValue?: string;
@@ -59,6 +61,36 @@ async function readControlValue(locator: Locator): Promise<string> {
 
 async function readEditableText(locator: Locator): Promise<string> {
   return locator.evaluate((element) => (element as HTMLElement).innerText);
+}
+
+/**
+ * Normalizes a contenteditable's innerText for verification. Rich-text editors
+ * wrap each logical line in a block element, so a single typed newline reads
+ * back as a paragraph break (`\n\n`) and a trailing block adds a final newline.
+ * Collapsing CRLF, runs of newlines, and trailing whitespace lets an entry that
+ * is visually exact verify as a match, while still catching genuine corruption
+ * (dropped characters, truncation, transformed content), which changes the text
+ * itself rather than only its block/whitespace framing.
+ */
+function normalizeEditableText(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{2,}/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\s+$/g, "");
+}
+
+/**
+ * Empties a focused contenteditable with one discrete trusted input:
+ * select all of its children, then a real Backspace. Shared by the initial
+ * clear and the keyboard-fallback reset so both go through the same path.
+ */
+async function clearEditable(locator: Locator, page: Page): Promise<void> {
+  await locator.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.ownerDocument.getSelection()?.selectAllChildren(target);
+  });
+  await page.keyboard.press("Backspace");
 }
 
 /**
@@ -149,13 +181,7 @@ export async function enterExactText(options: EnterExactTextOptions): Promise<En
       // Select-all + Backspace is one discrete trusted input; the insertText
       // below is a second one. Each gets its own dispatch so a lease
       // conflict or stale ref arising between them is still caught.
-      await dispatch(async () => {
-        await options.locator.evaluate((element) => {
-          const target = element as HTMLElement;
-          target.ownerDocument.getSelection()?.selectAllChildren(target);
-        });
-        await options.page.keyboard.press("Backspace");
-      });
+      await dispatch(() => clearEditable(options.locator, options.page));
     } else {
       previous = await readEditableText(options.locator);
       await options.locator.evaluate((element) => {
@@ -165,18 +191,29 @@ export async function enterExactText(options: EnterExactTextOptions): Promise<En
         selection?.collapseToEnd();
       });
     }
-    await dispatch(() => options.page.keyboard.insertText(options.text));
-    const verifiedValue = await readEditableText(options.locator);
     const expected = previous + options.text;
-    if (verifiedValue !== expected) {
+    const expectedNormalized = normalizeEditableText(expected);
+    await dispatch(() => options.page.keyboard.insertText(options.text));
+    let verifiedValue = await readEditableText(options.locator);
+    if (normalizeEditableText(verifiedValue) === expectedNormalized)
+      return { strategy: "insert-text", verifiedValue };
+
+    // A single bulk insertText is dropped by rich-text editors (Draft.js /
+    // Lexical-style) that manage their own model from per-keystroke events.
+    // Reset to a known-empty baseline and re-enter the full expected text with
+    // real key-by-key input, which those editors do commit, then re-verify.
+    await dispatch(() => clearEditable(options.locator, options.page));
+    await dispatch(() => options.page.keyboard.type(expected, { delay: options.delayMs }));
+    verifiedValue = await readEditableText(options.locator);
+    if (normalizeEditableText(verifiedValue) !== expectedNormalized) {
       throw new AgentProtocolError(
         "INPUT_VALUE_MISMATCH",
-        "Typed value did not match after insert-text entry; the editable region may reject or transform input",
+        "Typed value did not match after insert-text and keyboard entry; the editable region may reject or transform input",
         true,
-        { details: { strategy: "insert-text", expectedLength: expected.length, actualLength: verifiedValue.length } }
+        { details: { strategy: "keyboard", expectedLength: expected.length, actualLength: verifiedValue.length } }
       );
     }
-    return { strategy: "insert-text", verifiedValue };
+    return { strategy: "keyboard", verifiedValue };
   }
 
   // Unrecognized element kind: no site-agnostic value/innerText contract to

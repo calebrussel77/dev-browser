@@ -32,6 +32,8 @@ const FIXTURE_HTML = `<!doctype html>
     <div id="composer-note" contenteditable="true" role="textbox" aria-label="Composer note"></div>
     <button id="composer-note-send" disabled>Send note</button>
 
+    <div id="managed-note" contenteditable="true" role="textbox" aria-label="Managed note"></div>
+
     <input id="truncating-input" aria-label="Truncating input" maxlength="5">
 
     <input id="secret-composer" type="password" aria-label="Secret composer">
@@ -67,6 +69,18 @@ const FIXTURE_HTML = `<!doctype html>
       note.addEventListener("input", () => {
         window.__noteState = note.innerText;
         noteSend.disabled = window.__noteState.trim().length === 0;
+      });
+
+      // Simulates a rich-text editor (Draft.js / Lexical-style) that manages its
+      // own model from per-keystroke events and discards a single bulk insertText
+      // commit (event.data spanning more than one character), like LinkedIn's
+      // message composer. Real key-by-key typing (one character per input) is
+      // accepted, so entry must fall back to keyboard input and still verify.
+      const managed = document.querySelector("#managed-note");
+      managed.addEventListener("input", (event) => {
+        if (event.inputType === "insertText" && event.data && event.data.length > 1) {
+          managed.textContent = "";
+        }
       });
 
       // Simulates a field that enforces its own maxlength/validation rule by
@@ -274,6 +288,22 @@ describe.sequential("react-safe exact text entry", () => {
     await expect(page.locator("#composer-note").innerText()).resolves.toBe(text);
     await expect(page.locator("#composer-note-send").isDisabled()).resolves.toBe(false);
     await expect(page.evaluate(() => (window as unknown as { __noteState: string }).__noteState)).resolves.toBe(text);
+  });
+
+  it("falls back to key-by-key input when a managed editor drops a bulk insertText", async () => {
+    const { page, pageName } = await freshPage();
+    const field = (await readElements(pageName)).find((element) => element.name === "Managed note")!;
+    const text = "Bonjour Kelly, ravi de connecter — à bientôt.";
+    const result = await executeInteractiveAction(
+      manager,
+      request(pageName, { kind: "type", ref: field.ref, text, clear: true, delayMs: 0 })
+    );
+
+    // insertText was discarded by the managed editor, so entry retried with real
+    // key events and reports the keyboard strategy with the verified value.
+    expect(result.inputStrategy).toBe("keyboard");
+    expect(result.verifiedValue).toBe(text);
+    await expect(page.locator("#managed-note").innerText()).resolves.toBe(text);
   });
 
   it("rechecks leases between the contenteditable clear and insertText trusted inputs", async () => {
