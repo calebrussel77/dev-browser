@@ -107,11 +107,15 @@ LLM USAGE GUIDE:
     `type` invokes the resolved field's native value setter and dispatches
     composed bubbling beforeinput/input/change events for input/textarea
     (so React-style controlled components commit the change), or
-    page.keyboard.insertText for contenteditable. It returns
+    page.keyboard.insertText for contenteditable -- with an automatic
+    fall back to real key-by-key typing when a rich-text editor (Draft.js /
+    Lexical-style) drops a bulk insertText. It returns
     { typed, inputStrategy, verifiedValue } where inputStrategy is
     native-setter, insert-text, or keyboard. The field is reread afterward;
-    a mismatch returns the typed INPUT_VALUE_MISMATCH error (exit 3) instead
-    of reporting success. --clear (default false) controls whether the
+    contenteditable verification is newline-normalized so a block/paragraph
+    editor rendering a typed newline as a paragraph break still verifies. A
+    genuine mismatch returns the typed INPUT_VALUE_MISMATCH error (exit 3)
+    instead of reporting success. --clear (default false) controls whether the
     existing content is replaced or appended to.
 
   Error codes (exit status 3 unless noted): STALE_REF, STALE_STATE,

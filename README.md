@@ -132,7 +132,7 @@ The result includes `scrollMetrics: { steps, uniqueItems, newItems, exhausted, p
 `type` inspects the resolved ref's kind and enters text the way the corresponding DOM API expects instead of relying on `HTMLElement.click()` + naive keystrokes alone:
 
 - `input`/`textarea`: invokes the element's native value setter, then dispatches composed, bubbling `beforeinput`, `input`, and `change` events — the same sequence a real keystroke produces, so React (and similar) controlled components observe and commit the change.
-- `contenteditable`: focuses the element and uses `page.keyboard.insertText(text)` (after select-all/backspace when `--clear` is set).
+- `contenteditable`: focuses the element and uses `page.keyboard.insertText(text)` (after select-all/backspace when `--clear` is set). Rich-text editors (Draft.js / Lexical-style, e.g. LinkedIn's message composer) that manage their own model and drop a bulk `insertText` are handled by an automatic fall back to real key-by-key typing, which they commit. Verification is newline-normalized, so an editor that renders a typed newline as a paragraph break still verifies as an exact match.
 
 The result reports `{ typed, inputStrategy, verifiedValue }`, where `inputStrategy` is `native-setter`, `insert-text`, or `keyboard`. After entry, dev-browser rereads the field's `value`/`innerText`; if it does not match what was requested (a validating/normalizing field rewrote it, or the controlled component never re-rendered), the action returns the typed, recoverable `INPUT_VALUE_MISMATCH` error (exit status `3`) instead of reporting success. `--clear false` (the default) appends at the existing caret/end of the field rather than replacing its contents.
 

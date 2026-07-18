@@ -61,6 +61,16 @@ Coordinate lesson: modal/eyeballed clicks must convert screenshot pixels → CSS
 
 Incidental observation (not caused by automation): LinkedIn showed a red account banner "Un problème est survenu lors du traitement de votre paiement — mettez à jour vos modes de paiement" (Premium billing issue on the user's account).
 
+## Product blockers fixed and verified live (2026-07-18, commits 578c519, 8fca5e6)
+
+The field run exposed two dev-browser blockers that would hit any agent driving a perpetually-repainting SPA. Both are now fixed at the root, unit-tested, and re-verified against live LinkedIn with the rebuilt release binary.
+
+1. **Pre-action bounding-box stability gate rejected all ref actions** (`daemon/src/actionability.ts`). It required <0.25px movement across consecutive samples within 500ms, so LinkedIn's constant repaints made every `click --ref` / `type --ref` fail `TARGET_MISSING (unstable)`. Fix: tolerate sub-pixel jitter (1px) on the fast path, and on budget expiry proceed with the latest box when the whole sampled sweep stayed within a 5px extent (jitter-in-place) — while still rejecting genuine movement (scroll/slide/large oscillation), which sweeps a wide extent. Live result: `click --ref` on a conversation row now succeeds and opens the thread.
+
+2. **contenteditable typing failed verification on LinkedIn's composer** (`daemon/src/react-input.ts`). Two causes: (a) the composer is a managed rich-text editor that silently drops a bulk `insertText`; (b) even once text lands, the editor renders a typed `\n` as a paragraph break, so `innerText` reads `\n\n` and the exact-string check rejected a visually-correct entry. Fix: fall back to real key-by-key typing when `insertText` doesn't take, and verify contenteditable against a newline-normalized comparison. Live result: `type --ref` into the composer returns `ok, strategy insert-text, verified "…✔\n\nligne 2"` (exit 0); `--clear` works too.
+
+The scoped observe → act loop is therefore usable end-to-end on real LinkedIn without the coordinate workaround. (When eyeballing a screenshot for `--xy` is still unavoidable, remember screenshot pixels are DPR-scaled vs the CSS px `--xy` expects; prefer `observe`-derived boxes or refs, which are already CSS px.)
+
 ## Session hygiene
 
 Search input cleared (verified ""), composer cleared (placeholder restored, send button gone),
