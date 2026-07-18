@@ -338,7 +338,17 @@ export async function captureVisualArtifacts(
         }),
         remainingBudgetMs(),
         "Screenshot capture"
-      );
+      ).catch((error) => {
+        // fromSurface captures produce no frame while the browser window is
+        // minimized, so the deadline is the only signal the agent gets —
+        // annotate it with the likely cause instead of a bare timeout.
+        if (error instanceof Error && /timed out after \d+ms$/.test(error.message)) {
+          throw new Error(
+            `${error.message} (the browser window may be minimized; restore it or use a headless browser)`
+          );
+        }
+        throw error;
+      });
       return { png: resizePng(Buffer.from(response.data, "base64"), zoom), captureMode: "cdp" };
     } catch (error) {
       if (!isUnsupportedCdpScreenshot(error)) throw error;

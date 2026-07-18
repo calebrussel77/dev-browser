@@ -192,6 +192,42 @@ describe.sequential("visual artifacts", () => {
     }
   });
 
+  it("appends a minimized-window hint only when the CDP capture itself hits the deadline", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setContent("<button>Hint target</button>");
+    const state = await collectPageState(page);
+    const session = {
+      send: vi.fn().mockImplementation(() => new Promise(() => {})),
+      detach: vi.fn().mockResolvedValue(undefined),
+    };
+    const newSession = vi.spyOn(page.context(), "newCDPSession").mockResolvedValue(session as never);
+    const screenshot = vi.spyOn(page, "screenshot").mockImplementation(() => new Promise(() => {}));
+    try {
+      await expect(
+        captureVisualArtifacts(page, state, {
+          screenshotName: `visual-tests/hint-${Date.now()}.png`,
+          timeoutMs: 250,
+        })
+      ).rejects.toThrow(
+        /Screenshot capture timed out after \d+ms \(the browser window may be minimized; restore it or use a headless browser\)/
+      );
+      expect(screenshot).not.toHaveBeenCalled();
+
+      // A deadline during CDP session creation says nothing about the window
+      // state, so that failure must stay a bare timeout without the hint.
+      newSession.mockImplementation(() => new Promise(() => {}));
+      await expect(
+        captureVisualArtifacts(page, state, {
+          screenshotName: `visual-tests/hint-session-${Date.now()}.png`,
+          timeoutMs: 250,
+        })
+      ).rejects.toThrow(/Screenshot capture timed out after \d+ms$/);
+    } finally {
+      screenshot.mockRestore();
+      newSession.mockRestore();
+    }
+  });
+
   it("draws deterministic non-overlapping labels and cleans the temporary overlay", async () => {
     const page = await manager.getPage("visual", "main");
     await page.setViewportSize({ width: 320, height: 180 });
