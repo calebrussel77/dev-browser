@@ -150,11 +150,23 @@ export function collectRealm({
           return { text: truncated ? normalized.slice(0, textMaxChars) : normalized, truncated };
         })()
       : undefined;
-  const candidates: Array<{ element: HTMLElement; shadowContext: string[]; depth: number }> = [];
+  const candidates: Array<{ element: HTMLElement; shadowContext: string[]; depth: number; scrollable: boolean }> = [];
   const allElements: HTMLElement[] = [];
   type Pending = { element: HTMLElement; shadowContext: string[]; depth: number };
   const pending: Pending[] = [];
   let traversalTruncated = false;
+  // Scroll containers (computed overflow other than visible, with content that
+  // actually overflows) are collected and given refs even when they match no
+  // semantic selector: real pages wrap virtualized lists in unnamed divs that
+  // `scroll --ref` and `find --scroll-container` must be able to target.
+  const isScrollable = (element: HTMLElement): boolean => {
+    const overflowsY = element.scrollHeight > element.clientHeight;
+    const overflowsX = element.scrollWidth > element.clientWidth;
+    if (!overflowsY && !overflowsX) return false;
+    const style = getComputedStyle(element);
+    const scrolls = (value: string) => value === "auto" || value === "scroll" || value === "overlay";
+    return (overflowsY && scrolls(style.overflowY)) || (overflowsX && scrolls(style.overflowX));
+  };
   const pushChildrenReverse = (children: HTMLCollection, shadowContext: string[], depth: number) => {
     const remaining = Math.max(0, maxWork - allElements.length - pending.length);
     const selected = Math.min(children.length, remaining);
@@ -167,7 +179,8 @@ export function collectRealm({
     const current = pending.pop()!;
     const { element, shadowContext, depth } = current;
     allElements.push(element);
-    if (element.matches(includeSelector)) candidates.push(current);
+    const scrollable = isScrollable(element);
+    if (scrollable || element.matches(includeSelector)) candidates.push({ ...current, scrollable });
     if (depth >= 100) {
       if (element.children.length > 0 || element.shadowRoot?.children.length) traversalTruncated = true;
       continue;
@@ -237,16 +250,17 @@ export function collectRealm({
     return active;
   };
   const active = deepActive();
-  const records = candidates.slice(0, maxRecords).map(({ element, shadowContext, depth }) => {
+  const records = candidates.slice(0, maxRecords).map(({ element, shadowContext, depth, scrollable }) => {
     const actionable = element.matches(actionableSelector);
+    const targetable = actionable || scrollable;
     const legacyRef = element.getAttribute("data-dev-browser-ref") ?? "";
-    let ref = actionable ? (registry.refs.get(element) ?? (legacyRefs && /^R\d+$/.test(legacyRef) ? legacyRef : "")) : "";
-    if (actionable && !ref) {
+    let ref = targetable ? (registry.refs.get(element) ?? (legacyRefs && /^R\d+$/.test(legacyRef) ? legacyRef : "")) : "";
+    if (targetable && !ref) {
       do ref = `R${registry.counter++}`; while (usedRefs.has(ref));
       registry.refs.set(element, ref); usedRefs.add(ref);
-    } else if (actionable && ref) registry.refs.set(element, ref);
-    if (actionable && ref) registry.byRef.set(ref, new WeakRef(element));
-    if (actionable && legacyRefs && !element.hasAttribute("data-dev-browser-ref")) element.setAttribute("data-dev-browser-ref", ref);
+    } else if (targetable && ref) registry.refs.set(element, ref);
+    if (targetable && ref) registry.byRef.set(ref, new WeakRef(element));
+    if (targetable && legacyRefs && !element.hasAttribute("data-dev-browser-ref")) element.setAttribute("data-dev-browser-ref", ref);
     const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
     const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number.parseFloat(style.opacity || "1") > 0;
     const inViewport = visible && rect.bottom >= 0 && rect.right >= 0 && rect.top <= innerHeight && rect.left <= innerWidth;
@@ -267,7 +281,7 @@ export function collectRealm({
       ref, role: roleFor(element), name: nameFor(element),
       description: compact(element.getAttribute("aria-description") || referencedText("aria-describedby", element)),
       landmark: semanticAncestors.join(" > ") || "body", semanticAncestors,
-      box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, visible, inViewport, actionable, obscured,
+      box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, visible, inViewport, actionable, scrollable, obscured,
       disabled: "disabled" in element ? Boolean((element as HTMLInputElement).disabled) : bool(element, "aria-disabled") === true,
       readonly: "readOnly" in element ? Boolean((element as HTMLInputElement).readOnly) : bool(element, "aria-readonly") === true,
       required: "required" in element ? Boolean((element as HTMLInputElement).required) : bool(element, "aria-required") === true,

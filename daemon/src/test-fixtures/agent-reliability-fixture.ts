@@ -16,6 +16,19 @@ const VIRTUAL_LIST_VISIBLE = 12;
 const VIRTUAL_LIST_ROW_HEIGHT = 40;
 const VIRTUAL_LIST_HEIGHT = VIRTUAL_LIST_VISIBLE * VIRTUAL_LIST_ROW_HEIGHT;
 
+// Unnamed scroll-container fixture: a plain div with overflow-y:auto and no
+// role/aria-label/test-id, like the wrappers real pages put around feeds.
+// Perception must still assign it a ref so `scroll --ref` and
+// `find --scroll-container` can target it.
+// Only one row carries a role (making it an actionable perception record the
+// find pool can match); the rest stay plain text divs so the fixture adds a
+// minimal number of records and does not starve default perception budgets
+// for elements that come later (frame contents in particular).
+const PLAIN_FEED_ROW_COUNT = 24;
+const PLAIN_FEED_TARGET_ROW = 19;
+const PLAIN_FEED_ROW_HEIGHT = 40;
+const PLAIN_FEED_HEIGHT = 4 * PLAIN_FEED_ROW_HEIGHT;
+
 export interface AgentReliabilityFixture {
   mainUrl: string;
   crossOriginFrameUrl: string;
@@ -179,6 +192,12 @@ function mainPage(origin: string, crossOriginFrameUrl: string): string {
       </section>
       <div data-testid="tall-spacer"></div>
       <p data-testid="scroll-target">End of tall content</p>
+      <section data-testid="plain-scroll-region">
+        <p>Plain feed</p>
+        <div style="height:${PLAIN_FEED_HEIGHT}px;overflow-y:auto;border:1px solid #ccc">
+          ${Array.from({ length: PLAIN_FEED_ROW_COUNT }, (_, index) => `<div${index + 1 === PLAIN_FEED_TARGET_ROW ? ' role="listitem"' : ""} style="height:${PLAIN_FEED_ROW_HEIGHT}px">Feed item ${index + 1}</div>`).join("")}
+        </div>
+      </section>
     </main>
     <aside><button data-testid="connect-aside">Connect</button></aside>
     <div id="portal-root"></div>`,

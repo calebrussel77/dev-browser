@@ -32,6 +32,7 @@ export function buildCompactTree(
       record.disabled ? "disabled" : "",
       record.checked === true ? "checked" : record.checked === "mixed" ? "mixed" : "",
       record.expanded === true ? "expanded" : record.expanded === false ? "collapsed" : "",
+      record.scrollable ? "scrollable" : "",
     ]
       .filter(Boolean)
       .join(" ");

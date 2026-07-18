@@ -33,6 +33,7 @@ export interface PerceptionElement {
   visible: boolean;
   inViewport: boolean;
   actionable: boolean;
+  scrollable?: boolean;
   obscured: boolean;
   disabled: boolean;
   readonly: boolean;
@@ -650,6 +651,7 @@ export async function collectPageState(
           quad: projected.quad,
           visible: inheritedVisible && record.visible,
           actionable: inheritedVisible && record.actionable,
+          scrollable: inheritedVisible && record.scrollable,
           obscured: record.obscured || frameObscured,
           inViewport: inheritedVisible && record.visible && box.x + box.width >= 0 && box.y + box.height >= 0 && box.x <= topViewport.width && box.y <= topViewport.height,
           frameId: entry.id,

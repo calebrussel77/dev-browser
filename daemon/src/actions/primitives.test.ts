@@ -405,6 +405,45 @@ describe.sequential("find --scroll-container bounded auto-scroll over a virtuali
     return element.ref;
   }
 
+  it("assigns a ref to an unnamed scrollable container so scroll --ref and find --scroll-container can target it", async () => {
+    const page = await manager.getPage(browser, "main");
+    const resetFeed = () =>
+      page.evaluate(() => {
+        document.querySelector('[data-testid="plain-scroll-region"]')!.querySelector("div")!.scrollTop = 0;
+      });
+    await resetFeed();
+    const state = await run({ kind: "read", limit: 400, depth: 12 });
+    const container = state.elements!.find(
+      (element) => element.scrollable === true && element.role === "div"
+    );
+    expect(container).toBeDefined();
+    expect(container!.actionable).toBe(false);
+    expect(container!.ref).toMatch(/^R\d+$/);
+
+    const scrolled = await run({
+      kind: "scroll",
+      ref: container!.ref,
+      until: "text:Feed item 22",
+      maxSteps: 15,
+    });
+    expect(scrolled.scroll).toMatchObject({ matched: true });
+    expect(scrolled.scroll!.steps).toBeGreaterThan(0);
+
+    await resetFeed();
+    const found = await run({
+      kind: "find",
+      name: "Feed item 19",
+      nameMode: "exact",
+      limit: 5,
+      scrollContainer: container!.ref,
+      maxSteps: 12,
+    });
+    expect(found.matches?.[0]).toMatchObject({ name: "Feed item 19", confidence: "high" });
+    // All rows are real DOM nodes (not virtualized), so the scan may match
+    // before any wheel step; the point is that the unnamed container resolved.
+    expect(found.scrollMetrics).toBeDefined();
+  });
+
   it("finds a row far below the initial render window without auto-clicking it", async () => {
     const container = await containerRef();
     const result = await run({

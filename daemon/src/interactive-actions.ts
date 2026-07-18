@@ -485,7 +485,12 @@ function applyPerception(
         };
   if (protocolVersion === 1) result.snapshot = perception.tree;
   if (includeElements) {
-    const visibleElements = perception.elements.filter((element) => element.actionable);
+    // Scroll containers ride along with actionable elements: they carry refs
+    // so scroll --ref / find --scroll-container can target them, and agents
+    // can only learn those refs from the elements payload.
+    const visibleElements = perception.elements.filter(
+      (element) => element.actionable || element.scrollable
+    );
     result.elements = visibleElements;
   }
 }
