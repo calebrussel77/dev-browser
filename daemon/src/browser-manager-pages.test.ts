@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
+import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { removeDirectoryWithRetries } from "./test-cleanup.js";
 
@@ -182,5 +183,84 @@ describe.sequential("BrowserManager page discovery", () => {
     expect(message).toContain(endpoint);
     // ...alongside a listener-specific recovery hint naming the actual port.
     expect(message).toMatch(new RegExp(`--remote-debugging-port=${port}\\b`));
+  }, 30_000);
+
+  it("connectBrowser bounds a stuck CDP attach with --timeout and suggests the exact ws:// endpoint", async () => {
+    const wsEndpoint = "ws://127.0.0.1:9333/devtools/browser/11111111-2222-3333-4444-555555555555";
+    const enoent = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    const hangingManager = new BrowserManager(path.join(browserRootDir, "hanging-attach"), {
+      fetch: async () =>
+        new Response(JSON.stringify({ webSocketDebuggerUrl: wsEndpoint }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      // Chrome resolves fine, but the Playwright attach never completes — the
+      // field failure mode where `pages` hung for 10+ minutes.
+      createSelectiveCdpTransport: () => new Promise<never>(() => {}),
+      connectOverCDP: () => new Promise<never>(() => {}),
+      readFile: async () => {
+        throw enoent();
+      },
+      webSocket: null,
+    });
+
+    const startedAt = Date.now();
+    let thrown: unknown;
+    try {
+      await hangingManager.connectBrowser("hang-attach", "http://127.0.0.1:9333", {
+        connectTimeoutMs: 400,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(thrown).toBeInstanceOf(AgentProtocolError);
+    const agentError = thrown as AgentProtocolError;
+    expect(agentError.code).toBe("CDP_ATTACH_FAILED");
+    expect(agentError.recoverable).toBe(true);
+    expect(agentError.message).toContain(wsEndpoint);
+    expect(agentError.nextCommands).toEqual([`dev-browser --connect ${wsEndpoint} pages`]);
+    expect(agentError.details).toEqual({
+      // Redaction canonicalizes URLs, hence the trailing slash.
+      endpoint: "http://127.0.0.1:9333/",
+      resolvedEndpoint: wsEndpoint,
+      timeoutMs: 400,
+    });
+  }, 30_000);
+
+  it("connectBrowser bounds endpoint resolution even when fetch ignores its abort signal", async () => {
+    const wsEndpoint = "ws://127.0.0.1:9444/devtools/browser/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const enoent = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    const hangingManager = new BrowserManager(path.join(browserRootDir, "hanging-resolution"), {
+      fetch: () => new Promise<never>(() => {}),
+      platform: "linux",
+      homedir: () => "/fake-home",
+      readFile: (async (file: unknown) => {
+        if (String(file).includes("google-chrome")) {
+          return "9444\n/devtools/browser/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        }
+        throw enoent();
+      }) as unknown as typeof import("node:fs/promises").readFile,
+    });
+
+    const startedAt = Date.now();
+    let thrown: unknown;
+    try {
+      await hangingManager.connectBrowser("hang-resolution", "http://127.0.0.1:9444", {
+        connectTimeoutMs: 400,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(thrown).toBeInstanceOf(AgentProtocolError);
+    const agentError = thrown as AgentProtocolError;
+    expect(agentError.code).toBe("CDP_DISCOVERY_FAILED");
+    expect(agentError.recoverable).toBe(true);
+    // The suggestion comes from DevToolsActivePort because the HTTP endpoint is the thing hanging.
+    expect(agentError.message).toContain(wsEndpoint);
+    expect(agentError.nextCommands).toEqual([`dev-browser --connect ${wsEndpoint} pages`]);
   }, 30_000);
 });

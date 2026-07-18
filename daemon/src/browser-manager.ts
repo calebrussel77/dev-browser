@@ -2,6 +2,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { AgentProtocolError } from "./agent-protocol.js";
 import { confirmationTokens } from "./confirmation-tokens.js";
 
 import {
@@ -101,6 +102,8 @@ const CHROMIUM_ATTACH_TO_OTHER_ENV = "PW_CHROMIUM_ATTACH_TO_OTHER";
 const CDP_PREFLIGHT_ENV = "DEV_BROWSER_CDP_PREFLIGHT";
 const PROBE_TIMEOUT_MS = 750;
 const MANUAL_CONNECT_TIMEOUT_MS = 5_000;
+const CONNECT_SUGGESTION_TIMEOUT_MS = 1_000;
+const CONNECT_DEADLINE_EXPIRED = Symbol("connect-deadline-expired");
 const CDP_PREFLIGHT_TIMEOUT_MS = 5_000;
 const PAGE_TITLE_TIMEOUT_MS = 1_500;
 const SELECTIVE_TARGET_ATTACH_TIMEOUT_MS = 15_000;
@@ -269,8 +272,51 @@ export class BrowserManager {
     }
 
     await this.ensureBaseDir();
-    const resolvedEndpoint = await this.resolveEndpoint(endpoint);
 
+    const timeoutMs = options.connectTimeoutMs;
+    if (timeoutMs === undefined) {
+      return this.connectToResolvedEndpoint(name, await this.resolveEndpoint(endpoint), options);
+    }
+
+    // One deadline bounds the whole resolution+attach sequence, so a stage
+    // that stalls past its own budget (a fetch whose abort signal is ignored,
+    // a stuck Playwright attach, an unbounded CDP command) surfaces as a typed
+    // error instead of hanging the daemon indefinitely.
+    const startedAt = Date.now();
+    let resolvedEndpoint: string | null = null;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const connectTask = (async () => {
+      const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+      resolvedEndpoint = await this.resolveEndpoint(endpoint, remainingMs);
+      return this.connectToResolvedEndpoint(name, resolvedEndpoint, options);
+    })();
+
+    const deadline = new Promise<never>((_, reject) => {
+      deadlineTimer = setTimeout(() => reject(CONNECT_DEADLINE_EXPIRED), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([connectTask, deadline]);
+    } catch (error) {
+      if (error !== CONNECT_DEADLINE_EXPIRED) {
+        throw error;
+      }
+
+      void connectTask
+        .then((entry) => this.discardStaleConnectEntry(entry))
+        .catch(() => undefined);
+      throw await this.buildConnectTimeoutError(endpoint, resolvedEndpoint, timeoutMs);
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+  }
+
+  private async connectToResolvedEndpoint(
+    name: string,
+    resolvedEndpoint: string,
+    options: ConnectBrowserOptions
+  ): Promise<BrowserEntry> {
     const existing = this.browsers.get(name);
     if (existing) {
       const isSameConnection =
@@ -286,6 +332,100 @@ export class BrowserManager {
     }
 
     return this.openConnectedBrowser(name, resolvedEndpoint, options);
+  }
+
+  /** Tears down a connection that finished only after its deadline already
+   * fired, so an abandoned attach cannot clobber a newer entry or leak the
+   * browser handle. */
+  private discardStaleConnectEntry(entry: BrowserEntry): void {
+    if (this.browsers.get(entry.name) === entry) {
+      this.browsers.delete(entry.name);
+    }
+
+    entry.selectiveTransport?.close();
+    void entry.browser.close().catch(() => undefined);
+  }
+
+  private async buildConnectTimeoutError(
+    endpoint: string,
+    resolvedEndpoint: string | null,
+    timeoutMs: number
+  ): Promise<AgentProtocolError> {
+    const attachPhase = resolvedEndpoint !== null;
+    const suggestion =
+      resolvedEndpoint ?? (await this.lookupWebSocketEndpointSuggestion(endpoint));
+
+    const details = [
+      attachPhase
+        ? `Timed out after ${timeoutMs}ms attaching to Chrome via Playwright CDP at ${resolvedEndpoint}.`
+        : `Timed out after ${timeoutMs}ms resolving a CDP WebSocket endpoint from ${endpoint}.`,
+    ];
+
+    if (suggestion && suggestion !== endpoint) {
+      details.push(
+        `Chrome's browser WebSocket endpoint is ${suggestion} — retry with \`--connect ${suggestion}\`.`
+      );
+    } else if (!suggestion) {
+      details.push(
+        "Read the ws:// endpoint from Chrome's DevToolsActivePort file (or `/json/version` on the debugging port) and pass it to `--connect` directly."
+      );
+    }
+
+    details.push("Increase `--timeout SECONDS` if Chrome is slow to respond.");
+
+    return new AgentProtocolError(
+      attachPhase ? "CDP_ATTACH_FAILED" : "CDP_DISCOVERY_FAILED",
+      details.join("\n"),
+      true,
+      {
+        details: { endpoint, resolvedEndpoint, timeoutMs },
+        nextCommands:
+          suggestion && suggestion !== endpoint
+            ? [`dev-browser --connect ${suggestion} pages`]
+            : undefined,
+      }
+    );
+  }
+
+  /** Best-effort lookup of the exact browser ws:// endpoint after a connect
+   * timeout, so the error can point at a `--connect` value that works. The
+   * probe is hard-capped because the main resolution fetch may be the very
+   * thing that hung. */
+  private async lookupWebSocketEndpointSuggestion(endpoint: string): Promise<string | null> {
+    if (isWebSocketEndpoint(endpoint)) {
+      return null;
+    }
+
+    const port = this.getEndpointPort(endpoint) ?? undefined;
+    try {
+      const fromDevToolsFile = await this.readDevToolsActivePort(port);
+      if (fromDevToolsFile) {
+        return fromDevToolsFile;
+      }
+    } catch {
+      // Diagnostic only; fall through to the HTTP probe.
+    }
+
+    if (!isHttpEndpoint(endpoint)) {
+      return null;
+    }
+
+    let probeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const probe = await Promise.race([
+        this.fetchDebuggerWebSocketUrl(endpoint, CONNECT_SUGGESTION_TIMEOUT_MS),
+        new Promise<DebuggerWebSocketLookupResult>((resolve) => {
+          probeTimer = setTimeout(
+            () => resolve({ status: "unavailable" }),
+            CONNECT_SUGGESTION_TIMEOUT_MS + 250
+          );
+        }),
+      ]);
+
+      return probe.status === "ok" ? probe.webSocketDebuggerUrl : null;
+    } finally {
+      clearTimeout(probeTimer);
+    }
   }
 
   getBrowser(name: string): BrowserEntry | undefined {
@@ -985,7 +1125,7 @@ export class BrowserManager {
     }
   }
 
-  private async resolveEndpoint(endpoint: string): Promise<string> {
+  private async resolveEndpoint(endpoint: string, timeoutMs?: number): Promise<string> {
     if (endpoint === "auto") {
       const discoveredEndpoint = await this.discoverChrome();
       if (discoveredEndpoint) {
@@ -996,7 +1136,11 @@ export class BrowserManager {
     }
 
     if (isHttpEndpoint(endpoint)) {
-      const resolved = await this.resolveHttpEndpoint(endpoint, MANUAL_CONNECT_TIMEOUT_MS);
+      const fetchTimeoutMs = Math.min(
+        timeoutMs ?? MANUAL_CONNECT_TIMEOUT_MS,
+        MANUAL_CONNECT_TIMEOUT_MS
+      );
+      const resolved = await this.resolveHttpEndpoint(endpoint, fetchTimeoutMs);
 
       if (!resolved.webSocketDebuggerUrl) {
         throw new Error(this.buildManualConnectError(endpoint, resolved.lastError));
