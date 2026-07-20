@@ -1712,6 +1712,7 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
             | "CDP_DISCOVERY_FAILED"
             | "CDP_ATTACH_FAILED"
             | "RENDERER_UNRESPONSIVE"
+            | "WINDOW_OCCLUDED"
             | "DAEMON_VERSION_MISMATCH"
             | "PROTOCOL_VERSION_MISMATCH",
         ) => 6,

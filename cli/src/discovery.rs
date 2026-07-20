@@ -28,7 +28,7 @@ pub fn agent_schema() -> Value {
             "actionability": { "exitStatus": 3, "codes": ["STALE_REF", "STALE_STATE", "AMBIGUOUS_TARGET", "TARGET_MISSING", "TARGET_HIDDEN", "TARGET_OBSCURED", "TARGET_DISABLED", "UNSUPPORTED_CONTEXT", "ASSERTION_FAILED", "INPUT_VALUE_MISMATCH"] },
             "wait": { "exitStatus": 4, "codes": ["WAIT_TIMEOUT"] },
             "lease": { "exitStatus": 5, "codes": ["LEASE_CONFLICT"] },
-            "runtime": { "exitStatus": 6, "codes": ["CDP_DISCOVERY_FAILED", "CDP_ATTACH_FAILED", "RENDERER_UNRESPONSIVE", "DAEMON_VERSION_MISMATCH", "PROTOCOL_VERSION_MISMATCH", "PAGE_CLOSED", "FRAME_DETACHED", "POPUP_OPENED"] },
+            "runtime": { "exitStatus": 6, "codes": ["CDP_DISCOVERY_FAILED", "CDP_ATTACH_FAILED", "RENDERER_UNRESPONSIVE", "WINDOW_OCCLUDED", "DAEMON_VERSION_MISMATCH", "PROTOCOL_VERSION_MISMATCH", "PAGE_CLOSED", "FRAME_DETACHED", "POPUP_OPENED"] },
             "download": { "exitStatus": 7, "codes": ["DOWNLOAD_FAILED"] },
             "confirmation": { "exitStatus": 8, "codes": ["CONFIRMATION_INVALID"] }
         },
