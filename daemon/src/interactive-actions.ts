@@ -60,6 +60,7 @@ import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-f
 import { observeRecoveryCommand } from "./recovery-command.js";
 import { enterExactText, type InputStrategy } from "./react-input.js";
 import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
+import { ensureTrustedInputDeliverable } from "./window-visibility.js";
 import { confirmationTokens, type ConfirmationScope } from "./confirmation-tokens.js";
 import { redactSensitive } from "./redaction.js";
 
@@ -195,6 +196,23 @@ export interface ActionExecutionHooks {
 }
 
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
+/** Actions that dispatch trusted input and are therefore silently dropped (or
+ * time out) when the browser window is occlusion-frozen. Read-only actions are
+ * unaffected — evaluation keeps working in a frozen renderer. */
+const TRUSTED_INPUT_ACTION_KINDS = new Set<InteractiveRequest["action"]["kind"]>([
+  "click",
+  "type",
+  "focus",
+  "press",
+  "paste",
+  "scroll",
+  "select",
+  "check",
+  "uncheck",
+  "hover",
+  "drag",
+  "upload",
+]);
 const DEFAULT_READ_LIMIT = 100;
 const DEFAULT_FIND_LIMIT = 10;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
@@ -672,6 +690,19 @@ export async function executeInteractiveAction(
     page: request.page,
   };
   const sensitiveValues: string[] = [];
+
+  // Connected browsers run without Playwright's --disable-backgrounding-occluded-windows
+  // launch flag, so a fully covered window freezes the renderer and drops trusted
+  // input while reads keep working. Detect and remediate before dispatching input.
+  if (TRUSTED_INPUT_ACTION_KINDS.has(action.kind)) {
+    const entry = manager.getBrowser(request.browser);
+    if (entry?.type === "connected") {
+      const remediation = await ensureTrustedInputDeliverable(page, request.page);
+      if (remediation) {
+        result.warnings = [...(result.warnings ?? []), ...remediation.warnings];
+      }
+    }
+  }
 
   const authorizeTrustedMutation = async () => {
     await hooks.beforeTrustedInput?.();
