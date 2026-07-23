@@ -141,7 +141,6 @@ Pages returned by `browser.getPage()` and `browser.newPage()` are full Playwrigh
 Page objects — you get the same API (goto, click, fill, locator, evaluate, etc.):
   https://playwright.dev/docs/api/class-page"###;
 
-#[allow(dead_code)]
 const CLI_AFTER_LONG_HELP: &str = include_str!("../llm-guide.txt");
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
@@ -152,6 +151,7 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 #[command(
     long_about = "Agent-friendly browser automation with persistent pages, trusted interactive actions, and sandboxed QuickJS scripts. Run `dev-browser schema --json` for the machine contract, `dev-browser capabilities --compact` for feature discovery, or `dev-browser examples COMMAND` for a focused recipe."
 )]
+#[command(after_long_help = CLI_AFTER_LONG_HELP)]
 #[command(subcommand_precedence_over_arg = true)]
 struct Cli {
     #[arg(
