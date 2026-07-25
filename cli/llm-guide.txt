@@ -148,6 +148,34 @@ LLM USAGE GUIDE:
       console.json({ ok: true, count: 3 });
       EOF
 
+  Video recording of a session (WebM):
+    Record a QA journey or proof of work. Recording state lives in the daemon,
+    so navigation, clicks, and chapter markers happen between separate commands.
+      dev-browser --connect video start recordings/login-flow.webm --page TARGET_ID --size 1280x800
+      dev-browser --connect video chapter "Sign in" --page TARGET_ID --description "Entering credentials" --duration 2000
+      dev-browser --connect click --page TARGET_ID --ref R12
+      dev-browser --connect video stop --page TARGET_ID
+    `video start` and `video stop` both return the absolute .webm path. Without
+    a FILE argument the recording lands under ~/.dev-browser/tmp/videos; a
+    relative FILE resolves against your working directory. One active recording
+    per page; two different pages can record at the same time.
+    `--max-duration SECONDS` overrides the 600-second cap after which the
+    daemon finalizes the file on its own. Popups and new tabs are not captured,
+    and a connected Chrome window that is covered mid-recording freezes the
+    picture. Video errors (VIDEO_ALREADY_RECORDING, VIDEO_NOT_RECORDING,
+    VIDEO_LIMIT_REACHED, VIDEO_ENCODER_MISSING) exit with status 6.
+    For a paced "hero" video with annotations, script it instead:
+      dev-browser --connect <<'EOF'
+      const page = await browser.getPage("main");
+      await page.screencast.start({ path: "demo.webm", size: { width: 1280, height: 800 } });
+      await page.screencast.showChapter("Adding items", { description: "...", duration: 2000 });
+      const note = await page.screencast.showOverlay('<div style="position:absolute;top:8px;right:8px">Done</div>');
+      await note.dispose();
+      await page.screencast.stop();
+      EOF
+    Overlays are pointer-events: none, so actions keep working while they are
+    visible. screencast.start({ onFrame }) is not supported in the sandbox.
+
   Quick inspection:
     dev-browser --connect <<'EOF'
     const tabs = await browser.listPages();

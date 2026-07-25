@@ -6,7 +6,13 @@ const SENSITIVE_HEADER_NAME = /^(?:cookie|set-cookie|authorization|proxy-authori
 const HEADER_CONTAINER_KEY = /headers?$/i;
 const COOKIE_CONTAINER_KEY = /cookies?$/i;
 
-export interface RedactionOptions { allowConfirmationToken?: boolean; secrets?: string[] }
+export interface RedactionOptions {
+  allowConfirmationToken?: boolean;
+  /** Keeps a `path` value intact instead of masking the home directory, for
+   * results whose whole point is the file the caller must open next. */
+  allowOutputPath?: boolean;
+  secrets?: string[];
+}
 
 const MAX_REDACTION_NODES = 20_000;
 const MAX_SECRETS = 2_000;
@@ -165,7 +171,12 @@ function collectSecrets(value: unknown, secrets: Set<string>, seen: WeakSet<obje
   }
 }
 
-function safeString(value: string, secrets: Set<string>, conservative = false): string {
+function safeString(
+  value: string,
+  secrets: Set<string>,
+  conservative = false,
+  keepHomePaths = false
+): string {
   if (conservative) return REDACTED;
   let output = value.slice(0, 8_000);
   output = output.replace(/https?:\/\/[^\s"'<>]+/gi, (url) => redactUrl(url, secrets));
@@ -174,12 +185,19 @@ function safeString(value: string, secrets: Set<string>, conservative = false): 
     output = output.split(secret).join(REDACTED);
     try { output = output.split(encodeURIComponent(secret)).join(REDACTED); } catch { /* malformed input */ }
   }
-  return output
+  output = output
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]")
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED)
     .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b/gi, REDACTED)
     .replace(/\b(AKIA|ASIA)[A-Z0-9]{16}\b/g, REDACTED)
-    .replace(/\b(token|access_token|refresh_token|id_token|code|key|secret|password|signature|session)\s*[:=]\s*[^\s,;|]+/gi, "$1=[redacted]")
+    .replace(/\b(token|access_token|refresh_token|id_token|code|key|secret|password|signature|session)\s*[:=]\s*[^\s,;|]+/gi, "$1=[redacted]");
+
+  // Home-directory paths are masked because they leak the operator's identity
+  // into journals. A path the caller supplied and must act on (a recording's
+  // output file) is not a leak, so it is echoed back intact.
+  if (keepHomePaths) return output;
+
+  return output
     .replace(/\b[A-Za-z]:\\(?:Users|Documents and Settings)\\[^\s"']+/gi, (path) => /\\\.dev-browser\\tmp\\/i.test(path) ? path : "[path]")
     .replace(/\/(?:home|Users)\/[^\s"']+/g, (path) => /\/\.dev-browser\/tmp\//.test(path) ? path : "[path]");
 }
@@ -201,6 +219,8 @@ export function redactSensitive(value: unknown, options: RedactionOptions = {}):
     if (typeof current === "string") {
       if (options.allowConfirmationToken && /^confirmationtoken$/i.test(key)) return current.slice(0, 200);
       if (SENSITIVE_KEY.test(key) || FILE_CONTENT_KEY.test(key)) return REDACTED;
+      if (options.allowOutputPath && /^path$/i.test(key))
+        return safeString(current, secrets, discovery.incomplete, true);
       if (CONTROL_STRING_VALUE_KEY.test(key)) return safeString(current, secrets, false);
       return safeString(current, secrets, discovery.incomplete);
     }

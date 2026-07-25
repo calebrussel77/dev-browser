@@ -28,6 +28,10 @@ export const AgentErrorCodeSchema = z.enum([
   "CONFIRMATION_INVALID",
   "ASSERTION_FAILED",
   "INPUT_VALUE_MISMATCH",
+  "VIDEO_ALREADY_RECORDING",
+  "VIDEO_NOT_RECORDING",
+  "VIDEO_LIMIT_REACHED",
+  "VIDEO_ENCODER_MISSING",
 ]);
 
 export type AgentErrorCode = z.infer<typeof AgentErrorCodeSchema>;
@@ -76,16 +80,23 @@ export class AgentProtocolError extends Error {
   readonly recoverable: boolean;
   readonly details?: unknown;
   readonly nextCommands?: string[];
+  /** Set by errors whose whole value is the file the caller must open next, so
+   * a `path` survives the redactor's home-directory masking end to end. */
+  readonly allowOutputPath: boolean;
 
   constructor(
     code: AgentErrorCode,
     message: string,
     recoverable: boolean,
-    options: { details?: unknown; nextCommands?: string[] } = {}
+    options: { details?: unknown; nextCommands?: string[]; allowOutputPath?: boolean } = {}
   ) {
     super(message);
     this.name = "AgentProtocolError";
-    const parsed = AgentErrorSchema.parse(redactSensitive({ code, message, recoverable, ...options }));
+    const { allowOutputPath = false, ...errorFields } = options;
+    this.allowOutputPath = allowOutputPath;
+    const parsed = AgentErrorSchema.parse(
+      redactSensitive({ code, message, recoverable, ...errorFields }, { allowOutputPath })
+    );
     this.message = parsed.message;
     this.code = parsed.code;
     this.recoverable = parsed.recoverable;
@@ -177,6 +188,8 @@ export function buildInteractiveFailure(input: {
   action?: string;
   error: unknown;
 }): InteractiveFailure {
+  const allowOutputPath =
+    input.error instanceof AgentProtocolError && input.error.allowOutputPath;
   return InteractiveFailureSchema.parse(redactSensitive({
     protocolVersion: AGENT_PROTOCOL_VERSION,
     ok: false,
@@ -185,7 +198,7 @@ export function buildInteractiveFailure(input: {
     page: input.page,
     action: input.action,
     error: toAgentError(input.error),
-  }));
+  }, { allowOutputPath }));
 }
 
 export function parseInteractiveSuccess(value: unknown): InteractiveSuccess {

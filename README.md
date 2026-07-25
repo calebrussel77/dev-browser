@@ -86,6 +86,19 @@ Open each returned screenshot path with your agent's image-viewing capability be
 
 The CLI and daemon negotiate version, bundle, protocol, Playwright, and QuickJS provenance before each request. An idle mismatched daemon is restarted automatically; in-flight work is never killed silently. `doctor --json` distinguishes daemon, browser/CDP, and renderer failures and provides recovery codes. `--trace` stores a redacted, size-bounded journal under `~/.dev-browser/tmp/traces` with timing, before/after state, target/input method, requested screenshots, errors, network/lifecycle events, waits, retries, and recovery hints. Twenty recent traces are retained. External CDP traces are best-effort and report that limitation.
 
+### Video recording
+
+Record a page to a playable WebM file — a QA journey, proof of work, or a demo. The recording lives in the daemon, so ordinary commands interleave between the video ones.
+
+```powershell
+dev-browser --connect video start recordings/login-flow.webm --page TARGET_ID --size 1280x800
+dev-browser --connect video chapter "Sign in" --page TARGET_ID --description "Entering credentials" --duration 2000
+dev-browser --connect click --page TARGET_ID --ref R12
+dev-browser --connect video stop --page TARGET_ID
+```
+
+`video start` and `video stop` both return the absolute `.webm` path. Without a file argument the recording lands under `~/.dev-browser/tmp/videos`; a relative path resolves against your working directory. One active recording per page; distinct pages record in parallel. Every recording carries a max duration (default 600 seconds, `--max-duration SECONDS`) after which the daemon finalizes the file itself, and recordings are finalized gracefully on page close, browser stop, and daemon shutdown. Sandboxed scripts get the full `page.screencast` API — `start({ path, size })`, `showChapter()`, `showOverlay()` with disposables, `hideOverlays()`/`showOverlays()`, `stop()` — for paced hero videos with annotations. Popups and new tabs are not captured, and a covered connected-Chrome window freezes the picture.
+
 ### Bounded screenshots
 
 Every capture — `shot`, `observe --shot`, and action screenshots — has a hard deadline: `--shot-timeout MILLISECONDS` (`250..120000`, default `min(--timeout, 8000)`). Capture prefers a single CDP `Page.captureScreenshot` call so it never waits on perpetual CSS/Web animations, blinking carets, or `document.fonts.ready`; animations and the caret are hidden for the duration of the capture and the injected style is always removed afterward, even on failure. Playwright's own `page.screenshot()` is used only as a one-time fallback when CDP capture is unavailable, and never after a CDP deadline has already elapsed. Result metadata reports `captureMode: "cdp" | "playwright"` so callers can tell which path produced the artifact.

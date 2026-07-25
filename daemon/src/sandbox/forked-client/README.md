@@ -118,6 +118,12 @@ These files have intentional behavior changes or important local wiring:
   - replaces upstream filesystem helpers with sandbox-safe behavior
   - `mkdirIfNeeded()` becomes a noop
   - `writeTempFile()` delegates to `globalThis.writeFile`, which is injected by `../quickjs-sandbox.ts`
+  - `reserveVideoPath()` delegates to `globalThis.reserveVideoPath`, injected by the same file
+
+- `src/client/screencast.ts`
+  - upstream behavior, with two sandbox adaptations
+  - `start({ path })` reserves the destination through the host instead of letting the script name a host path
+  - `start({ onFrame })` throws: no frame data crosses the QuickJS bridge
 
 - `src/client/page.ts`
   - intercepts `page.screenshot({ path })`
@@ -162,7 +168,6 @@ src/client/electron.ts
 src/client/fetch.ts
 src/client/harRouter.ts
 src/client/localUtils.ts
-src/client/screencast.ts
 src/client/stream.ts
 src/client/tracing.ts
 src/client/video.ts
@@ -173,7 +178,7 @@ types/recorder-actions.d.ts
 Why they are stubbed:
 
 - Android and Electron are not part of the sandbox execution model
-- artifacts, streams, tracing, and HAR helpers assume filesystem or stream access the sandbox does not have
+- artifacts, streams, tracing, and HAR helpers assume filesystem or stream access the sandbox does not have (video recording saves through the artifact *channel* with a host-reserved path, never through the stubbed `Artifact` class)
 - `APIRequest` and `LocalUtils` would otherwise pull in more host capabilities than this sandbox should expose
 - `types/recorder-actions.d.ts` exists only to satisfy local type imports from `src/client/browserContext.ts`
 
