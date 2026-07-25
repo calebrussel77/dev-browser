@@ -30,6 +30,7 @@ export const AgentErrorCodeSchema = z.enum([
   "INPUT_VALUE_MISMATCH",
   "VIDEO_ALREADY_RECORDING",
   "VIDEO_NOT_RECORDING",
+  "VIDEO_LIMIT_REACHED",
   "VIDEO_ENCODER_MISSING",
 ]);
 

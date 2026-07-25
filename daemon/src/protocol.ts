@@ -546,6 +546,7 @@ const VideoRequestSchema = z.union([
         height: z.number().int().min(1).max(4_320),
       })
       .optional(),
+    maxDurationSeconds: z.number().int().min(1).max(7_200).optional(),
   }),
   RequestBaseSchema.merge(BrowserTargetSchema).extend({
     type: z.literal("video"),

@@ -422,6 +422,7 @@ async function handleVideo(socket: net.Socket, request: VideoRequest): Promise<v
           pageObject: page,
           file: request.file,
           size: request.size,
+          maxDurationSeconds: request.maxDurationSeconds,
         });
         data = { action: "start", browser: request.browser, page: request.page, ...started };
       } else if (request.action === "chapter") {
@@ -678,6 +679,9 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
         return;
 
       case "browser-stop":
+        // A recording cannot be salvaged once its browser is gone, so it is
+        // finalized while the browser is still connected.
+        await videoRecordings.finalizeAll(request.browser);
         await manager.stopBrowser(request.browser);
         await writeMessage(socket, {
           id: request.id,
@@ -794,6 +798,9 @@ async function shutdown(exitCode = 0): Promise<void> {
     server = null;
     const serverClosed = serverToClose ? closeServerInstance(serverToClose) : Promise.resolve();
 
+    // Finalize before the browsers go away: a shutdown must never leave a
+    // half-written recording behind.
+    await videoRecordings.finalizeAll();
     await manager.stopAll();
     await Promise.allSettled(Array.from(clients, (socket) => closeClientSocket(socket)));
     await serverClosed;

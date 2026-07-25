@@ -10,6 +10,7 @@ import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js"
 import { parseRequest } from "./protocol.js";
 import {
   DEFAULT_CHAPTER_DURATION_MS,
+  DEFAULT_MAX_DURATION_SECONDS,
   defaultVideoPath,
   VideoRecorderRegistry,
   VIDEO_OUTPUT_DIR,
@@ -25,6 +26,27 @@ async function expectPlayableWebm(filePath: string): Promise<void> {
   expect(stats.size).toBeGreaterThan(0);
   const header = (await readFile(filePath)).subarray(0, EBML_SIGNATURE.length);
   expect(header.equals(EBML_SIGNATURE)).toBe(true);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  return stat(filePath).then(
+    () => true,
+    () => false
+  );
+}
+
+/** Polls a condition the daemon reaches on its own (a cap firing, a page-close
+ * finalization) instead of sleeping for a guessed duration. */
+async function waitFor(
+  condition: () => boolean | Promise<boolean>,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await condition()) return;
+    if (Date.now() > deadline) throw new Error("Timed out waiting for the expected daemon state");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 async function expectAgentError(
@@ -83,6 +105,29 @@ describe("video protocol requests", () => {
     expect(
       parseRequest(JSON.stringify({ id: "req-chapter-2", type: "video", action: "chapter" }))
         .success
+    ).toBe(false);
+  });
+
+  it("accepts a per-recording max duration within bounds", () => {
+    expect(
+      parseRequest(
+        JSON.stringify({
+          id: "req-cap",
+          type: "video",
+          action: "start",
+          maxDurationSeconds: 30,
+        })
+      ).success
+    ).toBe(true);
+    expect(
+      parseRequest(
+        JSON.stringify({
+          id: "req-cap-2",
+          type: "video",
+          action: "start",
+          maxDurationSeconds: 0,
+        })
+      ).success
     ).toBe(false);
   });
 
@@ -262,6 +307,117 @@ describe.sequential("video recording against a real browser", () => {
     );
     expect(agentErrorExitCode(error.code)).toBe(6);
   }, 60_000);
+
+  it("finalizes a capped recording on its own and reports the cap once", async () => {
+    const page = await manager.getPage(browserName, "capped");
+    await page.setContent("<h1 style='font-size:64px'>Capped</h1>");
+    const outputPath = path.join(outputDir, "capped.webm");
+
+    const started = await recordings.start({
+      browser: browserName,
+      page: "capped",
+      pageObject: page,
+      file: outputPath,
+      maxDurationSeconds: 1,
+    });
+    expect(started.maxDurationSeconds).toBe(1);
+
+    // No further command: the daemon must finalize the file by itself.
+    await waitFor(
+      () => !recordings.isRecording({ browser: browserName, page: "capped" }),
+      15_000
+    );
+    await waitFor(() => fileExists(outputPath), 15_000);
+    await expectPlayableWebm(outputPath);
+
+    const capped = await expectAgentError(
+      recordings.stop({ browser: browserName, page: "capped" }),
+      "VIDEO_LIMIT_REACHED"
+    );
+    expect(agentErrorExitCode(capped.code)).toBe(6);
+    expect(capped.message).toContain("max duration");
+
+    // The note is reported once; the page is then a clean slate again.
+    await expectAgentError(
+      recordings.stop({ browser: browserName, page: "capped" }),
+      "VIDEO_NOT_RECORDING"
+    );
+  }, 120_000);
+
+  it("keeps recording while a longer cap has not expired", async () => {
+    const page = await manager.getPage(browserName, "long-cap");
+    await page.setContent("<h1 style='font-size:64px'>Long cap</h1>");
+    const outputPath = path.join(outputDir, "long-cap.webm");
+
+    const started = await recordings.start({
+      browser: browserName,
+      page: "long-cap",
+      pageObject: page,
+      file: outputPath,
+      maxDurationSeconds: 3_600,
+    });
+    expect(started.maxDurationSeconds).toBe(3_600);
+
+    await page.waitForTimeout(1_500);
+    expect(recordings.isRecording({ browser: browserName, page: "long-cap" })).toBe(true);
+
+    await recordings.stop({ browser: browserName, page: "long-cap" });
+    await expectPlayableWebm(outputPath);
+  }, 120_000);
+
+  it("applies the default cap when none is requested", async () => {
+    const page = await manager.getPage(browserName, "default-cap");
+    const outputPath = path.join(outputDir, "default-cap.webm");
+    const started = await recordings.start({
+      browser: browserName,
+      page: "default-cap",
+      pageObject: page,
+      file: outputPath,
+    });
+    expect(started.maxDurationSeconds).toBe(DEFAULT_MAX_DURATION_SECONDS);
+    await recordings.stop({ browser: browserName, page: "default-cap" });
+  }, 120_000);
+
+  it("finalizes a valid file when the recorded page closes mid-recording", async () => {
+    const page = await manager.getPage(browserName, "closed-mid-recording");
+    await page.setContent("<h1 style='font-size:64px'>Closing</h1>");
+    const outputPath = path.join(outputDir, "closed.webm");
+
+    await recordings.start({
+      browser: browserName,
+      page: "closed-mid-recording",
+      pageObject: page,
+      file: outputPath,
+    });
+    await page.waitForTimeout(1_500);
+    await page.close();
+
+    await waitFor(
+      () => !recordings.isRecording({ browser: browserName, page: "closed-mid-recording" }),
+      15_000
+    );
+    await waitFor(() => fileExists(outputPath), 15_000);
+    await expectPlayableWebm(outputPath);
+  }, 120_000);
+
+  it("finalizes every active recording on shutdown", async () => {
+    const page = await manager.getPage(browserName, "shutdown-recording");
+    await page.setContent("<h1 style='font-size:64px'>Shutting down</h1>");
+    const outputPath = path.join(outputDir, "shutdown.webm");
+
+    await recordings.start({
+      browser: browserName,
+      page: "shutdown-recording",
+      pageObject: page,
+      file: outputPath,
+    });
+    await page.waitForTimeout(1_500);
+
+    await recordings.finalizeAll();
+
+    expect(recordings.activeCount()).toBe(0);
+    await expectPlayableWebm(outputPath);
+  }, 120_000);
 
   it("records two pages in parallel into separate files", async () => {
     const first = await manager.getPage(browserName, "parallel-one");

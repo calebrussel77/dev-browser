@@ -345,6 +345,13 @@ enum VideoCommand {
             help = "Record at fixed dimensions regardless of the live viewport"
         )]
         size: Option<(u32, u32)>,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u32).range(1..=7_200),
+            help = "Auto-finalize the recording after this long (default 600)"
+        )]
+        max_duration: Option<u32>,
     },
     #[command(
         about = "Insert a chapter card into the active recording",
@@ -1723,12 +1730,20 @@ fn build_video_request(cli: &Cli, command: &VideoCommand) -> Result<Value, Box<d
     }
 
     match command {
-        VideoCommand::Start { file, size, .. } => {
+        VideoCommand::Start {
+            file,
+            size,
+            max_duration,
+            ..
+        } => {
             if let Some(file) = file {
                 request["file"] = json!(resolve_output_path(file)?);
             }
             if let Some((width, height)) = size {
                 request["size"] = json!({ "width": width, "height": height });
+            }
+            if let Some(seconds) = max_duration {
+                request["maxDurationSeconds"] = json!(seconds);
             }
         }
         VideoCommand::Chapter {
@@ -2796,6 +2811,21 @@ mod tests {
         assert_eq!(request["browser"], json!("default"));
         assert!(request.get("file").is_none());
         assert!(request.get("size").is_none());
+        // Omitted means "let the daemon apply its default cap", not "no cap".
+        assert!(request.get("maxDurationSeconds").is_none());
+    }
+
+    #[test]
+    fn video_start_rejects_an_out_of_range_max_duration() {
+        assert!(
+            Cli::try_parse_from(["dev-browser", "video", "start", "--max-duration", "0"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["dev-browser", "video", "start", "--max-duration", "7201"])
+                .is_err()
+        );
+        let short = video_request(&["dev-browser", "video", "start", "--max-duration", "30"]);
+        assert_eq!(short["maxDurationSeconds"], json!(30));
     }
 
     #[test]
@@ -2810,10 +2840,13 @@ mod tests {
             "feed",
             "--size",
             "1280x800",
+            "--max-duration",
+            "1800",
         ]);
         assert_eq!(request["page"], json!("feed"));
         assert_eq!(request["connect"], json!("auto"));
         assert_eq!(request["size"], json!({ "width": 1280, "height": 800 }));
+        assert_eq!(request["maxDurationSeconds"], json!(1800));
 
         let file = request["file"].as_str().unwrap();
         assert!(

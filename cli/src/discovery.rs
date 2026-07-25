@@ -30,7 +30,7 @@ pub fn agent_schema() -> Value {
             "lease": { "exitStatus": 5, "codes": ["LEASE_CONFLICT"] },
             "runtime": { "exitStatus": 6, "codes": ["CDP_DISCOVERY_FAILED", "CDP_ATTACH_FAILED", "RENDERER_UNRESPONSIVE", "WINDOW_OCCLUDED", "DAEMON_VERSION_MISMATCH", "PROTOCOL_VERSION_MISMATCH", "PAGE_CLOSED", "FRAME_DETACHED", "POPUP_OPENED"] },
             "download": { "exitStatus": 7, "codes": ["DOWNLOAD_FAILED"] },
-            "video": { "exitStatus": 6, "codes": ["VIDEO_ALREADY_RECORDING", "VIDEO_NOT_RECORDING", "VIDEO_ENCODER_MISSING"] },
+            "video": { "exitStatus": 6, "codes": ["VIDEO_ALREADY_RECORDING", "VIDEO_NOT_RECORDING", "VIDEO_LIMIT_REACHED", "VIDEO_ENCODER_MISSING"] },
             "confirmation": { "exitStatus": 8, "codes": ["CONFIRMATION_INVALID"] }
         },
         "limits": {
@@ -223,6 +223,7 @@ mod tests {
         for code in [
             "VIDEO_ALREADY_RECORDING",
             "VIDEO_NOT_RECORDING",
+            "VIDEO_LIMIT_REACHED",
             "VIDEO_ENCODER_MISSING",
         ] {
             assert!(schema["errors"]["video"]["codes"]
