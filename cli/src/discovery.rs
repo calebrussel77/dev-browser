@@ -140,6 +140,7 @@ pub fn focused_example(command: &str) -> Option<&'static str> {
         "trace" => Some("dev-browser click --page TARGET --ref R7 --trace && dev-browser trace show LAST"),
         "video" => Some(concat!(
             "dev-browser video start --page TARGET recordings/flow.webm --size 1280x800\n",
+            "dev-browser video chapter \"Sign in\" --page TARGET --description \"Entering credentials\" --duration 2000\n",
             "dev-browser click --page TARGET --ref R7\n",
             "dev-browser video stop --page TARGET"
         )),
@@ -239,6 +240,12 @@ mod tests {
             .unwrap()
             .contains(&json!("start")));
 
-        assert!(focused_example("video").unwrap().contains("video stop"));
+        let example = focused_example("video").unwrap();
+        for expected in ["video start", "video chapter", "video stop"] {
+            assert!(
+                example.contains(expected),
+                "expected the video recipe to show {expected}"
+            );
+        }
     }
 }

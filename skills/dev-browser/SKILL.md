@@ -65,6 +65,21 @@ EOF
 
 Full detail — the script globals, file I/O helpers, `console.json`, `snapshotForAI`, and the sandbox's hard limits: `references/scripting.md`.
 
+## Recording a video
+
+When the deliverable is something a human watches — a QA journey, proof of work, a demo — record the page to a WebM file. Quick path:
+
+```bash
+dev-browser --connect video start recordings/login-flow.webm --page TARGET --size 1280x800
+dev-browser --connect video chapter "Sign in" --page TARGET --description "Entering credentials"
+dev-browser --connect click --page TARGET --ref R12
+dev-browser --connect video stop --page TARGET
+```
+
+`start` and `stop` both return the absolute `.webm` path. For a paced video with typing and annotations, script it with `page.screencast` instead.
+
+Full detail — both paths, the overlay API, and the limitations you must know before recording (popups are not captured, a covered connected window freezes, recordings auto-finalize at their max duration): `references/video-recording.md`.
+
 ## Discovery and diagnostics — the authoritative contract
 
 This SKILL.md is the mental model and the *why*. The exhaustive, versioned, machine-readable contract lives in the CLI itself — consult it rather than guessing flags or memorizing grammar that may have changed:
@@ -86,4 +101,5 @@ Full detail — recovery playbook, lifecycle commands, the pitfalls checklist, a
 | `references/browsers-and-pages.md` | Choosing `--connect` vs. a managed profile, or working across several tabs of one session |
 | `references/interactive-loop.md` | Running the perceive → find → act → verify loop, or decoding a typed error |
 | `references/scripting.md` | Writing a sandboxed script, or hitting a sandbox limitation |
+| `references/video-recording.md` | Recording a session to WebM — CLI commands or a scripted hero video |
 | `references/diagnostics-and-recovery.md` | Something is surprising, broken, or needs cleanup — plus install |

@@ -362,7 +362,11 @@ enum VideoCommand {
         title: String,
         #[command(flatten)]
         target: PageTargetArgs,
-        #[arg(long, value_name = "TEXT", help = "Secondary line shown below the title")]
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Secondary line shown below the title"
+        )]
         description: Option<String>,
         #[arg(
             long,

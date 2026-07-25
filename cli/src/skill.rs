@@ -15,7 +15,7 @@ struct EmbeddedSkillFile {
     contents: &'static str,
 }
 
-const EMBEDDED_DEV_BROWSER_SKILL_FILES: [EmbeddedSkillFile; 5] = [
+const EMBEDDED_DEV_BROWSER_SKILL_FILES: [EmbeddedSkillFile; 6] = [
     EmbeddedSkillFile {
         relative_path: "SKILL.md",
         contents: include_str!("../../skills/dev-browser/SKILL.md"),
@@ -31,6 +31,10 @@ const EMBEDDED_DEV_BROWSER_SKILL_FILES: [EmbeddedSkillFile; 5] = [
     EmbeddedSkillFile {
         relative_path: "references/scripting.md",
         contents: include_str!("../../skills/dev-browser/references/scripting.md"),
+    },
+    EmbeddedSkillFile {
+        relative_path: "references/video-recording.md",
+        contents: include_str!("../../skills/dev-browser/references/video-recording.md"),
     },
     EmbeddedSkillFile {
         relative_path: "references/diagnostics-and-recovery.md",
@@ -292,7 +296,10 @@ mod tests {
             .map(|file| file.relative_path)
             .filter(|path| path.starts_with("references/"))
             .collect();
-        assert!(references.len() >= 4, "expected the reference files to ship");
+        assert!(
+            references.len() >= 4,
+            "expected the reference files to ship"
+        );
 
         for reference in references {
             assert!(
