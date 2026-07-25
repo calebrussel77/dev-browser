@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { posix, win32 } from "node:path";
 import util from "node:util";
 
 import type { Page } from "playwright";
@@ -7,6 +8,7 @@ import type { BrowserManager } from "../browser-manager.js";
 import {
   ensureDevBrowserTempDir,
   readDevBrowserTempFile,
+  resolveDevBrowserTempPath,
   writeDevBrowserTempFile,
 } from "../temp-files.js";
 import { HostBridge } from "./host-bridge.js";
@@ -213,6 +215,7 @@ export class QuickJSSandbox {
           saveScreenshot: (name, data) => this.#writeTempFile(name, data),
           writeFile: (name, data) => this.#writeTempFile(name, data),
           readFile: (name) => this.#readTempFile(name),
+          reserveVideoPath: (name) => this.#reserveVideoPath(name),
         },
         onConsole: (level, args) => {
           this.#routeConsole(level, args);
@@ -519,6 +522,14 @@ export class QuickJSSandbox {
                   enumerable: true,
                   writable: false,
                 },
+                reserveVideoPath: {
+                  value: async (name) => {
+                    return await hostCall("reserveVideoPath", JSON.stringify([name]));
+                  },
+                  configurable: false,
+                  enumerable: true,
+                  writable: false,
+                },
               });
             })();
           })()
@@ -699,6 +710,20 @@ export class QuickJSSandbox {
 
   async #readTempFile(name: unknown): Promise<string> {
     return await readDevBrowserTempFile(requireString(name, "File name"));
+  }
+
+  /** A recording is written by the *host* (Playwright's encoder), not by the
+   * script, so the sandbox never gets to name a host path: it asks for a
+   * filename and receives the controlled absolute path it landed on. */
+  async #reserveVideoPath(name: unknown): Promise<string> {
+    const requested = requireString(name, "Video file name");
+    // Reject before prefixing: once "videos/" is prepended an absolute path
+    // stops looking absolute and would be silently rewritten instead of
+    // refused, unlike every other sandbox file helper.
+    if (posix.isAbsolute(requested) || win32.isAbsolute(requested)) {
+      throw new Error("Absolute paths are not allowed");
+    }
+    return await resolveDevBrowserTempPath(`videos/${requested}`, { createParents: true });
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {
