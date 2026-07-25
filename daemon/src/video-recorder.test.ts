@@ -422,6 +422,9 @@ describe.sequential("video recording against a real browser", () => {
       () => !recordings.isRecording({ browser: browserName, page: "closed-mid-recording" }),
       15_000
     );
+    // A shutdown that lands on top of an in-flight page-close finalization
+    // must wait for that write instead of racing it.
+    await recordings.finalizeAll();
     await waitFor(() => fileExists(outputPath), 15_000);
     await expectPlayableWebm(outputPath);
   }, 120_000);

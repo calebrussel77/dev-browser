@@ -94,7 +94,6 @@ interface ActiveRecording extends VideoTarget {
   timer: NodeJS.Timeout;
   onPageClose: () => void;
   artifact?: RecordingArtifact;
-  finalizing?: Promise<void>;
 }
 
 interface CapFinalizedNote {
@@ -137,6 +136,7 @@ function recordingArtifactOf(page: Page): RecordingArtifact | undefined {
 
 export class VideoRecorderRegistry {
   readonly #active = new Map<string, ActiveRecording>();
+  readonly #finalizing = new Map<string, Promise<void>>();
   readonly #capFinalized = new Map<string, CapFinalizedNote>();
   readonly #ensureVisible: NonNullable<VideoRecorderDependencies["ensureVisible"]>;
 
@@ -285,38 +285,40 @@ export class VideoRecorderRegistry {
 
   /** Finalizes every recording for one browser (or all of them) before the
    * browser goes away, because a recording whose browser is already gone can
-   * only be salvaged from the encoder's own temp file. */
+   * only be salvaged from the encoder's own temp file. Also waits on writes
+   * another exit path already started, so a shutdown never races a page-close
+   * finalization to the same file. */
   async finalizeAll(browser?: string): Promise<void> {
-    const keys = [...this.#active.entries()]
+    const started = [...this.#active.entries()]
       .filter(([, recording]) => browser === undefined || recording.browser === browser)
-      .map(([key]) => key);
-    await Promise.allSettled(keys.map((key) => this.#finalize(key, "shutdown")));
+      .map(([key]) => this.#finalize(key, "shutdown"));
+    await Promise.allSettled([...started, ...this.#finalizing.values()]);
   }
 
-  /** Every exit path funnels through here so a recording is finalized exactly
-   * once and always leaves a valid file behind. */
+  /** Every exit path funnels through here. Removing the recording from the
+   * active map before the first await makes finalization single-shot, and the
+   * in-flight promise stays reachable so shutdown can wait on it. */
   async #finalize(key: string, reason: FinalizationReason): Promise<void> {
     const recording = this.#active.get(key);
-    if (!recording) return;
-    if (recording.finalizing) return recording.finalizing;
+    if (!recording) return this.#finalizing.get(key);
 
-    recording.finalizing = (async () => {
-      clearTimeout(recording.timer);
-      recording.pageObject.off("close", recording.onPageClose);
-      this.#active.delete(key);
+    clearTimeout(recording.timer);
+    recording.pageObject.off("close", recording.onPageClose);
+    this.#active.delete(key);
 
-      if (reason === "max-duration") {
-        this.#capFinalized.set(key, {
-          path: recording.outputPath,
-          maxDurationSeconds: recording.maxDurationSeconds,
-          finalizedAt: Date.now(),
-        });
-      }
+    if (reason === "max-duration") {
+      this.#capFinalized.set(key, {
+        path: recording.outputPath,
+        maxDurationSeconds: recording.maxDurationSeconds,
+        finalizedAt: Date.now(),
+      });
+    }
 
-      await this.#saveRecording(recording, reason);
-    })();
-
-    return recording.finalizing;
+    const pending = this.#saveRecording(recording, reason).finally(() => {
+      this.#finalizing.delete(key);
+    });
+    this.#finalizing.set(key, pending);
+    return pending;
   }
 
   /** Three tiers, least to most degraded: a live page can stop the screencast
