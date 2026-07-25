@@ -117,7 +117,7 @@ pub fn compact_capabilities() -> Value {
         "safety": ["state-guards", "target-fingerprints", "leases", "typed-waits", "safe-retry", "confirmation-tokens", "redaction"],
         "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
         "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],
-        "video": ["start", "stop"],
+        "video": ["start", "chapter", "stop"],
         "runtimeHandshake": true,
         "quickjs": true,
         "scripting": ["console.json"]

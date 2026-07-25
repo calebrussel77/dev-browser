@@ -8,7 +8,12 @@ import { AgentProtocolError, agentErrorExitCode } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
 import { parseRequest } from "./protocol.js";
-import { defaultVideoPath, VideoRecorderRegistry, VIDEO_OUTPUT_DIR } from "./video-recorder.js";
+import {
+  DEFAULT_CHAPTER_DURATION_MS,
+  defaultVideoPath,
+  VideoRecorderRegistry,
+  VIDEO_OUTPUT_DIR,
+} from "./video-recorder.js";
 
 /** Matroska/WebM files always open with the EBML magic number. */
 const EBML_SIGNATURE = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]);
@@ -61,6 +66,24 @@ describe("video protocol requests", () => {
       })
     );
     expect(sized.success).toBe(true);
+  });
+
+  it("accepts chapter with a title and optional card fields", () => {
+    const parsed = parseRequest(
+      JSON.stringify({
+        id: "req-chapter",
+        type: "video",
+        action: "chapter",
+        title: "Sign in",
+        description: "Entering credentials",
+        durationMs: 2_500,
+      })
+    );
+    expect(parsed.success).toBe(true);
+    expect(
+      parseRequest(JSON.stringify({ id: "req-chapter-2", type: "video", action: "chapter" }))
+        .success
+    ).toBe(false);
   });
 
   it("accepts stop and rejects unknown actions or malformed sizes", () => {
@@ -171,6 +194,70 @@ describe.sequential("video recording against a real browser", () => {
   it("rejects stop on a page with no active recording", async () => {
     const error = await expectAgentError(
       recordings.stop({ browser: browserName, page: "never-recorded" }),
+      "VIDEO_NOT_RECORDING"
+    );
+    expect(agentErrorExitCode(error.code)).toBe(6);
+  }, 60_000);
+
+  it("marks chapters into an active recording and blocks for the card duration", async () => {
+    const page = await manager.getPage(browserName, "chaptered");
+    await page.setContent("<h1 style='font-size:64px'>Chaptered</h1>");
+    const outputPath = path.join(outputDir, "chaptered.webm");
+
+    await recordings.start({
+      browser: browserName,
+      page: "chaptered",
+      pageObject: page,
+      file: outputPath,
+    });
+
+    // The card must be genuinely composited while it is up, not merely
+    // requested: capture the frame mid-chapter and compare it with the frames
+    // before and after.
+    const beforeCard = await page.screenshot();
+    const startedAt = Date.now();
+    const pending = recordings.chapter({
+      browser: browserName,
+      page: "chaptered",
+      title: "Sign in",
+      description: "Entering credentials",
+      durationMs: 1_500,
+    });
+    await page.waitForTimeout(500);
+    const duringCard = await page.screenshot();
+    const chapter = await pending;
+    const elapsed = Date.now() - startedAt;
+    await page.waitForTimeout(300);
+    const afterCard = await page.screenshot();
+
+    expect(duringCard.equals(beforeCard)).toBe(false);
+    expect(afterCard.equals(beforeCard)).toBe(true);
+    expect(chapter).toMatchObject({
+      title: "Sign in",
+      description: "Entering credentials",
+      durationMs: 1_500,
+    });
+    expect(elapsed).toBeGreaterThanOrEqual(1_400);
+
+    await page.setContent("<h1 style='font-size:64px'>After the chapter</h1>");
+    const second = await recordings.chapter({
+      browser: browserName,
+      page: "chaptered",
+      title: "Result",
+    });
+    expect(second.durationMs).toBe(DEFAULT_CHAPTER_DURATION_MS);
+
+    await recordings.stop({ browser: browserName, page: "chaptered" });
+    await expectPlayableWebm(outputPath);
+  }, 120_000);
+
+  it("rejects a chapter on a page with no active recording", async () => {
+    const error = await expectAgentError(
+      recordings.chapter({
+        browser: browserName,
+        page: "never-recorded",
+        title: "Nothing to mark",
+      }),
       "VIDEO_NOT_RECORDING"
     );
     expect(agentErrorExitCode(error.code)).toBe(6);

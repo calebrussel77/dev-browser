@@ -346,6 +346,25 @@ enum VideoCommand {
         )]
         size: Option<(u32, u32)>,
     },
+    #[command(
+        about = "Insert a chapter card into the active recording",
+        long_about = "Insert a full-screen chapter card (blurred backdrop, title, optional description) into the active recording of the targeted page.\n\nThe command blocks for the requested duration so the card is genuinely on screen in the finished video."
+    )]
+    Chapter {
+        #[arg(value_name = "TITLE")]
+        title: String,
+        #[command(flatten)]
+        target: PageTargetArgs,
+        #[arg(long, value_name = "TEXT", help = "Secondary line shown below the title")]
+        description: Option<String>,
+        #[arg(
+            long,
+            value_name = "MILLISECONDS",
+            value_parser = clap::value_parser!(u32).range(1..=60_000),
+            help = "How long the card stays on screen (default 2000)"
+        )]
+        duration: Option<u32>,
+    },
     #[command(about = "Finalize the active recording and return its absolute path")]
     Stop {
         #[command(flatten)]
@@ -1680,6 +1699,7 @@ fn run_interactive(
 fn build_video_request(cli: &Cli, command: &VideoCommand) -> Result<Value, Box<dyn Error>> {
     let (action, page) = match command {
         VideoCommand::Start { target, .. } => ("start", target.page.as_str()),
+        VideoCommand::Chapter { target, .. } => ("chapter", target.page.as_str()),
         VideoCommand::Stop { target } => ("stop", target.page.as_str()),
     };
 
@@ -1702,13 +1722,30 @@ fn build_video_request(cli: &Cli, command: &VideoCommand) -> Result<Value, Box<d
         request["ignoreHTTPSErrors"] = json!(true);
     }
 
-    if let VideoCommand::Start { file, size, .. } = command {
-        if let Some(file) = file {
-            request["file"] = json!(resolve_output_path(file)?);
+    match command {
+        VideoCommand::Start { file, size, .. } => {
+            if let Some(file) = file {
+                request["file"] = json!(resolve_output_path(file)?);
+            }
+            if let Some((width, height)) = size {
+                request["size"] = json!({ "width": width, "height": height });
+            }
         }
-        if let Some((width, height)) = size {
-            request["size"] = json!({ "width": width, "height": height });
+        VideoCommand::Chapter {
+            title,
+            description,
+            duration,
+            ..
+        } => {
+            request["title"] = json!(title);
+            if let Some(description) = description {
+                request["description"] = json!(description);
+            }
+            if let Some(duration) = duration {
+                request["durationMs"] = json!(duration);
+            }
         }
+        VideoCommand::Stop { .. } => {}
     }
 
     Ok(request)
@@ -2795,6 +2832,37 @@ mod tests {
         };
         let request = video_request(&["dev-browser", "video", "start", absolute]);
         assert_eq!(request["file"], json!(absolute));
+    }
+
+    #[test]
+    fn video_chapter_maps_title_description_and_duration() {
+        let request = video_request(&[
+            "dev-browser",
+            "video",
+            "chapter",
+            "Sign in",
+            "--page",
+            "feed",
+            "--description",
+            "Entering credentials",
+            "--duration",
+            "2500",
+        ]);
+        assert_eq!(request["action"], json!("chapter"));
+        assert_eq!(request["page"], json!("feed"));
+        assert_eq!(request["title"], json!("Sign in"));
+        assert_eq!(request["description"], json!("Entering credentials"));
+        assert_eq!(request["durationMs"], json!(2500));
+    }
+
+    #[test]
+    fn video_chapter_requires_a_title_and_leaves_optional_flags_out() {
+        assert!(Cli::try_parse_from(["dev-browser", "video", "chapter"]).is_err());
+        let request = video_request(&["dev-browser", "video", "chapter", "Result"]);
+        assert_eq!(request["title"], json!("Result"));
+        assert_eq!(request["page"], json!("main"));
+        assert!(request.get("description").is_none());
+        assert!(request.get("durationMs").is_none());
     }
 
     #[test]

@@ -37,6 +37,22 @@ export interface VideoStopResult {
   durationMs: number;
 }
 
+export interface VideoChapterOptions extends VideoTarget {
+  title: string;
+  description?: string;
+  durationMs?: number;
+}
+
+export interface VideoChapterResult {
+  title: string;
+  description?: string;
+  durationMs: number;
+}
+
+/** Playwright's own default for a chapter card. Mirrored here so the result
+ * reports the duration the caller actually got, not `undefined`. */
+export const DEFAULT_CHAPTER_DURATION_MS = 2_000;
+
 interface ActiveRecording {
   browser: string;
   page: string;
@@ -135,6 +151,27 @@ export class VideoRecorderRegistry {
     });
 
     return { path: outputPath, startedAt: new Date(startedAt).toISOString() };
+  }
+
+  /** Blocks for the card's duration so the marker is genuinely on screen in
+   * the finished video rather than a frame that the encoder may drop. */
+  async chapter(options: VideoChapterOptions): Promise<VideoChapterResult> {
+    const recording = this.#active.get(this.#key(options.browser, options.page));
+    if (!recording) {
+      throw this.#notRecording(options.page);
+    }
+
+    const durationMs = options.durationMs ?? DEFAULT_CHAPTER_DURATION_MS;
+    await recording.pageObject.screencast.showChapter(options.title, {
+      ...(options.description ? { description: options.description } : {}),
+      duration: durationMs,
+    });
+
+    return {
+      title: options.title,
+      ...(options.description ? { description: options.description } : {}),
+      durationMs,
+    };
   }
 
   async stop(target: VideoTarget): Promise<VideoStopResult> {

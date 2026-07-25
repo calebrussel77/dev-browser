@@ -424,6 +424,15 @@ async function handleVideo(socket: net.Socket, request: VideoRequest): Promise<v
           size: request.size,
         });
         data = { action: "start", browser: request.browser, page: request.page, ...started };
+      } else if (request.action === "chapter") {
+        const chapter = await videoRecordings.chapter({
+          browser: request.browser,
+          page: request.page,
+          title: request.title,
+          description: request.description,
+          durationMs: request.durationMs,
+        });
+        data = { action: "chapter", browser: request.browser, page: request.page, ...chapter };
       } else {
         const stopped = await videoRecordings.stop({
           browser: request.browser,

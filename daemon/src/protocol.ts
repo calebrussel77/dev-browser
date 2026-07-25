@@ -549,6 +549,13 @@ const VideoRequestSchema = z.union([
   }),
   RequestBaseSchema.merge(BrowserTargetSchema).extend({
     type: z.literal("video"),
+    action: z.literal("chapter"),
+    title: z.string().min(1).max(200),
+    description: z.string().min(1).max(1_000).optional(),
+    durationMs: z.number().int().min(1).max(60_000).optional(),
+  }),
+  RequestBaseSchema.merge(BrowserTargetSchema).extend({
+    type: z.literal("video"),
     action: z.literal("stop"),
   }),
 ]);
