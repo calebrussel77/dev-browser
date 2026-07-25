@@ -51,6 +51,37 @@ fn parse_ref_id(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// `--size WxH` for a recording, e.g. `1280x800`.
+fn parse_video_size(value: &str) -> Result<(u32, u32), String> {
+    let (width, height) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| "size must match WIDTHxHEIGHT, e.g. 1280x800".to_owned())?;
+    let width: u32 = width
+        .trim()
+        .parse()
+        .map_err(|_| "size width must be a positive integer".to_owned())?;
+    let height: u32 = height
+        .trim()
+        .parse()
+        .map_err(|_| "size height must be a positive integer".to_owned())?;
+    if width == 0 || width > 7_680 || height == 0 || height > 4_320 {
+        return Err("size must be within 1x1 and 7680x4320".into());
+    }
+    Ok((width, height))
+}
+
+/// Recording paths are resolved against the *caller's* working directory, not
+/// the daemon's: `video start recordings/login.webm` must land where the agent
+/// ran the command.
+fn resolve_output_path(file: &str) -> Result<String, Box<dyn Error>> {
+    let candidate = std::path::Path::new(file);
+    if candidate.is_absolute() {
+        return Ok(candidate.to_string_lossy().into_owned());
+    }
+    let resolved = std::env::current_dir()?.join(candidate);
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
 #[allow(dead_code)]
 const CLI_LONG_ABOUT: &str = r###"Dev Browser is a CLI for controlling local or external browsers with JavaScript scripts.
 Scripts run in a sandboxed QuickJS runtime (not Node.js). Top-level `await` is
@@ -293,6 +324,32 @@ enum SessionCommand {
     Close {
         #[arg(long, value_name = "SESSION_ID")]
         session: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum VideoCommand {
+    #[command(
+        about = "Start recording the targeted page to a WebM file",
+        long_about = "Start recording the targeted page to a WebM file.\n\nRecording state lives in the daemon, so navigation, clicks, and chapter markers can happen between separate commands. The absolute output path is returned in the JSON result.\n\nWithout FILE the recording lands under ~/.dev-browser/tmp/videos with a timestamped name. A relative FILE is resolved against the current working directory."
+    )]
+    Start {
+        #[arg(value_name = "FILE")]
+        file: Option<String>,
+        #[command(flatten)]
+        target: PageTargetArgs,
+        #[arg(
+            long,
+            value_name = "WxH",
+            value_parser = parse_video_size,
+            help = "Record at fixed dimensions regardless of the live viewport"
+        )]
+        size: Option<(u32, u32)>,
+    },
+    #[command(about = "Finalize the active recording and return its absolute path")]
+    Stop {
+        #[command(flatten)]
+        target: PageTargetArgs,
     },
 }
 
@@ -836,6 +893,8 @@ enum Command {
     },
     #[command(subcommand, about = "Read a bounded redacted action trace")]
     Trace(TraceCommand),
+    #[command(subcommand, about = "Record a page to a WebM video")]
+    Video(VideoCommand),
     #[command(
         about = "Install Playwright browsers (Chromium)",
         long_about = "Install Playwright browsers (Chromium).\n\nDownloads the Chromium build used for daemon-managed browser instances."
@@ -1392,6 +1451,11 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 ResultMode::Json,
             )
         }
+        Some(Command::Video(command)) => {
+            let request = build_video_request(&cli, command)?;
+            ensure_daemon()?;
+            send_request(request, ResultMode::Json)
+        }
         Some(Command::InstallSkill { claude, agents }) => {
             install_skill(*claude, *agents)?;
             Ok(0)
@@ -1611,6 +1675,43 @@ fn run_interactive(
         action,
     );
     send_request(request, ResultMode::Json)
+}
+
+fn build_video_request(cli: &Cli, command: &VideoCommand) -> Result<Value, Box<dyn Error>> {
+    let (action, page) = match command {
+        VideoCommand::Start { target, .. } => ("start", target.page.as_str()),
+        VideoCommand::Stop { target } => ("stop", target.page.as_str()),
+    };
+
+    let mut request = json!({
+        "id": request_id(&format!("video-{action}")),
+        "type": "video",
+        "action": action,
+        "browser": cli.browser,
+        "page": page,
+        "timeoutMs": timeout_ms(cli)?,
+    });
+
+    if let Some(connect) = cli.connect.as_deref() {
+        request["connect"] = json!(connect);
+    }
+    if cli.headless {
+        request["headless"] = json!(true);
+    }
+    if cli.ignore_https_errors {
+        request["ignoreHTTPSErrors"] = json!(true);
+    }
+
+    if let VideoCommand::Start { file, size, .. } = command {
+        if let Some(file) = file {
+            request["file"] = json!(resolve_output_path(file)?);
+        }
+        if let Some((width, height)) = size {
+            request["size"] = json!({ "width": width, "height": height });
+        }
+    }
+
+    Ok(request)
 }
 
 fn timeout_ms(cli: &Cli) -> Result<u64, Box<dyn Error>> {
@@ -1855,8 +1956,8 @@ fn format_duration_ms(duration_ms: u64) -> String {
 mod tests {
     use super::{
         apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
-        cli_error_exit_code, read_text_stream, stream_responses, Cli, Command, ResultMode,
-        SessionCommand, TraceCommand,
+        build_video_request, cli_error_exit_code, parse_video_size, read_text_stream,
+        stream_responses, Cli, Command, ResultMode, SessionCommand, TraceCommand, VideoCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2638,6 +2739,94 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Trace(TraceCommand::Show { trace_id })) if trace_id == "LAST"
+        ));
+    }
+
+    fn video_request(argv: &[&str]) -> serde_json::Value {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Some(Command::Video(command)) = &cli.command else {
+            panic!("expected a video command");
+        };
+        build_video_request(&cli, command).unwrap()
+    }
+
+    #[test]
+    fn video_start_defaults_to_the_main_page_without_an_output_file() {
+        let request = video_request(&["dev-browser", "video", "start"]);
+        assert_eq!(request["type"], json!("video"));
+        assert_eq!(request["action"], json!("start"));
+        assert_eq!(request["page"], json!("main"));
+        assert_eq!(request["browser"], json!("default"));
+        assert!(request.get("file").is_none());
+        assert!(request.get("size").is_none());
+    }
+
+    #[test]
+    fn video_start_maps_flags_and_resolves_relative_paths() {
+        let request = video_request(&[
+            "dev-browser",
+            "--connect",
+            "video",
+            "start",
+            "recordings/login-flow.webm",
+            "--page",
+            "feed",
+            "--size",
+            "1280x800",
+        ]);
+        assert_eq!(request["page"], json!("feed"));
+        assert_eq!(request["connect"], json!("auto"));
+        assert_eq!(request["size"], json!({ "width": 1280, "height": 800 }));
+
+        let file = request["file"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(file).is_absolute(),
+            "relative output paths must be resolved for the daemon: {file}"
+        );
+        assert!(file.ends_with("login-flow.webm"));
+    }
+
+    #[test]
+    fn video_start_keeps_absolute_paths_verbatim() {
+        let absolute = if cfg!(windows) {
+            "C:\\recordings\\demo.webm"
+        } else {
+            "/recordings/demo.webm"
+        };
+        let request = video_request(&["dev-browser", "video", "start", absolute]);
+        assert_eq!(request["file"], json!(absolute));
+    }
+
+    #[test]
+    fn video_stop_targets_the_requested_page() {
+        let request = video_request(&["dev-browser", "video", "stop", "--page", "feed"]);
+        assert_eq!(request["action"], json!("stop"));
+        assert_eq!(request["page"], json!("feed"));
+        assert!(request.get("file").is_none());
+    }
+
+    #[test]
+    fn video_size_rejects_malformed_and_out_of_range_dimensions() {
+        assert_eq!(parse_video_size("1280x800").unwrap(), (1280, 800));
+        assert!(parse_video_size("1280").is_err());
+        assert!(parse_video_size("0x800").is_err());
+        assert!(parse_video_size("99999x800").is_err());
+        assert!(Cli::try_parse_from(["dev-browser", "video", "start", "--size", "wide"]).is_err());
+    }
+
+    #[test]
+    fn video_commands_parse_into_the_expected_variants() {
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "video", "start"])
+                .unwrap()
+                .command,
+            Some(Command::Video(VideoCommand::Start { .. }))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dev-browser", "video", "stop"])
+                .unwrap()
+                .command,
+            Some(Command::Video(VideoCommand::Stop { .. }))
         ));
     }
 }

@@ -30,8 +30,10 @@ import {
   type RestartRequest,
   type SessionRequest,
   type TraceRequest,
+  type VideoRequest,
   type Response,
 } from "./protocol.js";
+import { videoRecordings } from "./video-recorder.js";
 import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
@@ -407,6 +409,51 @@ async function handleSession(socket: net.Socket, request: SessionRequest): Promi
   }
 }
 
+async function handleVideo(socket: net.Socket, request: VideoRequest): Promise<void> {
+  await withBrowserLock(request.browser, async () => {
+    try {
+      let data: Record<string, unknown>;
+      if (request.action === "start") {
+        await prepareBrowser(request);
+        const page = await manager.getPage(request.browser, request.page);
+        const started = await videoRecordings.start({
+          browser: request.browser,
+          page: request.page,
+          pageObject: page,
+          file: request.file,
+          size: request.size,
+        });
+        data = { action: "start", browser: request.browser, page: request.page, ...started };
+      } else {
+        const stopped = await videoRecordings.stop({
+          browser: request.browser,
+          page: request.page,
+        });
+        data = { action: "stop", browser: request.browser, page: request.page, ...stopped };
+      }
+
+      await writeMessage(socket, { id: request.id, type: "result", data });
+      await writeMessage(socket, { id: request.id, type: "complete", success: true });
+    } catch (error) {
+      const failure = buildInteractiveFailure({
+        requestId: request.id,
+        browser: request.browser,
+        page: request.page,
+        action: `video-${request.action}`,
+        error,
+      });
+      await writeMessage(socket, {
+        id: request.id,
+        type: "error",
+        message: failure.error.message,
+        exitCode: agentErrorExitCode(failure.error.code),
+        error: failure.error,
+        data: failure,
+      });
+    }
+  });
+}
+
 async function handleTrace(socket: net.Socket, request: TraceRequest): Promise<void> {
   try {
     const data = await traceStore.read(request.traceId);
@@ -556,9 +603,14 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
     return;
   }
 
-  const tracksOperation = ["execute", "interactive", "session", "install", "browser-stop"].includes(
-    request.type
-  );
+  const tracksOperation = [
+    "execute",
+    "interactive",
+    "session",
+    "install",
+    "browser-stop",
+    "video",
+  ].includes(request.type);
   let finishOperation: (() => void) | undefined;
   if (tracksOperation) {
     try {
@@ -597,6 +649,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
 
       case "trace":
         await handleTrace(socket, request);
+        return;
+
+      case "video":
+        await handleVideo(socket, request);
         return;
 
       case "browsers":

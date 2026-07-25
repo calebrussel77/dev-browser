@@ -524,8 +524,38 @@ const TraceRequestSchema = RequestBaseSchema.extend({
   traceId: z.union([z.literal("LAST"), z.string().regex(/^[a-z0-9-]{8,80}$/)]),
 });
 
+const BrowserTargetSchema = z.object({
+  browser: z.string().min(1).default("default"),
+  page: z.string().min(1).default("main"),
+  headless: z.boolean().optional(),
+  ignoreHTTPSErrors: z.boolean().optional(),
+  connect: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+});
+
+const VideoRequestSchema = z.union([
+  RequestBaseSchema.merge(BrowserTargetSchema).extend({
+    type: z.literal("video"),
+    action: z.literal("start"),
+    // Resolved to an absolute path by the CLI against the caller's cwd; the
+    // daemon never guesses a working directory on the agent's behalf.
+    file: z.string().min(1).max(4_096).optional(),
+    size: z
+      .object({
+        width: z.number().int().min(1).max(7_680),
+        height: z.number().int().min(1).max(4_320),
+      })
+      .optional(),
+  }),
+  RequestBaseSchema.merge(BrowserTargetSchema).extend({
+    type: z.literal("video"),
+    action: z.literal("stop"),
+  }),
+]);
+
 const RequestSchema = z.union([
   ExecuteRequestSchema,
+  VideoRequestSchema,
   InteractiveRequestSchema,
   BrowsersRequestSchema,
   BrowserStopRequestSchema,
@@ -584,6 +614,7 @@ export type SessionRequest = z.infer<typeof SessionRequestSchema>;
 export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
 export type RestartRequest = z.infer<typeof RestartRequestSchema>;
 export type TraceRequest = z.infer<typeof TraceRequestSchema>;
+export type VideoRequest = z.infer<typeof VideoRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }

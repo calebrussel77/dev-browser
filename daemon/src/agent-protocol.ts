@@ -28,6 +28,9 @@ export const AgentErrorCodeSchema = z.enum([
   "CONFIRMATION_INVALID",
   "ASSERTION_FAILED",
   "INPUT_VALUE_MISMATCH",
+  "VIDEO_ALREADY_RECORDING",
+  "VIDEO_NOT_RECORDING",
+  "VIDEO_ENCODER_MISSING",
 ]);
 
 export type AgentErrorCode = z.infer<typeof AgentErrorCodeSchema>;

@@ -11,7 +11,7 @@ pub fn agent_schema() -> Value {
             "find", "text", "assert", "click", "focus", "press", "paste", "scroll", "select",
             "check", "uncheck", "hover", "drag", "type", "confirm", "shot", "upload",
             "session", "browsers", "install", "status", "stop", "doctor", "schema",
-            "capabilities", "examples", "trace", "install-skill"
+            "capabilities", "examples", "trace", "video", "install-skill"
         ],
         "interactiveActions": [
             "pages", "navigate", "back", "forward", "reload", "read", "observe", "find",
@@ -30,6 +30,7 @@ pub fn agent_schema() -> Value {
             "lease": { "exitStatus": 5, "codes": ["LEASE_CONFLICT"] },
             "runtime": { "exitStatus": 6, "codes": ["CDP_DISCOVERY_FAILED", "CDP_ATTACH_FAILED", "RENDERER_UNRESPONSIVE", "WINDOW_OCCLUDED", "DAEMON_VERSION_MISMATCH", "PROTOCOL_VERSION_MISMATCH", "PAGE_CLOSED", "FRAME_DETACHED", "POPUP_OPENED"] },
             "download": { "exitStatus": 7, "codes": ["DOWNLOAD_FAILED"] },
+            "video": { "exitStatus": 6, "codes": ["VIDEO_ALREADY_RECORDING", "VIDEO_NOT_RECORDING", "VIDEO_ENCODER_MISSING"] },
             "confirmation": { "exitStatus": 8, "codes": ["CONFIRMATION_INVALID"] }
         },
         "limits": {
@@ -116,6 +117,7 @@ pub fn compact_capabilities() -> Value {
         "safety": ["state-guards", "target-fingerprints", "leases", "typed-waits", "safe-retry", "confirmation-tokens", "redaction"],
         "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
         "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],
+        "video": ["start", "stop"],
         "runtimeHandshake": true,
         "quickjs": true,
         "scripting": ["console.json"]
@@ -136,6 +138,11 @@ pub fn focused_example(command: &str) -> Option<&'static str> {
         "schema" => Some("dev-browser schema --json"),
         "capabilities" => Some("dev-browser capabilities --compact"),
         "trace" => Some("dev-browser click --page TARGET --ref R7 --trace && dev-browser trace show LAST"),
+        "video" => Some(concat!(
+            "dev-browser video start --page TARGET recordings/flow.webm --size 1280x800\n",
+            "dev-browser click --page TARGET --ref R7\n",
+            "dev-browser video stop --page TARGET"
+        )),
         _ => None,
     }
 }
@@ -204,5 +211,33 @@ mod tests {
     fn focused_examples_are_deterministic_and_reject_unknown_commands() {
         assert!(focused_example("click").unwrap().contains("--from-state"));
         assert_eq!(focused_example("unknown"), None);
+    }
+
+    #[test]
+    fn video_recording_is_discoverable() {
+        let schema = agent_schema();
+        assert!(schema["commands"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("video")));
+        for code in [
+            "VIDEO_ALREADY_RECORDING",
+            "VIDEO_NOT_RECORDING",
+            "VIDEO_ENCODER_MISSING",
+        ] {
+            assert!(schema["errors"]["video"]["codes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(code)));
+        }
+        assert_eq!(schema["errors"]["video"]["exitStatus"], 6);
+
+        let capabilities = compact_capabilities();
+        assert!(capabilities["video"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("start")));
+
+        assert!(focused_example("video").unwrap().contains("video stop"));
     }
 }
