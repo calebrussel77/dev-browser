@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentProtocolError, agentErrorExitCode } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
-import { parseRequest } from "./protocol.js";
+import { parseRequest, serialize } from "./protocol.js";
 import {
   DEFAULT_CHAPTER_DURATION_MS,
   DEFAULT_MAX_DURATION_SECONDS,
@@ -148,6 +148,31 @@ describe("video protocol requests", () => {
         })
       ).success
     ).toBe(false);
+  });
+});
+
+describe("video result serialization", () => {
+  const outsideTemp =
+    process.platform === "win32"
+      ? "C:\\Users\\agent\\recordings\\flow.webm"
+      : "/Users/agent/recordings/flow.webm";
+
+  it("keeps the absolute output path of a video result intact", () => {
+    const serialized = serialize({
+      id: "req-1",
+      type: "result",
+      data: { action: "start", browser: "default", page: "main", path: outsideTemp },
+    });
+    expect(JSON.parse(serialized).data.path).toBe(outsideTemp);
+  });
+
+  it("still masks home paths in results that are not video results", () => {
+    const serialized = serialize({
+      id: "req-2",
+      type: "result",
+      data: { action: "shot", screenshotPath: outsideTemp },
+    });
+    expect(JSON.parse(serialized).data.screenshotPath).toBe("[path]");
   });
 });
 
@@ -336,6 +361,7 @@ describe.sequential("video recording against a real browser", () => {
     );
     expect(agentErrorExitCode(capped.code)).toBe(6);
     expect(capped.message).toContain("max duration");
+    expect(capped.details).toMatchObject({ path: outputPath, maxDurationSeconds: 1 });
 
     // The note is reported once; the page is then a clean slate again.
     await expectAgentError(
@@ -417,6 +443,63 @@ describe.sequential("video recording against a real browser", () => {
 
     expect(recordings.activeCount()).toBe(0);
     await expectPlayableWebm(outputPath);
+  }, 120_000);
+
+  it("wakes an occluded window before recording a connected browser", async () => {
+    const wakeCalls: string[] = [];
+    const connectedRecordings = new VideoRecorderRegistry({
+      ensureVisible: async (_page, pageName) => {
+        wakeCalls.push(pageName);
+        return {
+          method: "window-restore",
+          warnings: ["The browser window was fully covered by other windows"],
+        };
+      },
+    });
+
+    const page = await manager.getPage(browserName, "connected-like");
+    await page.setContent("<h1 style='font-size:64px'>Connected</h1>");
+    const outputPath = path.join(outputDir, "connected.webm");
+
+    const started = await connectedRecordings.start({
+      browser: browserName,
+      page: "connected-like",
+      pageObject: page,
+      file: outputPath,
+      connected: true,
+    });
+
+    expect(wakeCalls).toEqual(["connected-like"]);
+    expect(started.warnings).toEqual(["The browser window was fully covered by other windows"]);
+
+    await page.waitForTimeout(1_000);
+    await connectedRecordings.stop({ browser: browserName, page: "connected-like" });
+    await expectPlayableWebm(outputPath);
+  }, 120_000);
+
+  it("never attempts a wake for a launched browser", async () => {
+    const wakeCalls: string[] = [];
+    const launchedRecordings = new VideoRecorderRegistry({
+      ensureVisible: async (_page, pageName) => {
+        wakeCalls.push(pageName);
+        return null;
+      },
+    });
+
+    const page = await manager.getPage(browserName, "launched-like");
+    const outputPath = path.join(outputDir, "launched.webm");
+
+    const started = await launchedRecordings.start({
+      browser: browserName,
+      page: "launched-like",
+      pageObject: page,
+      file: outputPath,
+    });
+
+    expect(wakeCalls).toEqual([]);
+    expect(started.warnings).toBeUndefined();
+
+    await launchedRecordings.stop({ browser: browserName, page: "launched-like" });
   }, 120_000);
 
   it("records two pages in parallel into separate files", async () => {

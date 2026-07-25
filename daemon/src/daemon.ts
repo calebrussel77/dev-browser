@@ -423,6 +423,7 @@ async function handleVideo(socket: net.Socket, request: VideoRequest): Promise<v
           file: request.file,
           size: request.size,
           maxDurationSeconds: request.maxDurationSeconds,
+          connected: manager.getBrowser(request.browser)?.type === "connected",
         });
         data = { action: "start", browser: request.browser, page: request.page, ...started };
       } else if (request.action === "chapter") {

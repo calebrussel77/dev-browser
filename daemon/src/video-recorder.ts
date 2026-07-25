@@ -4,6 +4,10 @@ import type { Page } from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
 import { DEV_BROWSER_TMP_DIR } from "./temp-files.js";
+import {
+  ensureTrustedInputDeliverable,
+  type WindowVisibilityRemediation,
+} from "./window-visibility.js";
 
 /** Default home for recordings started without an explicit output file. */
 export const VIDEO_OUTPUT_DIR = path.join(DEV_BROWSER_TMP_DIR, "videos");
@@ -32,12 +36,23 @@ export interface VideoStartOptions extends VideoTarget {
   file?: string;
   size?: VideoSize;
   maxDurationSeconds?: number;
+  /** True for a browser reached through `--connect`. Such a window is not
+   * launched with Chrome's occlusion opt-out, so it may be frozen. */
+  connected?: boolean;
 }
 
 export interface VideoStartResult {
   path: string;
   startedAt: string;
   maxDurationSeconds: number;
+  warnings?: string[];
+}
+
+export interface VideoRecorderDependencies {
+  ensureVisible?: (
+    page: Page,
+    pageName: string
+  ) => Promise<WindowVisibilityRemediation | null>;
 }
 
 export interface VideoStopResult {
@@ -123,6 +138,11 @@ function recordingArtifactOf(page: Page): RecordingArtifact | undefined {
 export class VideoRecorderRegistry {
   readonly #active = new Map<string, ActiveRecording>();
   readonly #capFinalized = new Map<string, CapFinalizedNote>();
+  readonly #ensureVisible: NonNullable<VideoRecorderDependencies["ensureVisible"]>;
+
+  constructor(dependencies: VideoRecorderDependencies = {}) {
+    this.#ensureVisible = dependencies.ensureVisible ?? ensureTrustedInputDeliverable;
+  }
 
   #key(browser: string, page: string): string {
     return `${browser}\0${page}`;
@@ -142,13 +162,17 @@ export class VideoRecorderRegistry {
 
     const existing = this.#active.get(key);
     if (existing) {
+      // The output path lives in details, not in the message: the redactor
+      // masks home directories inside free text, and details.path is preserved
+      // verbatim for exactly this case.
       throw new AgentProtocolError(
         "VIDEO_ALREADY_RECORDING",
-        `Page "${options.page}" is already recording to ${existing.outputPath}`,
+        `Page "${options.page}" is already recording; stop that recording before starting another`,
         true,
         {
           details: { page: options.page, path: existing.outputPath },
           nextCommands: [`dev-browser video stop --page ${options.page}`],
+          allowOutputPath: true,
         }
       );
     }
@@ -159,6 +183,16 @@ export class VideoRecorderRegistry {
       ? path.resolve(options.file)
       : defaultVideoPath(options.page, startedAt);
     await mkdir(path.dirname(outputPath), { recursive: true });
+
+    // A headful Chrome only composes frames while its window is visible, so a
+    // recording started against a covered window would open on frozen or black
+    // frames. Wake it with the same remediation used before trusted input.
+    // Launched browsers carry Chrome's occlusion opt-out and need nothing.
+    let warnings: string[] | undefined;
+    if (options.connected) {
+      const remediation = await this.#ensureVisible(options.pageObject, options.page);
+      if (remediation) warnings = remediation.warnings;
+    }
 
     try {
       await options.pageObject.screencast.start({
@@ -203,6 +237,7 @@ export class VideoRecorderRegistry {
       path: outputPath,
       startedAt: new Date(startedAt).toISOString(),
       maxDurationSeconds,
+      ...(warnings && warnings.length > 0 ? { warnings } : {}),
     };
   }
 
@@ -334,7 +369,7 @@ export class VideoRecorderRegistry {
     this.#capFinalized.delete(key);
     throw new AgentProtocolError(
       "VIDEO_LIMIT_REACHED",
-      `The recording for page "${page}" reached its ${note.maxDurationSeconds}s max duration and was finalized to ${note.path}`,
+      `The recording for page "${page}" reached its ${note.maxDurationSeconds}s max duration and was finalized; its path is in details.path`,
       true,
       {
         details: {
@@ -344,6 +379,7 @@ export class VideoRecorderRegistry {
           finalizedAt: new Date(note.finalizedAt).toISOString(),
         },
         nextCommands: [`dev-browser video start --page ${page}`],
+        allowOutputPath: true,
       }
     );
   }

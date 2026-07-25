@@ -765,12 +765,14 @@ export function parseRequest(line: string): ParseSuccess | ParseFailure {
 
 export function serialize(message: Response): string {
   const parsed = ResponseSchema.parse(message);
-  const allowConfirmationToken =
-    parsed.type === "result" &&
-    Boolean(
-      parsed.data &&
-      typeof parsed.data === "object" &&
-      (parsed.data as { action?: unknown }).action === "confirm"
-    );
-  return `${JSON.stringify(redactSensitive(parsed, { allowConfirmationToken }))}\n`;
+  const resultAction =
+    parsed.type === "result" && parsed.data && typeof parsed.data === "object"
+      ? (parsed.data as { action?: unknown }).action
+      : undefined;
+  const allowConfirmationToken = resultAction === "confirm";
+  // The whole point of a video result is the file the caller opens next, so
+  // its absolute path must survive home-directory masking.
+  const allowOutputPath =
+    resultAction === "start" || resultAction === "stop" || resultAction === "chapter";
+  return `${JSON.stringify(redactSensitive(parsed, { allowConfirmationToken, allowOutputPath }))}\n`;
 }
