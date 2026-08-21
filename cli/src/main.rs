@@ -538,9 +538,12 @@ enum Command {
         about = "Navigate one persistent page and return its resulting state",
         long_about = "Navigate a persistent named page or existing target to a URL with waitUntil=domcontentloaded. Add --shot to save and return a PNG after navigation."
     )]
+    #[command(group(clap::ArgGroup::new("navigate_url").required(true).args(["url", "url_flag"])))]
     Navigate {
         #[arg(value_name = "URL")]
-        url: String,
+        url: Option<String>,
+        #[arg(long = "url", value_name = "URL", id = "url_flag")]
+        url_flag: Option<String>,
         #[command(flatten)]
         output: PageActionArgs,
     },
@@ -610,23 +613,13 @@ enum Command {
         about = "Read bounded normalized text from a ref or landmark scope",
         long_about = "Return bounded, normalized innerText for a single ref or a within scope (a landmark substring using find's within grammar, role:<role>, or name:<exact name>), preserving line breaks and truncation metadata."
     )]
+    #[command(group(clap::ArgGroup::new("text_scope").required(true).args(["ref_id", "within"])))]
     Text {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(
-            long = "ref",
-            value_name = "REF",
-            value_parser = parse_ref_id,
-            conflicts_with = "within",
-            required_unless_present = "within"
-        )]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
-        #[arg(
-            long,
-            value_name = "SCOPE",
-            conflicts_with = "ref_id",
-            required_unless_present = "ref_id"
-        )]
+        #[arg(long, value_name = "SCOPE")]
         within: Option<String>,
         #[arg(long, default_value_t = 20_000, value_parser = clap::value_parser!(u32).range(1..=200_000))]
         max_chars: u32,
@@ -635,23 +628,13 @@ enum Command {
         about = "Assert that scoped text is present without mutating the page",
         long_about = "Read bounded text from a ref or within scope and fail with a typed, recoverable ASSERTION_FAILED error (no trusted input attempt) if the expected text is absent."
     )]
+    #[command(group(clap::ArgGroup::new("assert_scope").required(true).args(["ref_id", "within"])))]
     Assert {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(
-            long = "ref",
-            value_name = "REF",
-            value_parser = parse_ref_id,
-            conflicts_with = "within",
-            required_unless_present = "within"
-        )]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
-        #[arg(
-            long,
-            value_name = "SCOPE",
-            conflicts_with = "ref_id",
-            required_unless_present = "ref_id"
-        )]
+        #[arg(long, value_name = "SCOPE")]
         within: Option<String>,
         #[arg(long, value_name = "TEXT")]
         text: String,
@@ -700,6 +683,14 @@ enum Command {
         index: Option<u16>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
+        #[arg(
+            long = "root",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "scroll_container",
+            help = "Scope collection to a subtree from observe so hard caps are spent inside it"
+        )]
+        root: Option<String>,
         #[arg(long, value_parser = parse_ref_id, requires = "max_steps")]
         scroll_container: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "scroll_container")]
@@ -709,23 +700,13 @@ enum Command {
         about = "Click through trusted Playwright mouse or locator input",
         long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). Retries default to never; --retry safe permits one retry only with strong evidence that no side effect or page change began, while --retry once is explicit but remains blocked for guarded or irreversible actions. Screenshot pixels and --xy coordinates both use CSS pixels."
     )]
+    #[command(group(clap::ArgGroup::new("click_target").required(true).args(["ref_id", "xy"])))]
     Click {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(
-            long = "ref",
-            value_name = "REF",
-            value_parser = parse_ref_id,
-            conflicts_with = "xy",
-            required_unless_present = "xy"
-        )]
+        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
-        #[arg(
-            long,
-            value_name = "X,Y",
-            conflicts_with = "ref_id",
-            required_unless_present = "ref_id"
-        )]
+        #[arg(long, value_name = "X,Y")]
         xy: Option<Coordinates>,
         #[arg(long, value_enum, default_value = "mouse")]
         method: ClickMethod,
@@ -733,6 +714,13 @@ enum Command {
         retry: RetryPolicy,
         #[arg(long, value_name = "TEXT")]
         expect_text: Option<String>,
+        #[arg(
+            long = "require-ancestor-text",
+            value_name = "TEXT",
+            conflicts_with = "xy",
+            help = "Refuse to click unless the target's nearest self-contained card ancestor contains this text (fails closed with a typed error)"
+        )]
+        require_ancestor_text: Option<String>,
         #[arg(long, value_name = "TEXT")]
         wait_for: Option<String>,
         #[command(flatten)]
@@ -1028,7 +1016,15 @@ fn run() -> Result<i32, Box<dyn Error>> {
             json!({ "kind": "pages" }),
             None,
         ),
-        Some(Command::Navigate { url, output }) => {
+        Some(Command::Navigate {
+            url,
+            url_flag,
+            output,
+        }) => {
+            let url = url
+                .as_deref()
+                .or(url_flag.as_deref())
+                .expect("clap enforces one URL form");
             run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
         }
         Some(Command::Back { output, wait }) => {
@@ -1122,10 +1118,11 @@ fn run() -> Result<i32, Box<dyn Error>> {
             states,
             index,
             limit,
+            root,
             scroll_container,
             max_steps,
         }) => {
-            let action = build_find_action(
+            let mut action = build_find_action(
                 query.as_deref(),
                 role.as_deref(),
                 name.as_deref(),
@@ -1143,6 +1140,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 scroll_container.as_deref(),
                 *max_steps,
             );
+            if let Some(root) = root {
+                action["root"] = json!(root);
+            }
             run_page_action(&cli, output, action)
         }
         Some(Command::Click {
@@ -1152,6 +1152,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             method,
             retry,
             expect_text,
+            require_ancestor_text,
             wait_for,
             wait,
         }) => {
@@ -1176,6 +1177,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
             }
             if let Some(expect_text) = expect_text {
                 action["expectText"] = Value::String(expect_text.clone());
+            }
+            if let Some(require_ancestor_text) = require_ancestor_text {
+                action["requireAncestorText"] = Value::String(require_ancestor_text.clone());
             }
             if let Some(wait_for) = wait_for {
                 action["waitForText"] = Value::String(wait_for.clone());
@@ -2152,6 +2156,98 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["dev-browser", "upload", "--ref", "R1"]).is_err());
         assert!(Cli::try_parse_from(["dev-browser", "upload", "--file", "fixture.txt"]).is_err());
+    }
+
+    #[test]
+    fn parses_find_root_and_click_ancestor_guard() {
+        let find = Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "Se connecter",
+            "--root",
+            "R12",
+        ])
+        .unwrap();
+        assert!(
+            matches!(find.command, Some(Command::Find { ref root, .. }) if root.as_deref() == Some("R12"))
+        );
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "find",
+            "--name",
+            "X",
+            "--root",
+            "R1",
+            "--scroll-container",
+            "R2",
+            "--max-steps",
+            "5",
+        ])
+        .is_err());
+
+        let click = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R7",
+            "--require-ancestor-text",
+            "Ibrahima Leye",
+        ])
+        .unwrap();
+        assert!(
+            matches!(click.command, Some(Command::Click { ref require_ancestor_text, .. }) if require_ancestor_text.as_deref() == Some("Ibrahima Leye"))
+        );
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--xy",
+            "10,20",
+            "--require-ancestor-text",
+            "X",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn navigate_accepts_the_url_positionally_or_as_a_flag() {
+        for args in [
+            vec![
+                "dev-browser",
+                "navigate",
+                "https://example.test",
+                "--page",
+                "TARGET",
+            ],
+            vec![
+                "dev-browser",
+                "navigate",
+                "--url",
+                "https://example.test",
+                "--page",
+                "TARGET",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Command::Navigate { url, url_flag, .. }) => assert_eq!(
+                    url.as_deref().or(url_flag.as_deref()),
+                    Some("https://example.test")
+                ),
+                _ => panic!("expected navigate command"),
+            }
+        }
+        assert!(Cli::try_parse_from(["dev-browser", "navigate", "--page", "TARGET"]).is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "navigate",
+            "https://one.test",
+            "--url",
+            "https://two.test",
+            "--page",
+            "TARGET",
+        ])
+        .is_err());
     }
 
     #[test]

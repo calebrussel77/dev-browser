@@ -78,6 +78,13 @@ export interface InteractiveResult {
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
   ambiguity?: TargetAmbiguity;
+  /** find only: how many actionable candidates were searched, and whether the
+   * collection hit a hard cap (in which case an empty match list is reported
+   * as "budget-exhausted" rather than "no-match"). */
+  search?: { candidates: number; truncated: boolean };
+  /** click --require-ancestor-text only: the addressing guard's verdict and
+   * the card ancestor whose text satisfied it. */
+  ancestorGuard?: { matched: boolean; card: string };
   scrollMetrics?: {
     steps: number;
     uniqueItems: number;
@@ -416,6 +423,71 @@ async function requireExpectedText(page: Page, expected: string): Promise<string
   return text;
 }
 
+// The dialog-less addressing guard (click --require-ancestor-text): the
+// "card" is the nearest ancestor that plausibly forms a self-contained block.
+// Nearest-first keeps the checked region small (a sidebar row's <li> wins over
+// the section that contains every row), which is what makes the guard
+// meaningful; when nothing card-like exists below a landmark, the outermost
+// ancestor still inside that landmark is the block. Failures are typed and
+// happen before any input is attempted — the guard fails closed.
+const CARD_ANCESTOR_SELECTOR =
+  "article,li,dialog,td,tr,fieldset,form,section,aside," +
+  "[role='listitem'],[role='article'],[role='group'],[role='row'],[role='dialog'],[role='region']";
+const LANDMARK_BOUNDARY_SELECTOR = "main,nav,header,footer";
+const MAX_ANCESTOR_GUARD_TEXT_LENGTH = 8_000;
+
+async function enforceAncestorGuard(
+  resolved: ResolvedActionTarget,
+  required: string,
+  pageName: string
+): Promise<{ matched: boolean; card: string }> {
+  const found = await resolved.locator.evaluate(
+    (element, selectors) => {
+      const describe = (node: Element) => {
+        const tag = node.tagName.toLowerCase();
+        const id = node.id ? `#${node.id.slice(0, 50)}` : "";
+        const role = node.getAttribute("role");
+        return `${tag}${id}${role ? `[role=${role}]` : ""}`;
+      };
+      let card: Element | null = null;
+      let below: Element = element;
+      let current: Element | null = element.parentElement;
+      while (current && current !== document.body) {
+        if (current.matches(selectors.card)) {
+          card = current;
+          break;
+        }
+        if (current.matches(selectors.landmark)) {
+          card = below;
+          break;
+        }
+        below = current;
+        current = current.parentElement;
+      }
+      card ??= below;
+      const text = ((card as HTMLElement).innerText ?? card.textContent ?? "").slice(
+        0,
+        selectors.maxChars
+      );
+      return { card: describe(card), text };
+    },
+    {
+      card: CARD_ANCESTOR_SELECTOR,
+      landmark: LANDMARK_BOUNDARY_SELECTOR,
+      maxChars: MAX_ANCESTOR_GUARD_TEXT_LENGTH,
+    }
+  );
+  if (!normalizeText(found.text).includes(normalizeText(required))) {
+    throw new AgentProtocolError(
+      "ASSERTION_FAILED",
+      `Ancestor guard failed: the target's nearest self-contained card (${found.card}) does not contain the required text, so the click was not attempted. The target likely belongs to a different block than intended.`,
+      true,
+      { details: { card: found.card }, nextCommands: [observeRecoveryCommand(pageName)] }
+    );
+  }
+  return { matched: true, card: found.card };
+}
+
 function confirmationScope(
   request: InteractiveRequest,
   page: Page,
@@ -511,6 +583,28 @@ function applyPerception(
     );
     result.elements = visibleElements;
   }
+}
+
+/**
+ * A bare "no-match" after an incomplete traversal is actively misleading: it
+ * reads as "the element does not exist" when the truth is "collection stopped
+ * looking". Rewrites the reason to "budget-exhausted" and warns whenever the
+ * collection hit a hard cap and find came back empty, and always reports how
+ * many candidates the search actually covered.
+ */
+function reportSearchCompleteness(
+  result: InteractiveResult,
+  ambiguity: TargetAmbiguity,
+  candidates: number,
+  perception: PagePerception
+): TargetAmbiguity {
+  result.search = { candidates, truncated: perception.collection.truncated };
+  if (ambiguity.reason !== "no-match" || !perception.collection.truncated) return ambiguity;
+  result.warnings = [
+    ...(result.warnings ?? []),
+    "Collection hit a hard cap before covering the whole page; this empty result may be incomplete. Narrow the search with --root REF (a subtree from observe), --within, or --frame.",
+  ];
+  return { ...ambiguity, reason: "budget-exhausted" };
 }
 
 /**
@@ -1051,11 +1145,19 @@ export async function executeInteractiveAction(
           action.within && !action.frame && isValidWithinScope(action.within)
             ? action.within
             : undefined;
+        // An explicit --root scopes collection to that subtree so the hard
+        // collection caps are spent inside it; a missing/stale root is the
+        // caller's error and propagates typed instead of falling back.
+        const collectScope = action.root
+          ? { ref: action.root }
+          : collectWithin
+            ? { within: collectWithin }
+            : undefined;
         let perception: PagePerception;
         try {
           perception = await perceive(
             page,
-            collectWithin ? { scope: { within: collectWithin } } : {},
+            collectScope ? { scope: collectScope } : {},
             protocolVersion === 1
           );
         } catch (error) {
@@ -1063,6 +1165,7 @@ export async function executeInteractiveAction(
           // unique root can scope collection, so fall back to the unscoped
           // walk with post-collection filtering.
           if (
+            !action.root &&
             collectWithin &&
             error instanceof AgentProtocolError &&
             (error.code === "TARGET_MISSING" || error.code === "AMBIGUOUS_TARGET")
@@ -1071,13 +1174,15 @@ export async function executeInteractiveAction(
           } else throw error;
         }
         applyPerception(result, perception, protocolVersion, protocolVersion === 1);
-        const targeted = findTargets(
-          perception.elements.filter((element) => element.actionable),
-          findFilters,
-          findLimit
-        );
+        // Match against the full collected record set, not the display-budgeted
+        // tree selection: the tree budget bounds payload size, and letting it
+        // bound matching makes find silently blind to mid-page elements on
+        // large documents. Every targetable record is ref-registered, so
+        // matches beyond the tree budget still resolve for click/type/etc.
+        const candidates = perception.allElements.filter((element) => element.actionable);
+        const targeted = findTargets(candidates, findFilters, findLimit);
         result.matches = targeted.matches;
-        result.ambiguity = targeted.ambiguity;
+        result.ambiguity = reportSearchCompleteness(result, targeted.ambiguity, candidates.length, perception);
         break;
       }
 
@@ -1110,7 +1215,7 @@ export async function executeInteractiveAction(
             protocolVersion === 1
           );
           lastPerception = perception;
-          const actionable = perception.elements.filter((element) => element.actionable);
+          const actionable = perception.allElements.filter((element) => element.actionable);
           const newIdentities = actionable
             .map((element) => elementIdentity(element))
             .filter((identity) => !seen.has(identity));
@@ -1152,7 +1257,7 @@ export async function executeInteractiveAction(
       // before any break (errors propagate before reaching here), so both
       // `targeted` and `lastPerception` are guaranteed to be assigned.
       result.matches = targeted!.matches;
-      result.ambiguity = targeted!.ambiguity;
+      result.ambiguity = reportSearchCompleteness(result, targeted!.ambiguity, seen.size, lastPerception!);
       result.scrollMetrics = {
         steps,
         uniqueItems: seen.size,
@@ -1212,6 +1317,13 @@ export async function executeInteractiveAction(
             y: box.y + box.height / 2,
           };
           try {
+            if (action.requireAncestorText) {
+              result.ancestorGuard = await enforceAncestorGuard(
+                resolved,
+                action.requireAncestorText,
+                request.page
+              );
+            }
             if (action.method === "locator") {
               await prepareClickInput(resolved);
               await locator.click({ timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS });
@@ -1895,7 +2007,7 @@ export async function executeInteractiveAction(
       fullPage: request.fullPage,
       timeoutMs: request.shotTimeoutMs ?? Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 8_000),
       annotationElements: matchRefs
-        ? visualPerception.elements.filter((element) => matchRefs.has(element.ref))
+        ? visualPerception.allElements.filter((element) => matchRefs.has(element.ref))
         : undefined,
       focus: focusElement
         ? { box: focusElement.box, padding: action.kind === "shot" ? (action.padding ?? 32) : 32 }
@@ -1907,6 +2019,7 @@ export async function executeInteractiveAction(
 
   const requestSecrets = [
     action.kind === "confirm" || action.kind === "click" ? action.expectText : undefined,
+    action.kind === "click" && "requireAncestorText" in action ? action.requireAncestorText : undefined,
     action.kind === "paste" ? action.text : undefined,
     "confirmToken" in action ? action.confirmToken : undefined,
   ].filter((value): value is string => Boolean(value));

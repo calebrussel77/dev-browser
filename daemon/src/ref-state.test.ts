@@ -20,6 +20,8 @@ const latest = {
   focusedRef: null,
   tree: "",
   elements: [],
+  allElements: [],
+  collection: { truncated: false },
   delta: null,
   warnings: [],
   truncation: { truncated: false, omittedNodes: 0, continuation: null },

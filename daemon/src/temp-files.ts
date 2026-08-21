@@ -73,12 +73,16 @@ function sanitizeRelativePath(fileName: unknown): string[] {
     throw new Error("File names must not contain null bytes");
   }
   if (path.posix.isAbsolute(rawPath) || path.win32.isAbsolute(rawPath)) {
-    throw new Error("Absolute paths are not allowed");
+    throw new Error(
+      `Absolute paths are not allowed; pass a relative path and the file is written under ${DEV_BROWSER_TMP_DIR} (the result reports the absolute path)`
+    );
   }
 
   const normalized = rawPath.replace(/\\/g, "/");
   if (normalized.startsWith("/")) {
-    throw new Error("Absolute paths are not allowed");
+    throw new Error(
+      `Absolute paths are not allowed; pass a relative path and the file is written under ${DEV_BROWSER_TMP_DIR} (the result reports the absolute path)`
+    );
   }
 
   return normalized.split("/").map(sanitizePathSegment);

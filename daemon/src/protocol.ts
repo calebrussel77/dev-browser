@@ -233,6 +233,11 @@ const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema)
   ref: ScopedRefSchema,
   method: z.enum(["mouse", "locator"]).default("mouse"),
   expectText: z.string().min(1).optional(),
+  // In-page addressing guard: resolve the target, walk up to its nearest
+  // self-contained card ancestor, and refuse to click (typed, fail-closed)
+  // unless that card's text contains this value. The dialog-less counterpart
+  // of confirm --expect.
+  requireAncestorText: z.string().min(1).max(2_000).optional(),
   waitForText: WaitValueSchema.optional(),
   retry: RetryPolicySchema.optional(),
 });
@@ -296,6 +301,10 @@ const StructuredFindSchema = z
       .default([]),
     index: z.number().int().nonnegative().max(999).optional(),
     limit: z.number().int().positive().max(50).default(10),
+    // Scope collection to a subtree obtained from observe, so hard collection
+    // caps are spent inside it instead of on the whole document. Filters
+    // (within included) still apply as post-collection filters.
+    root: ScopedRefSchema.optional(),
     // Bounded auto-scroll: scans inside a virtualized/overflow container by
     // taking one trusted wheel step per round until a confident match,
     // maxSteps, or exhaustion (see executeInteractiveAction's "find" case).
@@ -326,6 +335,12 @@ const StructuredFindSchema = z
       context.addIssue({
         code: z.ZodIssueCode.custom,
         message: "scrollContainer and maxSteps are required together",
+      });
+    if (value.root && value.scrollContainer)
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["root"],
+        message: "provide either root or scrollContainer, not both",
       });
   });
 

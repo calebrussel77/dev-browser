@@ -183,11 +183,13 @@ impl WaitArgs {
         }
         for (kind, values) in [("dialog", &self.wait_dialog), ("toast", &self.wait_toast)] {
             for state in values {
-                if !matches!(state.as_str(), "opened" | "closed") {
-                    return Err(format!("{kind} state must be opened or closed"));
-                } else {
-                    conditions.push(json!({ "kind": kind, "state": state }));
+                let normalized = state.to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "opened" | "closed") {
+                    return Err(format!(
+                        "{kind} state must be one of: opened, closed — got \"{state}\""
+                    ));
                 }
+                conditions.push(json!({ "kind": kind, "state": normalized }));
             }
         }
         if self.wait_popup {
@@ -200,10 +202,13 @@ impl WaitArgs {
             conditions.push(json!({ "kind": "fileChooser" }));
         }
         for state in &self.wait_navigation {
-            if !matches!(state.as_str(), "navigation" | "document") {
-                return Err("navigation must be navigation or document".into());
+            let normalized = state.to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "navigation" | "document") {
+                return Err(format!(
+                    "navigation must be one of: navigation, document — got \"{state}\""
+                ));
             }
-            conditions.push(json!({ "kind": "navigation", "state": state }));
+            conditions.push(json!({ "kind": "navigation", "state": normalized }));
         }
         for item in &self.wait_response {
             let parts: Vec<_> = item.splitn(4, ',').collect();
@@ -288,6 +293,26 @@ mod tests {
         assert_eq!(wait["conditions"].as_array().unwrap().len(), 13);
         assert_eq!(wait["conditions"][0]["kind"], "text");
         assert_eq!(wait["conditions"][0]["match"], "contains");
+    }
+
+    #[test]
+    fn accepts_dialog_toast_and_navigation_states_case_insensitively() {
+        let mut args = WaitArgs::default();
+        args.wait_dialog.push("OPENED".into());
+        args.wait_toast.push("Closed".into());
+        args.wait_navigation.push("DOCUMENT".into());
+        let wait = args.build_spec(None).unwrap().unwrap();
+        assert_eq!(wait["conditions"][0]["state"], "opened");
+        assert_eq!(wait["conditions"][1]["state"], "closed");
+        assert_eq!(wait["conditions"][2]["state"], "document");
+
+        let mut invalid = WaitArgs::default();
+        invalid.wait_dialog.push("OPEN".into());
+        let error = invalid.build_spec(None).unwrap_err();
+        assert!(
+            error.contains("got \"OPEN\""),
+            "error should echo the received value: {error}"
+        );
     }
 
     #[test]

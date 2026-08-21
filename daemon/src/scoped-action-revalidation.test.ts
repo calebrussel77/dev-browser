@@ -119,7 +119,9 @@ describe.sequential("scoped observe → act on pages heavier than the default bu
     ).toBe("reached deep");
   });
 
-  it("find --within scopes its collection so mid-page elements beyond the budget match", async () => {
+  it("find matches mid-page elements beyond the display budget, scoped or not", async () => {
+    // Unscoped find matches over the full collected record set, so the display
+    // budget that starves the observe tree above never hides the element.
     const unscoped = await executeInteractiveAction(
       manager,
       request({
@@ -131,7 +133,10 @@ describe.sequential("scoped observe → act on pages heavier than the default bu
         limit: 10,
       })
     );
-    expect(unscoped.matches).toHaveLength(0);
+    expect(unscoped.matches?.[0]).toEqual(
+      expect.objectContaining({ name: "Deep action", landmark: expect.stringContaining("main") })
+    );
+    expect(unscoped.search).toEqual({ candidates: expect.any(Number), truncated: false });
 
     const scoped = await executeInteractiveAction(
       manager,
