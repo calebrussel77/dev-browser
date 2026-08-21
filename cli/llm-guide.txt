@@ -37,7 +37,14 @@ LLM USAGE GUIDE:
     and also accepts combinable role/name/within/near/frame/scope/state filters;
     use index only as an explicit last resort. Matches report exact reasons,
     confidence, score gap, ambiguity, duplicate-disambiguating context, and
-    actionability state. `click` and `type` automatically return the refreshed
+    actionability state. `find` matches over the full collected snapshot, not
+    the display-budgeted tree `observe` prints, so it reaches mid-page elements
+    on large documents; its `search` field reports coverage. An empty result
+    with `ambiguity.reason: "no-match"` means the traversal completed and the
+    element genuinely is absent; `"budget-exhausted"` (with `search.truncated:
+    true`) means collection hit a hard cap and absence was NOT proven — narrow
+    with `find --root REF` (a subtree ref from observe), --within, or --frame
+    instead of falling back to raw selectors. `click` and `type` automatically return the refreshed
     snapshot, refs, and coordinates. Ref actions share bounded visibility,
     stability, enabled-state, scrolling, and obstruction checks. `click` reports URL/snapshot/dialog/aria-expanded
     changes. Typed `--wait-*` conditions are event-driven and cover text, URL,
@@ -57,6 +64,14 @@ LLM USAGE GUIDE:
     `--from-state STATE --confirm-token TOKEN`. `--expect-text` remains v1 compatibility.
     Invalid, expired, reused, or out-of-scope tokens return
     `CONFIRMATION_INVALID` with process exit status 8.
+    When the irreversible control opens NO dialog (nothing for confirm to read),
+    use `click --ref REF --require-ancestor-text "Recipient Name"`: the daemon
+    walks up to the target's nearest self-contained card ancestor (article, li,
+    listitem, dialog, section, ... or the outermost block inside the enclosing
+    landmark) and refuses to click — typed ASSERTION_FAILED, exit 3, no input
+    dispatched — unless that card's text contains the value. This addresses the
+    duplicate-label problem (a sidebar full of buttons with the same label as
+    the one you mean): the click fails closed instead of hitting a lookalike.
 
     Machine discovery and diagnostics:
       dev-browser schema --json
@@ -88,10 +103,15 @@ LLM USAGE GUIDE:
       dev-browser text --page TARGET_ID --ref R42
       dev-browser assert --page TARGET_ID --within main --text "Jane Doe" --match contains
     `observe --root REF` scopes to a specific ref's subtree instead
-    (mutually exclusive with --within). `observe --text-only` returns bounded
-    normalized innerText with truncation metadata. `assert` never attempts
+    (mutually exclusive with --within); `find --root REF` does the same for
+    find. `observe --text-only` returns bounded normalized innerText with
+    truncation metadata (under the `textOnly` object). `assert` never attempts
     trusted input; on failure it returns the typed ASSERTION_FAILED error
     (exit 3) instead of silently proceeding.
+    Very large SPAs can exceed even the maximum observe budgets; when
+    `truncation.truncated` stays true at max budget, paging with
+    `--continuation` (or scoping with --root/--within) is required, not
+    optional.
 
   Virtualized/infinite-scroll containers need container-relative scrolling:
     A recycled virtual list keeps only a handful of DOM nodes for dozens or

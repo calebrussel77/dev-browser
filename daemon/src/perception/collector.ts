@@ -73,6 +73,14 @@ export interface PagePerception {
   focusedRef: string | null;
   tree: string;
   elements: PerceptionElement[];
+  /** Every collected record, bounded only by the hard collection caps (frames,
+   * records, per-frame work) — not by the tree display budget. All targetable
+   * records are ref-registered in-page, so server-side matching (find) may use
+   * this set and still hand out resolvable refs. */
+  allElements: PerceptionElement[];
+  /** Whether the collection itself hit a hard cap. Distinct from `truncation`,
+   * which describes the display-budgeted tree/elements payload. */
+  collection: { truncated: boolean };
   delta: PerceptionDelta | null;
   warnings: string[];
   truncation: { truncated: boolean; omittedNodes: number; continuation: string | null };
@@ -83,7 +91,11 @@ export interface PagePerception {
 const DEFAULTS = { maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 };
 const MAX_FRAMES_PER_OBSERVATION = 64;
 const MAX_RECORDS_PER_OBSERVATION = 2_000;
-const MAX_WORK_PER_FRAME = 5_000;
+// Bounds one in-page collectRealm walk. 20k element visits stay in the low
+// tens of milliseconds; the previous 5k cap was reachable on ordinary
+// LinkedIn-sized documents and silently hid late-DOM content (overflow menus)
+// from find, which then honestly — but uselessly — reported budget-exhausted.
+const MAX_WORK_PER_FRAME = 20_000;
 
 function bounded(value: number | undefined, fallback: number, maximum: number): number {
   return Math.max(1, Math.min(maximum, Math.trunc(value ?? fallback)));
@@ -406,6 +418,8 @@ async function collectLegacyPageState(
     focusedRef: raw.focusedRef,
     tree: built.tree,
     elements: built.elements,
+    allElements: raw.records as unknown as PerceptionElement[],
+    collection: { truncated: false },
     delta: history.delta,
     warnings: [],
     truncation: {
@@ -598,13 +612,21 @@ export async function collectPageState(
   });
   if (scope) {
     const scopeLabel = scope.within ?? scope.ref ?? "";
-    if (initialTop.scope?.ambiguous)
+    if (initialTop.scope?.ambiguous) {
+      // Tailor the refinement advice to what the caller already tried: telling
+      // someone who passed role:menu to "refine with role:" is a dead end.
+      const advice = scopeLabel.startsWith("role:")
+        ? "use name:<exact name>, or pick one element from find/observe and scope by --root REF"
+        : scopeLabel.startsWith("name:")
+          ? "pick one element from find/observe and scope by --root REF"
+          : "refine with role: or name:, or scope by --root REF";
       throw new AgentProtocolError(
         "AMBIGUOUS_TARGET",
-        `Scope "${scopeLabel}" matched ${initialTop.scope.count} elements; refine with role: or name:`,
+        `Scope "${scopeLabel}" matched ${initialTop.scope.count} elements; ${advice}`,
         true,
         { details: { scope } }
       );
+    }
     if (initialTop.scope && !initialTop.scope.matched)
       throw new AgentProtocolError(
         "TARGET_MISSING",
@@ -687,7 +709,7 @@ export async function collectPageState(
     documentId: history.documentId, stateId: history.stateId, url: top.url, title: top.title,
     coordinateSpace: { unit: "css-px", viewport, devicePixelRatio: coordinate.devicePixelRatio, scroll: coordinate.scroll, screenshotScale: "css" },
     focusedRef: records.find((record) => record.focused)?.ref || null,
-    tree: built.tree, elements: built.elements, delta: history.delta, warnings: warnings.slice(0, 20),
+    tree: built.tree, elements: built.elements, allElements: records, collection: { truncated: collectionTruncated }, delta: history.delta, warnings: warnings.slice(0, 20),
     truncation: { truncated: built.omittedNodes > 0 || collectionTruncated, omittedNodes: built.omittedNodes + (collectionTruncated ? 1 : 0), continuation: built.omittedNodes > 0 ? encodeCursor(offset + built.consumedNodes) : null },
     scope: scope
       ? { kind: scope.ref ? "ref" : "within", value: scope.ref ?? scope.within ?? "", frameId: "F0" }

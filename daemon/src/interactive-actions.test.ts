@@ -243,6 +243,183 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.tree).toEqual(expect.any(String));
   });
 
+  it("find reaches and can act on elements beyond the display budget", async () => {
+    const nesting = 20;
+    const page = await manager.getPage(browserName, "deep-page");
+    await page.setContent(`
+      <header><button id="skip">Skip to content</button></header>
+      ${"<div>".repeat(nesting)}<button id="deep">Se connecter</button>${"</div>".repeat(nesting)}
+      <script>
+        window.__deepClicked = false;
+        document.querySelector('#deep').addEventListener('click', event => {
+          window.__deepClicked = event.isTrusted;
+        });
+      </script>
+    `);
+
+    const found = await executeInteractiveAction(manager, {
+      id: "test-find-deep",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "deep-page",
+      action: { kind: "find", name: "Se connecter", nameMode: "exact", scope: "visible", states: [], limit: 10 },
+    });
+
+    // The budgeted tree stops before the deep subtree, yet find matches it.
+    expect(found.tree).not.toContain("Se connecter");
+    expect(found.matches?.[0]).toEqual(
+      expect.objectContaining({ name: "Se connecter", confidence: "high" })
+    );
+    expect(found.search).toEqual({ candidates: expect.any(Number), truncated: false });
+    expect(found.ambiguity?.reason).toBe("score-separated");
+
+    // A completed traversal with no match still reads "no-match".
+    const absent = await executeInteractiveAction(manager, {
+      id: "test-find-absent",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "deep-page",
+      action: { kind: "find", name: "Introuvable", nameMode: "exact", scope: "visible", states: [], limit: 10 },
+    });
+    expect(absent.matches).toEqual([]);
+    expect(absent.ambiguity?.reason).toBe("no-match");
+    expect(absent.search?.truncated).toBe(false);
+
+    // Refs matched beyond the display budget resolve for trusted actions.
+    const clicked = await executeInteractiveAction(manager, {
+      id: "test-click-deep",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "deep-page",
+      action: { kind: "click", ref: found.matches![0]!.ref, method: "mouse" },
+    });
+    expect(clicked.clicked?.ref).toBeTruthy();
+    expect(await page.evaluate(() => (window as { __deepClicked?: boolean }).__deepClicked)).toBe(true);
+  });
+
+  it("find --root scopes collection to the subtree and fails typed on a stale root", async () => {
+    const page = await manager.getPage(browserName, "root-page");
+    await page.setContent(`
+      <div role="region" aria-label="Inside cards">
+        <button id="inside">Duplicate label</button>
+      </div>
+      <div>
+        <button id="outside">Duplicate label</button>
+      </div>
+    `);
+
+    const read = await executeInteractiveAction(manager, {
+      id: "test-root-read",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "root-page",
+      action: { kind: "read", limit: 100, depth: 12 },
+    });
+    const region = read.elements!.find((element) => element.name === "Inside cards");
+    expect(region?.ref).toMatch(/^R\d+$/);
+
+    const scoped = await executeInteractiveAction(manager, {
+      id: "test-root-find",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "root-page",
+      action: { kind: "find", name: "Duplicate label", nameMode: "exact", scope: "visible", states: [], limit: 10, root: region!.ref },
+    });
+    expect(scoped.matches).toHaveLength(1);
+    expect(scoped.matches?.[0]?.stableAttributes.id).toBe("inside");
+    expect(scoped.ambiguity?.ambiguous).toBe(false);
+    expect(scoped.scope).toMatchObject({ kind: "ref", value: region!.ref });
+
+    await expect(
+      executeInteractiveAction(manager, {
+        id: "test-root-stale",
+        type: "interactive",
+        protocolVersion: 2,
+        browser: browserName,
+        page: "root-page",
+        action: { kind: "find", name: "Duplicate label", nameMode: "exact", scope: "visible", states: [], limit: 10, root: "R99999" },
+      })
+    ).rejects.toMatchObject({ code: "TARGET_MISSING", recoverable: true });
+  });
+
+  it("click --require-ancestor-text fails closed on a wrong-card target and passes on the right one", async () => {
+    const page = await manager.getPage(browserName, "guard-page");
+    await page.setContent(`
+      <main>
+        <article class="profile-card">
+          <h1>Ibrahima Leye</h1>
+          <button id="profile-connect">Se connecter</button>
+        </article>
+        <section role="list" aria-label="People you may know">
+          <div role="listitem"><span>Sobour Gbagbola</span><button id="sidebar-connect">Se connecter</button></div>
+        </section>
+      </main>
+      <script>
+        window.__guardClicks = [];
+        for (const button of document.querySelectorAll('button')) {
+          button.addEventListener('click', () => window.__guardClicks.push(button.id));
+        }
+      </script>
+    `);
+    const run = (action: Parameters<typeof executeInteractiveAction>[1]["action"]) =>
+      executeInteractiveAction(manager, {
+        id: "test-ancestor-guard",
+        type: "interactive",
+        protocolVersion: 2,
+        browser: browserName,
+        page: "guard-page",
+        action,
+      });
+
+    const found = await run({ kind: "find", name: "Se connecter", nameMode: "exact", scope: "visible", states: [], limit: 10 });
+    const wrong = found.matches!.find((match) => match.stableAttributes.id === "sidebar-connect")!;
+    const right = found.matches!.find((match) => match.stableAttributes.id === "profile-connect")!;
+
+    // Wrong card: typed failure, no input dispatched.
+    await expect(
+      run({ kind: "click", ref: wrong.ref, method: "mouse", requireAncestorText: "Ibrahima Leye" })
+    ).rejects.toMatchObject({ code: "ASSERTION_FAILED", recoverable: true });
+    expect(await page.evaluate(() => (window as { __guardClicks?: string[] }).__guardClicks)).toEqual([]);
+
+    // Right card: guard reports the card and the trusted click goes through.
+    const clicked = await run({
+      kind: "click",
+      ref: right.ref,
+      method: "mouse",
+      requireAncestorText: "Ibrahima Leye",
+    });
+    expect(clicked.ancestorGuard).toMatchObject({ matched: true, card: expect.stringContaining("article") });
+    expect(await page.evaluate(() => (window as { __guardClicks?: string[] }).__guardClicks)).toEqual([
+      "profile-connect",
+    ]);
+  });
+
+  it("find reports budget-exhausted instead of a bare no-match when collection hits a hard cap", async () => {
+    const page = await manager.getPage(browserName, "huge-page");
+    await page.setContent(
+      `<main>${Array.from({ length: 22_000 }, (_, index) => `<div>filler ${index}</div>`).join("")}</main>`
+    );
+
+    const result = await executeInteractiveAction(manager, {
+      id: "test-find-exhausted",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: "huge-page",
+      action: { kind: "find", name: "Introuvable", nameMode: "exact", scope: "visible", states: [], limit: 10 },
+    });
+
+    expect(result.matches).toEqual([]);
+    expect(result.ambiguity?.reason).toBe("budget-exhausted");
+    expect(result.search?.truncated).toBe(true);
+    expect(result.warnings?.join(" ")).toContain("hard cap");
+  });
+
   it("returns unified post-action state after acting on a v2 registry ref", async () => {
     const observed = await executeInteractiveAction(manager, {
       ...request({

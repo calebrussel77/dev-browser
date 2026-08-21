@@ -721,7 +721,9 @@ export class QuickJSSandbox {
     // stops looking absolute and would be silently rewritten instead of
     // refused, unlike every other sandbox file helper.
     if (posix.isAbsolute(requested) || win32.isAbsolute(requested)) {
-      throw new Error("Absolute paths are not allowed");
+      throw new Error(
+        "Absolute paths are not allowed; pass a relative name and the recording is written under the controlled temp directory (the result reports the absolute path)"
+      );
     }
     return await resolveDevBrowserTempPath(`videos/${requested}`, { createParents: true });
   }

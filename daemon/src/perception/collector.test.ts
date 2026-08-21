@@ -201,6 +201,27 @@ describe.sequential("unified page perception", () => {
     ]);
   });
 
+  it("exposes the full collected record set beyond the display budget", async () => {
+    const nesting = 20;
+    await page.setContent(`
+      <header><button id="skip">Skip to content</button></header>
+      ${"<div>".repeat(nesting)}<button id="deep">Deep action</button>${"</div>".repeat(nesting)}
+      <footer><button id="after">After deep</button></footer>
+    `);
+
+    const state = await collectPageState(page, { track: "full-records" });
+
+    // The display-budgeted selection stops at the deep record (depth break)...
+    expect(state.elements.some((element) => element.name === "Deep action")).toBe(false);
+    expect(state.truncation.truncated).toBe(true);
+    // ...but the full record set still carries every collected element, with
+    // refs, and reports that collection itself completed.
+    const names = state.allElements.map((element) => element.name);
+    expect(names).toEqual(expect.arrayContaining(["Skip to content", "Deep action", "After deep"]));
+    expect(state.allElements.find((element) => element.name === "Deep action")?.ref).toMatch(/^R\d+$/);
+    expect(state.collection).toEqual({ truncated: false });
+  });
+
   it("rejects malformed opaque continuations as typed stale state", async () => {
     await page.setContent(`<button>Continue</button>`);
 
