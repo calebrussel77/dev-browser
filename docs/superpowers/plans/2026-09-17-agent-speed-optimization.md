@@ -173,9 +173,9 @@ Mesure intermédiaire 1.1 : `observe` 4,2 KB, `observe --elements` 22,6 KB, `obs
 
 **Fichiers :** `daemon/src/interactive-actions.ts`, `daemon/src/page-state.ts`.
 
-- [ ] Pour `click`, `type`, `press`, `paste`, `scroll`, `select`, `check`, `uncheck`, `hover`, `drag`, `back`, `forward`, `reload`, `navigate` : la perception finale est appelée avec `delta: true` sur le track `default` (aujourd'hui seulement certains chemins). Le delta est renvoyé sous `delta: { url?, title?, focus?, added: [...], removed: [...], changed: [...] }` borné à 50 refs par liste (avec `truncated: true` au-delà).
-- [ ] Ajouter `delta.summary`: une ligne courte, p. ex. `"+12 −3 ~4 refs, url changed, dialog opened"`, calculée côté daemon.
-- [ ] `page-state.ts` : le calcul du delta ne doit pas sérialiser `semanticFingerprint` deux fois par élément (mémoïser par ref au sein d'un `recordPageState`).
+- [x] Pour `click`, `type`, `press`, `paste`, `scroll`, `select`, `check`, `uncheck`, `hover`, `drag`, `back`, `forward`, `reload`, `navigate` : la perception finale est appelée avec `delta: true` sur le track `default` (aujourd'hui seulement certains chemins). Le delta est renvoyé sous `delta: { url?, title?, focus?, added: [...], removed: [...], changed: [...] }` borné à 50 refs par liste (avec `truncated: true` au-delà).
+- [x] Ajouter `delta.summary`: une ligne courte, p. ex. `"+12 −3 ~4 refs, url changed, dialog opened"`, calculée côté daemon.
+- [x] `page-state.ts` : le calcul du delta ne doit pas sérialiser `semanticFingerprint` deux fois par élément (mémoïser par ref au sein d'un `recordPageState`).
 
 **Tests :** `page-state.test.ts` ou nouveau `ref-state.test.ts` cas : delta borné ; summary correcte ; delta null sur la première observation d'un track.
 
