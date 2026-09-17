@@ -54,6 +54,7 @@ function resolvePlaywrightInternal(modulePath: string): string {
 function tryResolvePlaywrightInternal(modulePath: string): string | null {
   const candidates = [
     path.resolve(currentDir, "../../node_modules/playwright-core", modulePath),
+    path.resolve(currentDir, "../node_modules/playwright-core", modulePath),
     path.resolve(currentDir, "node_modules/playwright-core", modulePath),
     path.resolve(process.cwd(), "node_modules/playwright-core", modulePath),
   ];
