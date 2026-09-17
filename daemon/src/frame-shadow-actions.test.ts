@@ -26,7 +26,9 @@ describe.sequential("frame and shadow action flows", () => {
       protocolVersion: 2,
       browser: browserName,
       page: pageName,
-      verbose: action.kind === "read" || action.kind === "observe",
+      // Frame coverage verifies journal/target context on successful actions;
+      // those diagnostics are intentionally verbose-only in protocol v2.
+      verbose: true,
       action,
     }, hooks);
 
@@ -143,7 +145,7 @@ describe.sequential("frame and shadow action flows", () => {
     target = await current("Frame editor");
     const shot = await executeInteractiveAction(manager, {
       id: "frame-shot", type: "interactive", protocolVersion: 2, browser: browserName, page: pageName,
-      shot: "auto", action: { kind: "shot", ref: target.ref, padding: 12 },
+      shot: "auto", verbose: true, action: { kind: "shot", ref: target.ref, padding: 12 },
     });
     const page = await manager.getPage(browserName, pageName);
     const same = page.frameLocator('[data-testid="same-origin-frame"]');

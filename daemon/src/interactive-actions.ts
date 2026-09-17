@@ -69,6 +69,12 @@ export type InteractiveElement = PerceptionElement;
 
 export type InteractiveMatch = TargetMatch;
 
+interface CompactWaitResult {
+  elapsedMs: number;
+  passed: string[];
+  timedOut: string[];
+}
+
 export interface InteractiveResult {
   action: InteractiveRequest["action"]["kind"];
   page: string;
@@ -161,7 +167,7 @@ export interface InteractiveResult {
   attemptJournal?: AttemptJournalEntry[];
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
-  waitResult?: WaitResult;
+  waitResult?: WaitResult | CompactWaitResult;
   pressed?: PrimitiveSummary["pressed"];
   pasted?: PrimitiveSummary["pasted"];
   scroll?: PrimitiveSummary["scroll"];
@@ -242,6 +248,116 @@ function compactWaitEvidence(waitResult: WaitResult | undefined, fallback?: unkn
     observations: waitResult.observations.slice(0, 5),
     events: boundedWaitEvents(waitResult.events),
   };
+}
+
+const roundedPoint = (point: { x: number; y: number }) => ({
+  x: Math.round(point.x),
+  y: Math.round(point.y),
+});
+
+const roundedBox = (box: { x: number; y: number; width: number; height: number }) => ({
+  x: Math.round(box.x),
+  y: Math.round(box.y),
+  width: Math.round(box.width),
+  height: Math.round(box.height),
+});
+
+function roundElementGeometry(element: PerceptionElement): void {
+  element.box = roundedBox(element.box);
+  if (element.quad) element.quad = element.quad.map(roundedPoint);
+}
+
+function roundTargetGeometry(target: ActionTargetMetadata): void {
+  target.box = roundedBox(target.box);
+  if (target.quad) target.quad = target.quad.map(roundedPoint);
+  target.scroll.before = roundedPoint(target.scroll.before);
+  target.scroll.after = roundedPoint(target.scroll.after);
+}
+
+function roundInteractiveGeometry(result: InteractiveResult): void {
+  result.elements?.forEach(roundElementGeometry);
+  result.matches?.forEach(roundElementGeometry);
+  result.targets?.forEach(roundTargetGeometry);
+  if (result.clicked) {
+    result.clicked.point = roundedPoint(result.clicked.point);
+    if (result.clicked.box) result.clicked.box = roundedBox(result.clicked.box);
+    if (result.clicked.scroll) {
+      result.clicked.scroll.before = roundedPoint(result.clicked.scroll.before);
+      result.clicked.scroll.after = roundedPoint(result.clicked.scroll.after);
+    }
+  }
+  if (result.scroll) {
+    result.scroll.before = roundedPoint(result.scroll.before);
+    result.scroll.after = roundedPoint(result.scroll.after);
+    result.scroll.delta = roundedPoint(result.scroll.delta);
+  }
+  if (result.scrollMetrics) {
+    result.scrollMetrics.positions = result.scrollMetrics.positions.map(Math.round);
+  }
+  if (result.coordinateSpace) {
+    result.coordinateSpace.viewport = {
+      width: Math.round(result.coordinateSpace.viewport.width),
+      height: Math.round(result.coordinateSpace.viewport.height),
+    };
+    result.coordinateSpace.devicePixelRatio =
+      Math.round(result.coordinateSpace.devicePixelRatio * 100) / 100;
+    if (result.coordinateSpace.scroll) {
+      result.coordinateSpace.scroll = roundedPoint(result.coordinateSpace.scroll);
+    }
+  }
+  for (const artifact of [result.artifacts?.screenshot, result.artifacts?.annotatedScreenshot]) {
+    if (!artifact) continue;
+    artifact.width = Math.round(artifact.width);
+    artifact.height = Math.round(artifact.height);
+    artifact.origin = roundedPoint(artifact.origin);
+    artifact.coordinateSpace.viewport = {
+      width: Math.round(artifact.coordinateSpace.viewport.width),
+      height: Math.round(artifact.coordinateSpace.viewport.height),
+    };
+    artifact.coordinateSpace.scroll = roundedPoint(artifact.coordinateSpace.scroll);
+    artifact.coordinateSpace.devicePixelRatio =
+      Math.round(artifact.coordinateSpace.devicePixelRatio * 100) / 100;
+  }
+}
+
+function compactInteractiveResult(
+  result: InteractiveResult,
+  request: InteractiveRequest
+): void {
+  if ((request.protocolVersion ?? 1) !== 2) return;
+
+  roundInteractiveGeometry(result);
+  if (request.verbose === true) return;
+
+  delete result.attemptJournal;
+  delete result.attempts;
+  delete result.targets;
+  delete result.change;
+  delete result.waitForText;
+  delete result.waitSatisfied;
+
+  if (result.waitResult && "passed" in result.waitResult) {
+    result.waitResult = {
+      elapsedMs: Math.round(result.waitResult.elapsedMs),
+      passed: result.waitResult.passed.map((condition) =>
+        typeof condition === "string" ? condition : condition.kind
+      ),
+      timedOut: result.waitResult.timedOut.map((condition) =>
+        typeof condition === "string" ? condition : condition.kind
+      ),
+    };
+  }
+  if (result.truncation?.truncated !== true) delete result.truncation;
+  if (result.warnings?.length === 0) delete result.warnings;
+  if (result.focusedRef == null) delete result.focusedRef;
+  if (result.delta == null) delete result.delta;
+
+  const needsCoordinateSpace =
+    request.elements === true ||
+    request.shot !== undefined ||
+    request.annotate === true ||
+    request.action.kind === "shot";
+  if (!needsCoordinateSpace) delete result.coordinateSpace;
 }
 
 function redactedUrl(value: string): string {
@@ -2044,6 +2160,7 @@ export async function executeInteractiveAction(
     "confirmToken" in action ? action.confirmToken : undefined,
   ].filter((value): value is string => Boolean(value));
   requestSecrets.push(...sensitiveValues);
+  compactInteractiveResult(result, request);
   return redactSensitive(result, {
     allowConfirmationToken: action.kind === "confirm" && protocolVersion === 2,
     secrets: requestSecrets,

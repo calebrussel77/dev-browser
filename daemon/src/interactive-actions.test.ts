@@ -230,6 +230,69 @@ describe.sequential("interactive Playwright actions", () => {
     expect(result.elements?.[0]).toHaveProperty("semanticAncestors");
   });
 
+  it("omits v2 diagnostic noise by default and keeps compact wait evidence", async () => {
+    const pageName = "compact-response";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><button id="open">Open modal</button></main><script>
+      document.querySelector('#open').addEventListener('click', () => {
+        const dialog = document.createElement('div');
+        dialog.setAttribute('role', 'dialog');
+        dialog.textContent = 'Compact modal opened';
+        document.body.append(dialog);
+      });
+    </script>`);
+    const found = await executeInteractiveAction(manager, {
+      ...request({ kind: "find", role: "button", name: "Open modal", nameMode: "exact", scope: "document", states: [], limit: 3 }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    const result = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "click",
+        ref: found.matches![0]!.ref,
+        method: "mouse",
+        wait: { mode: "all", timeoutMs: 1_000, conditions: [{ kind: "dialog", state: "opened" }] },
+      }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+
+    for (const key of [
+      "attemptJournal", "attempts", "targets", "change", "waitForText", "waitSatisfied",
+      "coordinateSpace", "truncation",
+    ]) expect(result).not.toHaveProperty(key);
+    expect(Object.keys(result.waitResult ?? {}).sort()).toEqual(["elapsedMs", "passed", "timedOut"]);
+    expect(result.waitResult).toEqual(expect.objectContaining({ passed: ["dialog"], timedOut: [] }));
+  });
+
+  it("preserves verbose diagnostics and rounds v2 response geometry", async () => {
+    const pageName = "verbose-response";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><button style="position:relative;left:0.375px;width:101.625px">Fractional button</button></main>`);
+    const observed = await executeInteractiveAction(manager, {
+      ...request({ kind: "observe", full: false, delta: false, track: "rounded", maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 }, { verbose: true }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    const target = observed.elements!.find((element) => element.name === "Fractional button")!;
+
+    expect(Object.values(target.box).every(Number.isInteger)).toBe(true);
+    expect(Object.values(observed.coordinateSpace!.viewport).every(Number.isInteger)).toBe(true);
+    expect((String(observed.coordinateSpace!.devicePixelRatio).split(".")[1] ?? "").length).toBeLessThanOrEqual(2);
+
+    const clicked = await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: target.ref, method: "mouse" }, { verbose: true }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    expect(clicked).toHaveProperty("attemptJournal");
+    expect(clicked).toHaveProperty("attempts");
+    expect(clicked).toHaveProperty("targets");
+    expect(clicked).toHaveProperty("change");
+    expect(clicked).toHaveProperty("coordinateSpace");
+    expect(Object.values(clicked.clicked!.point).every(Number.isInteger)).toBe(true);
+  });
+
   it("keeps text/assert responses scope bounded instead of re-collecting the full unscoped tree", async () => {
     const text = await executeInteractiveAction(
       manager,
@@ -741,7 +804,7 @@ describe.sequential("interactive Playwright actions", () => {
         const result = await executeInteractiveAction(manager, {
           ...request(
             { kind: "click", ref, method: "mouse", waitForText: "SUCCESS", retry },
-            { timeoutMs: 100 }
+            { timeoutMs: 100, verbose: true }
           ),
           protocolVersion: 2,
         });

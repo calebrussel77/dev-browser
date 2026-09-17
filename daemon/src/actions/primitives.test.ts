@@ -30,7 +30,9 @@ describe.sequential("trusted interaction primitives", () => {
       protocolVersion: 2,
       browser,
       page: "main",
-      verbose: action.kind === "read" || action.kind === "observe",
+      // This suite asserts dispatch journals and resolved target metadata, so
+      // opt into the diagnostic response shape explicitly.
+      verbose: true,
       action,
     }, hooks);
   async function ref(name: string) {

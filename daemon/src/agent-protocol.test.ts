@@ -33,6 +33,34 @@ describe("agent protocol v2", () => {
     });
   });
 
+  it("does not let result fields replace required success envelope controls", () => {
+    const envelope = buildInteractiveSuccess({
+      requestId: "required-fields",
+      browser: "daily",
+      page: "TARGET",
+      action: "click",
+      result: {
+        protocolVersion: 1,
+        ok: false,
+        requestId: "spoofed",
+        browser: "spoofed",
+        page: "spoofed",
+        action: "spoofed",
+        clicked: { ref: "R1" },
+      },
+    });
+
+    expect(envelope).toMatchObject({
+      protocolVersion: 2,
+      ok: true,
+      requestId: "required-fields",
+      browser: "daily",
+      page: "TARGET",
+      action: "click",
+      clicked: { ref: "R1" },
+    });
+  });
+
   it("builds and parses a typed failure envelope", () => {
     const envelope = buildInteractiveFailure({
       requestId: "click-1",
