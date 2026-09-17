@@ -72,6 +72,34 @@ describe("shared actionability pipeline", () => {
     }
   });
 
+  it("resolves a main-frame target within the bounded protocol-call budget", async () => {
+    await page.setContent(`<button data-testid="target">Fast target</button>`);
+    const ref = await observedRef("target");
+    const connection = (page as any)._connection;
+    const originalSend = connection.sendMessageToServer;
+    let calls = 0;
+    connection.sendMessageToServer = function (...args: unknown[]) {
+      calls += 1;
+      return originalSend.apply(this, args);
+    };
+    let target: Awaited<ReturnType<typeof resolveActionTarget>> | undefined;
+    try {
+      target = await resolveActionTarget(page, ref, {
+        timeoutMs: 500,
+        scroll: true,
+        hitTest: true,
+        applicability: "pointer",
+      });
+    } finally {
+      connection.sendMessageToServer = originalSend;
+    }
+    try {
+      expect(calls).toBeLessThanOrEqual(25);
+    } finally {
+      await target?.cleanup();
+    }
+  });
+
   it("resolves a target that only micro-jitters in place on a repainting page", async () => {
     await page.setContent(`
       <button data-testid="target" style="position:relative;left:0;top:0;width:120px">Jitter</button>
