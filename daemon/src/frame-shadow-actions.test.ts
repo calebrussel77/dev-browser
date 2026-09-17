@@ -194,7 +194,7 @@ describe.sequential("frame and shadow action flows", () => {
     expect(await page.locator("iframe").contentFrame().locator("output").textContent()).toContain("delayed:1");
   }, 20_000);
 
-  it("does not retry when before/after page-signal coverage is truncated", async () => {
+  it("uses the mutation epoch instead of traversal truncation for retry evidence", async () => {
     const page = await manager.getPage(browserName, pageName);
     await page.setContent(`<button id="target">Bounded retry</button><output>clicks:0</output><script>let clicks=0;target.onclick=()=>document.querySelector('output').textContent='clicks:'+(++clicks)</script>`);
     const observed = await action({ kind: "observe", full: true });
@@ -206,9 +206,12 @@ describe.sequential("frame and shadow action flows", () => {
     });
     await expect(action({ kind: "click", ref: target.ref, method: "locator", retry: "once", fromState: observed.stateId, wait: { mode: "all", timeoutMs: 30, conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "never" }] } })).rejects.toMatchObject({
       code: "WAIT_TIMEOUT",
-      details: { attemptJournal: [expect.objectContaining({ retryDecision: "stop", reason: "observation-coverage-truncated", change: expect.objectContaining({ coverageTruncated: true }) })] },
+      details: { attemptJournal: [
+        expect.objectContaining({ retryDecision: "retry", reason: "explicit-once", change: expect.objectContaining({ coverageTruncated: false, dom: true }) }),
+        expect.objectContaining({ retryDecision: "stop", reason: "retry-limit-reached" }),
+      ] },
     });
-    expect(await page.locator("output").textContent()).toBe("clicks:1");
+    expect(await page.locator("output").textContent()).toBe("clicks:2");
   });
 
   it("inherits frame and shadow context for secondary download and popup-failure journal entries", async () => {

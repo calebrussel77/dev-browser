@@ -6,6 +6,7 @@ import { parseScopedRef, registeredFrame, registeredFrames } from "./frame-regis
 const MAX_FRAMES = 64;
 const MAX_RECORDS = 2_000;
 const MAX_TEXT = 10_000;
+const MAX_TEXT_CHARS = 200_000;
 const MAX_WORK = 1_000;
 const MAX_DEPTH = 100;
 
@@ -27,6 +28,8 @@ export interface LivePageSnapshot {
   refs: Record<string, LiveRefState>;
   frameSignals: Array<{ frameId: string; url: string; dom: string; focus: string; values: string[] }>;
   truncated: boolean;
+  refsTruncated: boolean;
+  textTruncated: boolean;
   hiddenFrameIds: string[];
 }
 
@@ -48,7 +51,155 @@ async function liveFrames(page: Page): Promise<{ frames: LiveFrame[]; truncated:
   return { frames, truncated };
 }
 
-export async function collectLiveSnapshot(page: Page): Promise<LivePageSnapshot> {
+export async function readLiveText(
+  page: Page,
+  scope: "body" | "dialog" | "toast"
+): Promise<{ texts: string[]; textTruncated: boolean }> {
+  const selected = await liveFrames(page);
+  const texts: string[] = [];
+  let textTruncated = selected.truncated;
+  for (const { frame, ancestorsVisible } of selected.frames) {
+    if (!ancestorsVisible) continue;
+    try {
+      const result = await frame.evaluate(({ selectedScope, bodyLimit, itemLimit }) => {
+        const normalize = (value: string) =>
+          value.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+        if (selectedScope === "body") {
+          const value = normalize(document.body?.innerText ?? "");
+          return {
+            texts: [value.slice(0, bodyLimit)],
+            truncated: value.length > bodyLimit,
+          };
+        }
+        const selector = selectedScope === "dialog"
+          ? '[role="dialog"],dialog[open]'
+          : '[role="status"],[role="alert"],[data-toast],[data-testid*="toast"]';
+        const roots: Array<Document | ShadowRoot> = [document];
+        const nodes: HTMLElement[] = [];
+        for (let index = 0; index < roots.length; index += 1) {
+          const root = roots[index]!;
+          nodes.push(...Array.from(root.querySelectorAll<HTMLElement>(selector)));
+          for (const element of Array.from(root.querySelectorAll<HTMLElement>("*")))
+            if (element.shadowRoot) roots.push(element.shadowRoot);
+        }
+        const values = nodes.slice(0, 50).flatMap((element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          if (
+            rect.width <= 0 ||
+            rect.height <= 0 ||
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            Number(style.opacity) === 0
+          ) return [];
+          const value = normalize(element.innerText ?? element.textContent ?? "");
+          return [value.slice(0, itemLimit)];
+        });
+        return {
+          texts: values,
+          truncated:
+            nodes.length > 50 ||
+            nodes.some((element) =>
+              normalize(element.innerText ?? element.textContent ?? "").length > itemLimit
+            ),
+        };
+      }, { selectedScope: scope, bodyLimit: MAX_TEXT_CHARS, itemLimit: MAX_TEXT });
+      texts.push(...result.texts);
+      textTruncated ||= result.truncated;
+    } catch {
+      textTruncated = true;
+    }
+  }
+  return {
+    texts: texts.slice(0, scope === "body" ? MAX_FRAMES : 50),
+    textTruncated: textTruncated || (scope !== "body" && texts.length > 50),
+  };
+}
+
+export async function readLiveRefs(
+  page: Page,
+  requestedRefs: string[]
+): Promise<{
+  refs: Record<string, LiveRefState>;
+  refsTruncated: boolean;
+  hiddenFrameIds: string[];
+}> {
+  const refs: Record<string, LiveRefState> = {};
+  const hiddenFrameIds: string[] = [];
+  let refsTruncated = false;
+  const grouped = new Map<string, string[]>();
+  for (const ref of [...new Set(requestedRefs)]) {
+    const scoped = parseScopedRef(ref);
+    if (!scoped) continue;
+    const values = grouped.get(scoped.frameId) ?? [];
+    values.push(scoped.localRef);
+    grouped.set(scoped.frameId, values);
+  }
+  for (const [frameId, localRefs] of grouped) {
+    const frame = frameId === "F0" ? page.mainFrame() : registeredFrame(page, frameId)?.frame;
+    if (!frame || frame.isDetached()) {
+      continue;
+    }
+    const ancestorsVisible = await frameAncestorsVisible(frame).catch(() => false);
+    if (!ancestorsVisible) hiddenFrameIds.push(frameId);
+    try {
+      const rows = await frame.evaluate(({ trackedRefs, maxTextChars }) => {
+        type RealmState = { byRef?: Map<string, WeakRef<Element>> };
+        const state = (window as Window & {
+          __devBrowserPerceptionState?: RealmState;
+        }).__devBrowserPerceptionState;
+        return trackedRefs.flatMap((ref) => {
+          const element = state?.byRef?.get(ref)?.deref();
+          if (!element?.isConnected) return [];
+          const input = element as HTMLInputElement;
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          const visible =
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            Number(style.opacity) !== 0;
+          const attributes: Record<string, string | null> = {};
+          for (let index = 0; index < Math.min(element.attributes.length, 30); index += 1) {
+            const attribute = element.attributes.item(index)!;
+            attributes[attribute.name.slice(0, 100)] = attribute.value.slice(0, 500);
+          }
+          return [{
+            ref,
+            visible,
+            enabled: !("disabled" in input) || !input.disabled,
+            value: "value" in input
+              ? String(input.value).slice(0, maxTextChars)
+              : (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, maxTextChars),
+            attributes,
+            states: {
+              checked: String(Boolean(input.checked)),
+              selected: String(Boolean((element as HTMLOptionElement).selected)),
+              expanded: element.getAttribute("aria-expanded") ?? "",
+              pressed: element.getAttribute("aria-pressed") ?? "",
+            },
+            shadowContext: [],
+          }];
+        });
+      }, { trackedRefs: localRefs, maxTextChars: MAX_TEXT_CHARS });
+      for (const row of rows) {
+        const ref = frameId === "F0" ? row.ref : `${frameId}:${row.ref}`;
+        refs[ref] = {
+          attached: true,
+          ...row,
+          visible: ancestorsVisible && row.visible,
+          frameId,
+        };
+      }
+    } catch {
+      refsTruncated = true;
+    }
+  }
+  return { refs, refsTruncated, hiddenFrameIds };
+}
+
+async function collectTraversalSnapshot(page: Page): Promise<Omit<LivePageSnapshot, "refsTruncated" | "textTruncated">> {
   const refs: Record<string, LiveRefState> = {};
   const dialogs: string[] = [], toasts: string[] = [], bodyText: string[] = [], frameSignals: LivePageSnapshot["frameSignals"] = [];
   let recordCount = 0;
@@ -172,6 +323,26 @@ export async function collectLiveSnapshot(page: Page): Promise<LivePageSnapshot>
   }
   if (dialogs.length > 50 || toasts.length > 50) truncated = true;
   return { dialogs: dialogs.slice(0, 50), toasts: toasts.slice(0, 50), bodyText: bodyText.slice(0, MAX_FRAMES), refs, frameSignals, truncated, hiddenFrameIds };
+}
+
+export async function collectLiveSnapshot(page: Page): Promise<LivePageSnapshot> {
+  const [traversal, body, dialogs, toasts] = await Promise.all([
+    collectTraversalSnapshot(page),
+    readLiveText(page, "body"),
+    readLiveText(page, "dialog"),
+    readLiveText(page, "toast"),
+  ]);
+  const textTruncated = body.textTruncated || dialogs.textTruncated || toasts.textTruncated;
+  const refsTruncated = traversal.truncated;
+  return {
+    ...traversal,
+    bodyText: body.texts,
+    dialogs: dialogs.texts,
+    toasts: toasts.texts,
+    refsTruncated,
+    textTruncated,
+    truncated: refsTruncated || textTruncated,
+  };
 }
 
 export async function describeLiveRef(page: Page, ref: string): Promise<string> {

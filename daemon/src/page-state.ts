@@ -16,6 +16,7 @@ export interface PerceptionDelta {
 export interface Snapshot {
   url: string;
   title: string;
+  mutationEpoch: number;
   focusedRef: string | null;
   elements: Map<string, string>;
   dialogs: Set<string>;
@@ -96,6 +97,20 @@ export function getLatestStateId(page: Page): string | null {
   return histories.get(page)?.latestStateId ?? null;
 }
 
+export function getPageStateIdentity(page: Page): {
+  realmToken: string;
+  documentId: string;
+  latestStateId: string | null;
+} | undefined {
+  const history = histories.get(page);
+  if (!history) return undefined;
+  return {
+    realmToken: history.realmToken,
+    documentId: `doc-${history.documentNumber}`,
+    latestStateId: history.latestStateId,
+  };
+}
+
 export function recordedStatesEqual(page: Page, left: string, right: string): boolean {
   const history = histories.get(page);
   const a = history?.states.get(left);
@@ -118,8 +133,9 @@ export function recordPageState(
   page: Page,
   realmToken: string,
   track: string,
-  current: Omit<Snapshot, "elements" | "dialogs" | "signature"> & {
+  current: Omit<Snapshot, "elements" | "dialogs" | "signature" | "mutationEpoch"> & {
     elements: PerceptionElement[];
+    mutationEpoch?: number;
   },
   includeDelta: boolean
 ): { documentId: string; stateId: string; delta: PerceptionDelta | null } {
@@ -162,7 +178,13 @@ export function recordPageState(
     focusedRef: current.focusedRef,
     elements: fingerprinted.map(({ fingerprint }) => fingerprint),
   });
-  const next: Snapshot = { ...current, elements, dialogs, signature };
+  const next: Snapshot = {
+    ...current,
+    mutationEpoch: current.mutationEpoch ?? 0,
+    elements,
+    dialogs,
+    signature,
+  };
   history.tracks.set(track, next);
 
   let delta: PerceptionDelta | null = null;

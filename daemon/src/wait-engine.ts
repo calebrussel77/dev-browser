@@ -10,14 +10,26 @@ import type {
 } from "playwright";
 
 import { AgentProtocolError } from "./agent-protocol.js";
-import { collectLiveSnapshot } from "./live-snapshot.js";
+import { collectLiveSnapshot, readLiveRefs, readLiveText } from "./live-snapshot.js";
 import type { WaitCondition, WaitSpec } from "./protocol.js";
 
-const POLL_INTERVAL_MS = 25;
+const POLL_INTERVAL_MS = 50;
 const MAX_OBSERVATION_LENGTH = 160;
 
+export interface SettledWaitCondition {
+  kind: "settled";
+  minSettleMs?: number;
+  maxSettleMs?: number;
+  idleMaxSettleMs?: number;
+}
+
+type InternalWaitCondition = WaitCondition | SettledWaitCondition;
+export type InternalWaitSpec = Omit<WaitSpec, "conditions"> & {
+  conditions: InternalWaitCondition[];
+};
+
 type ConditionObservation = {
-  condition: WaitCondition;
+  condition: InternalWaitCondition;
   passed: boolean;
   observed?: string | number | boolean | null;
   coverage?: "complete" | "truncated";
@@ -48,8 +60,8 @@ type TransientCapture = Pick<WaitEvents, "mutations" | "focusChanges" | "valueCh
 export interface WaitResult {
   mode: WaitSpec["mode"];
   elapsedMs: number;
-  passed: WaitCondition[];
-  timedOut: WaitCondition[];
+  passed: InternalWaitCondition[];
+  timedOut: InternalWaitCondition[];
   observations: ConditionObservation[];
   events: WaitEvents;
 }
@@ -134,8 +146,8 @@ function safeText(value: string, secrets: string[] = []): string {
     .replace(/\b(token|auth|key|password|secret|session|code|credential)\s*[:=]\s*[^\s|,;]+/gi, "$1=[redacted]");
 }
 
-function boundedCondition(condition: WaitCondition): WaitCondition {
-  const copy = { ...condition } as WaitCondition & {
+function boundedCondition(condition: InternalWaitCondition): InternalWaitCondition {
+  const copy = { ...condition } as InternalWaitCondition & {
     value?: string;
     expected?: string;
     attribute?: string;
@@ -144,6 +156,144 @@ function boundedCondition(condition: WaitCondition): WaitCondition {
   if (copy.expected) copy.expected = bounded(copy.expected);
   if (copy.attribute) copy.attribute = bounded(copy.attribute);
   return copy;
+}
+
+export interface PerceptionSignal {
+  epoch: string;
+  mainEpoch: number;
+  lastMutationAt: number;
+  quietMs: number;
+  url: string;
+  activeRef: string | null;
+  dialogs: number;
+  inFlightFetch: number;
+  values: Array<{ ref: string; value: string; expanded: string }>;
+}
+
+interface RealmPerceptionSignal {
+  epoch: number;
+  lastMutationAt: number;
+  quietMs: number;
+  url: string;
+  activeRef: string | null;
+  dialogs: number;
+  inFlightFetch: number;
+  values: Array<{ ref: string; value: string; expanded: string }>;
+}
+
+async function readRealmPerceptionSignal(
+  surface: Page | Frame,
+  refs: string[] = []
+): Promise<RealmPerceptionSignal> {
+  return await surface.evaluate((trackedRefs) => {
+    type State = {
+      token: string;
+      refs: WeakMap<Element, string>;
+      byRef: Map<string, WeakRef<Element>>;
+      counter: number;
+      mutationEpoch: number;
+      lastMutationAt: number;
+      mutationObserver?: MutationObserver;
+      signal?: () => Omit<RealmPerceptionSignal, "quietMs" | "values">;
+    };
+    const realm = window as Window & { __devBrowserPerceptionState?: State };
+    if (!realm.__devBrowserPerceptionState) {
+      Object.defineProperty(realm, "__devBrowserPerceptionState", {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: {
+          token: `${Date.now()}-${Math.random()}`,
+          refs: new WeakMap<Element, string>(),
+          byRef: new Map<string, WeakRef<Element>>(),
+          counter: 1,
+          mutationEpoch: 0,
+          lastMutationAt: performance.now(),
+        },
+      });
+    }
+    const state = realm.__devBrowserPerceptionState!;
+    state.mutationEpoch ??= 0;
+    state.lastMutationAt ??= performance.now();
+    if (!state.mutationObserver) {
+      const isInternalMutation = (mutation: MutationRecord) => {
+        if (
+          mutation.type === "attributes" &&
+          mutation.attributeName &&
+          /^data-dev-browser-(?:ref|action-ref|visual-overlay|capture-style)/.test(mutation.attributeName)
+        ) return true;
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+        return Boolean(target?.closest("[data-dev-browser-visual-overlay],[data-dev-browser-capture-style]"));
+      };
+      state.mutationObserver = new MutationObserver((mutations) => {
+        if (mutations.every(isInternalMutation)) return;
+        state.mutationEpoch += 1;
+        state.lastMutationAt = performance.now();
+      });
+      state.mutationObserver.observe(document, {
+        attributes: true,
+        characterData: true,
+        childList: true,
+        subtree: true,
+      });
+      state.signal = () => {
+        let active: Element | null = document.activeElement;
+        while (active instanceof HTMLElement && active.shadowRoot?.activeElement)
+          active = active.shadowRoot.activeElement;
+        return {
+          epoch: state.mutationEpoch,
+          lastMutationAt: state.lastMutationAt,
+          url: location.href,
+          activeRef: active ? state.refs.get(active) ?? active.getAttribute("data-dev-browser-ref") : null,
+          dialogs: document.querySelectorAll('[role="dialog"],dialog[open]').length,
+          inFlightFetch: 0,
+        };
+      };
+    }
+    const signal = state.signal!();
+    const values = trackedRefs.flatMap((ref) => {
+      const element = state.byRef.get(ref)?.deref();
+      if (!element?.isConnected) return [];
+      const input = element as HTMLInputElement;
+      return [{
+        ref,
+        value: "value" in input ? String(input.value) : (element.textContent ?? ""),
+        expanded: element.getAttribute("aria-expanded") ?? "",
+      }];
+    });
+    return {
+      ...signal,
+      quietMs: Math.max(0, performance.now() - signal.lastMutationAt),
+      values,
+    };
+  }, refs);
+}
+
+export async function readPerceptionSignal(
+  page: Page,
+  refs: string[] = []
+): Promise<PerceptionSignal> {
+  const frames = page.frames();
+  const signals = (
+    await Promise.all(
+      frames.map(async (frame) => ({
+        frame,
+        signal: await readRealmPerceptionSignal(frame, refs).catch(() => null),
+      }))
+    )
+  ).filter((entry): entry is { frame: Frame; signal: RealmPerceptionSignal } => entry.signal !== null);
+  const main = signals.find((entry) => entry.frame === page.mainFrame())?.signal;
+  return {
+    epoch: signals.map(({ frame, signal }) => `${frame.url()}#${signal.epoch}`).join("|"),
+    mainEpoch: main?.epoch ?? 0,
+    lastMutationAt: Math.max(0, ...signals.map(({ signal }) => signal.lastMutationAt)),
+    quietMs: Math.min(...signals.map(({ signal }) => signal.quietMs), Number.MAX_SAFE_INTEGER),
+    url: page.url(),
+    activeRef: signals.find(({ signal }) => signal.activeRef)?.signal.activeRef ?? null,
+    dialogs: signals.reduce((total, { signal }) => total + signal.dialogs, 0),
+    inFlightFetch: signals.reduce((total, { signal }) => total + signal.inFlightFetch, 0),
+    values: signals.flatMap(({ signal }) => signal.values),
+  };
 }
 
 function boundedDetails(value: unknown, key = "", depth = 0): unknown {
@@ -347,8 +497,8 @@ async function sharedDomSnapshot(page: Page, protocolVersion: 1 | 2): ReturnType
 
 async function sharedScopedText(page: Page, scope: "body" | "dialog" | "toast", protocolVersion: 1 | 2): Promise<{ texts: string[]; truncated: boolean }> {
   if (protocolVersion === 1) return { texts: await scopedText(page, scope), truncated: false };
-  const live = await collectLiveSnapshot(page);
-  return { texts: scope === "dialog" ? live.dialogs : scope === "toast" ? live.toasts : live.bodyText, truncated: live.truncated };
+  const live = await readLiveText(page, scope);
+  return { texts: live.texts, truncated: live.textTruncated };
 }
 
 async function installTransientCapture(page: Page, ownerToken: string): Promise<void> {
@@ -572,20 +722,54 @@ async function cleanupTransientCapture(page: Page, ownerToken: string): Promise<
 export async function runWithWait<State>(
   page: Page,
   stateContext: WaitStateContext<State>,
-  spec: WaitSpec,
+  spec: InternalWaitSpec,
   dispatch: () => unknown | Promise<unknown>
 ): Promise<{ waitResult: WaitResult; state: State }> {
   if (page.isClosed())
     throw new AgentProtocolError("PAGE_CLOSED", "Page closed before wait dispatch", true);
   const started = Date.now();
   const protocolVersion = stateContext.protocolVersion ?? 2;
-  const initial = await sharedDomSnapshot(page, protocolVersion);
-  const refBaselines = new Map<string, (typeof initial.refs)[string] | undefined>();
+  const baselineRefs = spec.conditions.flatMap((condition) =>
+    condition.kind === "ref" ? [condition.ref] : []
+  );
+  const needsDialogBaseline = spec.conditions.some((condition) => condition.kind === "dialog");
+  const needsToastBaseline = spec.conditions.some((condition) => condition.kind === "toast");
+  const [initial, initialDialogs, initialToasts] = protocolVersion === 1
+    ? await Promise.all([
+        baselineRefs.length > 0 || needsDialogBaseline || needsToastBaseline
+          ? sharedDomSnapshot(page, protocolVersion)
+          : Promise.resolve({ dialogs: [], toasts: [], refs: {}, truncated: false, hiddenFrameIds: [] }),
+        Promise.resolve({ texts: [] as string[], textTruncated: false }),
+        Promise.resolve({ texts: [] as string[], textTruncated: false }),
+      ])
+    : await Promise.all([
+        baselineRefs.length > 0
+          ? readLiveRefs(page, baselineRefs).then((value) => ({
+              dialogs: [] as string[],
+              toasts: [] as string[],
+              refs: value.refs,
+              truncated: value.refsTruncated,
+              hiddenFrameIds: value.hiddenFrameIds,
+            }))
+          : Promise.resolve({ dialogs: [] as string[], toasts: [] as string[], refs: {}, truncated: false, hiddenFrameIds: [] as string[] }),
+        needsDialogBaseline
+          ? readLiveText(page, "dialog")
+          : Promise.resolve({ texts: [] as string[], textTruncated: false }),
+        needsToastBaseline
+          ? readLiveText(page, "toast")
+          : Promise.resolve({ texts: [] as string[], textTruncated: false }),
+      ]);
+  if (protocolVersion === 2) {
+    initial.dialogs = initialDialogs.texts;
+    initial.toasts = initialToasts.texts;
+  }
+  const initialRefStates = initial.refs as Awaited<ReturnType<typeof sharedDomSnapshot>>["refs"];
+  const refBaselines = new Map<string, (typeof initialRefStates)[string] | undefined>();
   const coveredRefBaselines = new Set<string>();
   const initiallyTruncatedRefBaselines = new Set<string>();
   for (const condition of spec.conditions) {
     if (condition.kind !== "ref") continue;
-    const baseline = initial.refs[condition.ref];
+    const baseline = initialRefStates[condition.ref];
     if (baseline || !initial.truncated) {
       refBaselines.set(condition.ref, baseline);
       coveredRefBaselines.add(condition.ref);
@@ -610,7 +794,11 @@ export async function runWithWait<State>(
   const cleanups: Array<() => void> = [];
   let closed = false;
   let inFlight = 0;
+  let sawNetwork = false;
   let lastNetworkActivity = Date.now();
+  let dispatchedAt = Date.now();
+  let settledEpoch: string | undefined;
+  let quietPolls = 0;
 
   const listen = <K extends keyof Parameters<Page["on"]>[0] extends never ? never : string>(
     event: K,
@@ -665,6 +853,7 @@ export async function runWithWait<State>(
   };
   const onRequest = (request: Request) => {
     inFlight += 1;
+    sawNetwork = true;
     lastNetworkActivity = Date.now();
     events.requests.push({ url: safeUrl(request.url()), method: request.method() });
   };
@@ -697,7 +886,28 @@ export async function runWithWait<State>(
   listen("requestfailed", onRequestFailed as never);
   listen("close", onClose as never);
 
-  const observe = async (condition: WaitCondition): Promise<ConditionObservation> => {
+  const observe = async (condition: InternalWaitCondition): Promise<ConditionObservation> => {
+    if (condition.kind === "settled") {
+      const signal = await readPerceptionSignal(page);
+      if (settledEpoch === signal.epoch) quietPolls += 1;
+      else quietPolls = 0;
+      settledEpoch = signal.epoch;
+      const elapsed = Date.now() - dispatchedAt;
+      const minSettleMs = condition.minSettleMs ?? 50;
+      const maxSettleMs = condition.maxSettleMs ?? 700;
+      const idleMaxSettleMs = condition.idleMaxSettleMs ?? 300;
+      const cap = inFlight > 0 || sawNetwork ? maxSettleMs : idleMaxSettleMs;
+      const quiet =
+        elapsed >= minSettleMs &&
+        signal.quietMs >= minSettleMs &&
+        inFlight === 0 &&
+        quietPolls >= 2;
+      return {
+        condition,
+        passed: quiet || elapsed >= cap,
+        observed: `epoch=${signal.epoch},quietMs=${Math.round(signal.quietMs)},inFlight=${inFlight}`,
+      };
+    }
     if (
       condition.kind === "popup" ||
       condition.kind === "download" ||
@@ -748,25 +958,48 @@ export async function runWithWait<State>(
     if (condition.kind === "text") {
       const scoped = await sharedScopedText(page, condition.scope, protocolVersion);
       const matched = scoped.texts.some(matcher(condition.match, condition.value));
+      const coverageTruncated = scoped.truncated && !matched;
       return {
         condition,
-        passed: !scoped.truncated && (condition.state === "visible" ? matched : !matched),
+        passed:
+          condition.state === "visible"
+            ? matched
+            : !matched && !scoped.truncated,
         observed: bounded(scoped.texts.join(" | ")),
-        coverage: scoped.truncated ? "truncated" : "complete",
+        coverage: coverageTruncated ? "truncated" : "complete",
       };
     }
-    const current = await sharedDomSnapshot(page, protocolVersion);
     if (condition.kind === "dialog" || condition.kind === "toast") {
       const before = condition.kind === "dialog" ? initial.dialogs : initial.toasts;
-      const after = condition.kind === "dialog" ? current.dialogs : current.toasts;
+      const current = protocolVersion === 1
+        ? await sharedDomSnapshot(page, protocolVersion).then((snapshot) => ({
+            texts: condition.kind === "dialog" ? snapshot.dialogs : snapshot.toasts,
+            textTruncated: snapshot.truncated,
+          }))
+        : await readLiveText(page, condition.kind);
+      const after = current.texts;
+      const baselineTruncated = protocolVersion === 1
+        ? initial.truncated
+        : condition.kind === "dialog"
+          ? initialDialogs.textTruncated
+          : initialToasts.textTruncated;
       const passed =
-        !initial.truncated && !current.truncated &&
+        !baselineTruncated && !current.textTruncated &&
         (condition.state === "opened" ? after.length > before.length : after.length < before.length);
-      return { condition, passed, observed: after.length, coverage: initial.truncated || current.truncated ? "truncated" : "complete" };
+      return { condition, passed, observed: after.length, coverage: baselineTruncated || current.textTruncated ? "truncated" : "complete" };
     }
     if (condition.kind !== "ref") {
       throw new Error(`Unsupported wait condition: ${(condition as { kind: string }).kind}`);
     }
+    const current = protocolVersion === 1
+      ? await sharedDomSnapshot(page, protocolVersion)
+      : await readLiveRefs(page, [condition.ref]).then((value) => ({
+          dialogs: [] as string[],
+          toasts: [] as string[],
+          refs: value.refs,
+          truncated: value.refsTruncated,
+          hiddenFrameIds: value.hiddenFrameIds,
+        }));
     let before = refBaselines.get(condition.ref);
     const after = current.refs[condition.ref];
     const frameId = /^(F\d+):/.exec(condition.ref)?.[1] ?? "F0";
@@ -831,6 +1064,9 @@ export async function runWithWait<State>(
   const captureOwnerToken = `wait-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
     await installTransientCapture(page, captureOwnerToken);
+    if (spec.conditions.some((condition) => condition.kind === "settled"))
+      settledEpoch = (await readPerceptionSignal(page)).epoch;
+    dispatchedAt = Date.now();
     await dispatch();
     let observations: ConditionObservation[] = [];
     while (true) {

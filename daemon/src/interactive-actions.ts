@@ -33,8 +33,8 @@ import {
   type PerceptionElement,
 } from "./perception/collector.js";
 import type { InteractiveRequest, WaitSpec } from "./protocol.js";
-import { discardValidationState, getLatestStateId, getRecordedState } from "./page-state.js";
-import { validateObservedDecision } from "./ref-state.js";
+import { getLatestStateId, getRecordedState } from "./page-state.js";
+import { validateObservedDecisionTargeted } from "./ref-state.js";
 import {
   retryDecision,
   type AttemptChange,
@@ -53,14 +53,16 @@ import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts
 import {
   capturedWaitEvents,
   capturePopupMetadata,
+  readPerceptionSignal,
   runWithWait,
+  type InternalWaitSpec,
   type WaitEvents,
   type WaitResult,
 } from "./wait-engine.js";
 import { reserveUniqueDownloadFile, resolveControlledUploadFile } from "./temp-files.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
 import { enterExactText, type InputStrategy } from "./react-input.js";
-import { collectLiveSnapshot, describeLiveRef } from "./live-snapshot.js";
+import { describeLiveRef } from "./live-snapshot.js";
 import { ensureTrustedInputDeliverable } from "./window-visibility.js";
 import { confirmationTokens, type ConfirmationScope } from "./confirmation-tokens.js";
 import { redactSensitive } from "./redaction.js";
@@ -232,7 +234,8 @@ const DEFAULT_FIND_LIMIT = 3;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
 const MAX_ERROR_CONTEXT_LENGTH = 500;
 const CLICK_SETTLE_MS = 100;
-const PRESS_SETTLE_MS = 750;
+const SETTLE_TIMEOUT_MS = 750;
+const POPUP_SETTLE_MS = 250;
 
 function waitIncludes(wait: WaitSpec | undefined, kind: WaitSpec["conditions"][number]["kind"]): boolean {
   return Boolean(wait?.conditions.some((condition) => condition.kind === kind));
@@ -800,7 +803,7 @@ async function coordinateSpaceOnly(
     scrollX,
     scrollY,
   }));
-  const viewport = page.viewportSize() ?? { width: info.innerWidth, height: info.innerHeight };
+  const viewport = { width: info.innerWidth, height: info.innerHeight };
   return protocolVersion === 2
     ? {
         unit: "css-px",
@@ -819,36 +822,36 @@ async function coordinateSpaceOnly(
 
 interface PageSignal {
   url: string;
-  snapshot: string;
-  dialogs: string[];
+  epoch: string;
+  mainEpoch: number;
+  dialogs: number;
   ariaExpanded: string[];
-  dom: string;
   focus: string;
   values: string[];
   truncated: boolean;
 }
 
-async function pageSignal(page: Page): Promise<PageSignal> {
-  const live = await collectLiveSnapshot(page);
+async function pageSignal(page: Page, refs: string[] = []): Promise<PageSignal> {
+  const signal = await readPerceptionSignal(page, refs);
   return {
     url: page.url(),
-    snapshot: JSON.stringify(live.frameSignals.map(({ frameId, url, dom }) => ({ frameId, url, dom }))).slice(0, 12_000),
-    dialogs: live.dialogs,
-    ariaExpanded: Object.entries(live.refs).filter(([, value]) => value.states.expanded !== "").map(([ref, value]) => `${ref}:${value.states.expanded}`),
-    dom: JSON.stringify(live.frameSignals).slice(0, 24_000),
-    focus: live.frameSignals.map((frame) => `${frame.frameId}:${frame.focus}`).join("|").slice(0, 2_000),
-    values: Object.entries(live.refs).map(([ref, value]) => `${ref}:${value.value}`).slice(0, 2_000),
-    truncated: live.truncated,
+    epoch: signal.epoch,
+    mainEpoch: signal.mainEpoch,
+    dialogs: signal.dialogs,
+    ariaExpanded: signal.values.map((value) => `${value.ref}:${value.expanded}`),
+    focus: signal.activeRef ?? "",
+    values: signal.values.map((value) => `${value.ref}:${value.value}`),
+    truncated: false,
   };
 }
 
 function compareSignals(before: PageSignal, after: PageSignal): AttemptChange {
   const change = {
     url: before.url !== after.url,
-    snapshot: before.snapshot !== after.snapshot,
-    dialog: JSON.stringify(before.dialogs) !== JSON.stringify(after.dialogs),
+    snapshot: before.epoch !== after.epoch,
+    dialog: before.dialogs !== after.dialogs,
     ariaExpanded: JSON.stringify(before.ariaExpanded) !== JSON.stringify(after.ariaExpanded),
-    dom: before.dom !== after.dom,
+    dom: before.epoch !== after.epoch,
     focus: before.focus !== after.focus,
     value: JSON.stringify(before.values) !== JSON.stringify(after.values),
     coverageTruncated: before.truncated || after.truncated,
@@ -958,6 +961,14 @@ export async function executeInteractiveAction(
     action: action.kind,
     page: request.page,
   };
+  let finalPerception: PagePerception | undefined;
+  const applyCurrentPerception = (
+    perception: PagePerception,
+    includeElements = true
+  ) => {
+    finalPerception = perception;
+    applyPerception(result, perception, request, includeElements);
+  };
   const sensitiveValues: string[] = [];
 
   // Connected browsers run without Playwright's --disable-backgrounding-occluded-windows
@@ -978,45 +989,26 @@ export async function executeInteractiveAction(
     pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
   };
 
-  const validateDecisionRefs = async (refs: Array<string | undefined>) => {
+  const validateDecisionRefs = async (
+    refs: Array<string | undefined>,
+    coverFrameNavigationRace = false
+  ) => {
     if (protocolVersion !== 2) return;
     const previousLatestStateId = getLatestStateId(page);
-    // Revalidate against the same scoped collection that produced the refs:
-    // on heavy pages an unscoped default-budget walk never reaches mid-page
-    // elements, so refs from a scoped observe would always read as stale.
-    const sourceStateId = ("fromState" in action ? action.fromState : undefined) ?? previousLatestStateId;
-    const sourceScope = sourceStateId ? getRecordedState(page, sourceStateId)?.scope : undefined;
-    let latest: PagePerception;
-    try {
-      latest = await perceive(page, sourceScope ? { scope: sourceScope } : {}, false);
-    } catch (error) {
-      // The scope root itself is gone or ambiguous now; fall back to the
-      // unscoped walk so the per-ref check reports staleness normally.
-      if (
-        sourceScope &&
-        error instanceof AgentProtocolError &&
-        (error.code === "TARGET_MISSING" || error.code === "AMBIGUOUS_TARGET")
-      ) {
-        latest = await perceive(page, {}, false);
-      } else throw error;
-    }
-    try {
-      for (const ref of refs) {
-        result.warnings = [
-          ...(result.warnings ?? []),
-          ...validateObservedDecision(
-            page,
-            request.page,
-            action,
-            ref,
-            latest,
-            previousLatestStateId,
-            request.verbose === true
-          ),
-        ];
-      }
-    } finally {
-      discardValidationState(page, latest.stateId, previousLatestStateId);
+    const validate = () => validateObservedDecisionTargeted(
+        page,
+        request.page,
+        action,
+        refs,
+        previousLatestStateId,
+        request.verbose === true
+      );
+    result.warnings = [...(result.warnings ?? []), ...(await validate())];
+    if (coverFrameNavigationRace && refs.some((ref) => Boolean(ref && /^F\d+:/.test(ref)))) {
+      await page.mainFrame().evaluate(() => new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve())
+      ));
+      result.warnings = [...(result.warnings ?? []), ...(await validate())];
     }
   };
 
@@ -1040,17 +1032,15 @@ export async function executeInteractiveAction(
           }
         );
         result.waitResult = waited.waitResult;
-        applyPerception(result, waited.state, request);
+        applyCurrentPerception(waited.state);
       } else {
         await authorizeTrustedMutation();
         await page.goto(action.url, {
           timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
           waitUntil: "domcontentloaded",
         });
-        applyPerception(
-          result,
-          await perceive(page, { delta: true }, protocolVersion === 1),
-          request
+        applyCurrentPerception(
+          await perceive(page, { delta: true }, protocolVersion === 1)
         );
       }
       break;
@@ -1087,10 +1077,10 @@ export async function executeInteractiveAction(
           );
           result.waitResult = waited.waitResult;
           sideEffects = boundedWaitEvents(waited.waitResult.events);
-          applyPerception(result, waited.state, request);
+          applyCurrentPerception(waited.state);
         } else {
           await dispatch();
-          applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), request);
+          applyCurrentPerception(await perceive(page, { delta: true }, protocolVersion === 1));
         }
       } catch (error) {
         const typed = pageAwareTrustedInputError(error, page, request.page);
@@ -1197,7 +1187,7 @@ export async function executeInteractiveAction(
           );
           result.waitResult = waited.waitResult;
           sideEffects = boundedWaitEvents(waited.waitResult.events);
-          applyPerception(result, waited.state, request);
+          applyCurrentPerception(waited.state);
         } else await dispatch();
         result.uploaded = {
           ref: action.ref,
@@ -1233,7 +1223,7 @@ export async function executeInteractiveAction(
         await resolved?.cleanup();
       }
       if (!result.stateId)
-        applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), request);
+        applyCurrentPerception(await perceive(page, { delta: true }, protocolVersion === 1));
       break;
     }
 
@@ -1260,7 +1250,7 @@ export async function executeInteractiveAction(
         },
         false
       );
-      applyPerception(result, perception, request);
+      applyCurrentPerception(perception);
       break;
     }
 
@@ -1296,7 +1286,7 @@ export async function executeInteractiveAction(
         { maxNodes: action.limit ?? DEFAULT_READ_LIMIT, depth: action.depth },
         protocolVersion === 1
       );
-      applyPerception(result, perception, request);
+      applyCurrentPerception(perception);
       break;
     }
 
@@ -1353,7 +1343,7 @@ export async function executeInteractiveAction(
             perception = await perceive(page, {}, protocolVersion === 1);
           } else throw error;
         }
-        applyPerception(result, perception, request, protocolVersion === 1);
+        applyCurrentPerception(perception, protocolVersion === 1);
         // Match against the full collected record set, not the display-budgeted
         // tree selection: the tree budget bounds payload size, and letting it
         // bound matching makes find silently blind to mid-page elements on
@@ -1452,7 +1442,7 @@ export async function executeInteractiveAction(
         exhausted,
         positions,
       };
-      applyPerception(result, lastPerception!, request, protocolVersion === 1);
+      applyCurrentPerception(lastPerception!, protocolVersion === 1);
       applyFindMatches(result, targeted!, findLimit, request);
       break;
     }
@@ -1465,14 +1455,38 @@ export async function executeInteractiveAction(
       if (action.expectText) {
         await requireExpectedText(page, action.expectText);
       }
-      const before = await pageSignal(page);
+      const signalRefs = "ref" in action ? [action.ref] : [];
+      const decisionStateId = ("fromState" in action ? action.fromState : undefined) ?? getLatestStateId(page);
+      const decisionState = decisionStateId ? getRecordedState(page, decisionStateId) : undefined;
+      const decisionScope = decisionState?.scope;
+      const decisionFingerprint = "ref" in action
+        ? decisionState?.elements.get(action.ref)
+        : undefined;
+      const canReuseUnchangedPerception = (() => {
+        if (!decisionFingerprint) return false;
+        try {
+          const semantic = JSON.parse(decisionFingerprint) as {
+            role?: string;
+            checked?: boolean | "mixed" | null;
+            selected?: boolean | null;
+          };
+          return (
+            (semantic.role === "button" || semantic.role === "link") &&
+            semantic.checked == null &&
+            semantic.selected == null
+          );
+        } catch {
+          return false;
+        }
+      })();
+      const before = await pageSignal(page, signalRefs);
       const revalidateClick = async () => {
         await validateDecisionRefs(["ref" in action ? action.ref : undefined]);
       };
       let confirmationConsumed = false;
       const prepareClickInput = async (resolved?: ResolvedActionTarget) => {
         await hooks.beforeTrustedInput?.();
-        await revalidateClick();
+        await validateDecisionRefs(signalRefs, true);
         pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
         if (action.confirmToken && !confirmationConsumed) {
           if (!resolved || !action.fromState)
@@ -1487,8 +1501,8 @@ export async function executeInteractiveAction(
       let clickFrameContext: AttemptJournalEntry["frameContext"] = attemptFrameContext("ref" in action ? action.ref : null);
       const clickOnce = async () => {
         if ("ref" in action) {
-          // Validate the observed decision before resolving the live element.
-          // The validation is repeated immediately before trusted input below.
+          // Reject semantic staleness before resolution can scroll the page;
+          // authorize again immediately before trusted input to cover races.
           await revalidateClick();
           const resolved = await resolveRef(page, action.ref, {
             pageName: request.page,
@@ -1579,16 +1593,19 @@ export async function executeInteractiveAction(
         page.on("popup", onOuterPopup);
         const finishOuterPopupCapture = () => page.off("popup", onOuterPopup);
         try {
-          attemptBefore = await pageSignal(page);
-          const monitoringWait: WaitSpec = wait ?? {
+          const monitoringWait: InternalWaitSpec = wait ?? {
             mode: "all",
-            timeoutMs: PRESS_SETTLE_MS,
-            conditions: [{ kind: "networkIdle", specialized: true, idleMs: 700 }],
+            timeoutMs: SETTLE_TIMEOUT_MS,
+            conditions: [{ kind: "settled", minSettleMs: 50, maxSettleMs: 700 }],
           };
           const waited = await runWithWait(
             page,
             {
-              collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              collect: () => perceive(page, {
+                delta: true,
+                ...(decisionScope ? { scope: decisionScope } : {}),
+                ...(canReuseUnchangedPerception ? { reuseIfEpoch: before.mainEpoch } : {}),
+              }, protocolVersion === 1),
               protocolVersion,
               onPopup: (popup) => openedPopups.push(popup),
               onDownload: (download) => startedDownloads.push(download),
@@ -1599,14 +1616,14 @@ export async function executeInteractiveAction(
           if (wait && !waitIncludes(wait, "popup") && !openedPopups[0])
             await Promise.race([
               outerPopupArrived,
-              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+              new Promise<void>((resolve) => setTimeout(resolve, POPUP_SETTLE_MS)),
             ]);
           finishOuterPopupCapture();
           if (openedPopups[0] && waited.waitResult.events.popup.length === 0)
             waited.waitResult.events.popup.push(
               await capturePopupMetadata(openedPopups[0], page.url())
             );
-          after = await pageSignal(page);
+          after = await pageSignal(page, signalRefs);
           const successfulChange = compareSignals(attemptBefore, after);
           addFrameSignalEvidence(waited.waitResult.events, successfulChange, clickFrameContext);
           recordAttempt(journal, {
@@ -1631,13 +1648,13 @@ export async function executeInteractiveAction(
             ), journal);
           }
           result.waitResult = wait ? waited.waitResult : undefined;
-          applyPerception(result, waited.state, request);
+          applyCurrentPerception(waited.state);
           break;
         } catch (error) {
           if (wait && !waitIncludes(wait, "popup") && !openedPopups[0])
             await Promise.race([
               outerPopupArrived,
-              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+              new Promise<void>((resolve) => setTimeout(resolve, POPUP_SETTLE_MS)),
             ]);
           finishOuterPopupCapture();
           const captured = capturedWaitEvents(error) ??
@@ -1648,9 +1665,7 @@ export async function executeInteractiveAction(
             captured
           );
           const typedError = attemptError(error, page);
-          if (typedError.code === "WAIT_TIMEOUT")
-            await new Promise<void>((resolve) => setTimeout(resolve, 150));
-          after = await pageSignal(page).catch(() => attemptBefore);
+          after = await pageSignal(page, signalRefs).catch(() => attemptBefore);
           const change = compareSignals(attemptBefore, after);
           addFrameSignalEvidence(sideEffects, change, clickFrameContext);
           if (wait && !waitIncludes(wait, "popup") && sideEffects.popup[0] && openedPopups[0]) {
@@ -1729,10 +1744,8 @@ export async function executeInteractiveAction(
       result.waitForText = action.waitForText ?? null;
       result.waitSatisfied = action.waitForText ? true : null;
       if (!result.stateId)
-        applyPerception(
-          result,
-          await perceive(page, { delta: true }, protocolVersion === 1),
-          request
+        applyCurrentPerception(
+          await perceive(page, { delta: true }, protocolVersion === 1)
         );
       if (startedDownloads[0])
         result.download = await saveDownload(startedDownloads[0], "click", request.page, journal);
@@ -1759,6 +1772,16 @@ export async function executeInteractiveAction(
 
     case "type": {
       const journal: AttemptJournalEntry[] = [];
+      const typeStateId = action.fromState ?? getLatestStateId(page) ?? undefined;
+      const typeState = typeStateId ? getRecordedState(page, typeStateId) : undefined;
+      const typeReuseEpoch = action.ref && typeState?.elements.has(action.ref)
+        ? (await readPerceptionSignal(page, [action.ref])).mainEpoch
+        : undefined;
+      const typePerceptionOptions: CollectPageStateOptions = {
+        delta: true,
+        ...(typeState?.scope ? { scope: typeState.scope } : {}),
+        ...(typeReuseEpoch !== undefined ? { reuseIfEpoch: typeReuseEpoch } : {}),
+      };
       let resolvedTypeTarget: ResolvedActionTarget | undefined;
       let typeConfirmationConsumed = false;
       let inputStrategy: InputStrategy | undefined;
@@ -1784,7 +1807,7 @@ export async function executeInteractiveAction(
         const startedAt = new Date().toISOString();
         try {
           await hooks.beforeTrustedInput?.();
-          await validateDecisionRefs([action.ref]);
+          await validateDecisionRefs([action.ref], true);
           pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
           if (action.confirmToken && !typeConfirmationConsumed) {
             if (!resolvedTypeTarget || !action.fromState)
@@ -1870,12 +1893,12 @@ export async function executeInteractiveAction(
       if (action.wait) {
         const waited = await runWithWait(
           page,
-          { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
+          { collect: () => perceive(page, typePerceptionOptions, protocolVersion === 1), protocolVersion },
           action.wait,
           dispatchType
         );
         result.waitResult = waited.waitResult;
-        applyPerception(result, waited.state, request);
+        applyCurrentPerception(waited.state);
       } else await dispatchType();
       const typeTarget = resolvedTypeTarget
         ? actionTargetMetadata(resolvedTypeTarget, "keyboard")
@@ -1890,10 +1913,8 @@ export async function executeInteractiveAction(
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)
-        applyPerception(
-          result,
-          await perceive(page, { delta: true }, protocolVersion === 1),
-          request
+        applyCurrentPerception(
+          await perceive(page, typePerceptionOptions, protocolVersion === 1)
         );
       break;
     }
@@ -1915,6 +1936,25 @@ export async function executeInteractiveAction(
           : action.kind === "scroll"
             ? [action.ref]
             : [action.ref];
+      const primitiveStateId = ("fromState" in action ? action.fromState : undefined) ?? getLatestStateId(page);
+      const primitiveState = primitiveStateId ? getRecordedState(page, primitiveStateId) : undefined;
+      const primitiveScope = primitiveState?.scope;
+      const primitiveCanReuse =
+        action.kind === "press" &&
+        primitiveRefs.every((ref) => {
+          if (!ref) return false;
+          const fingerprint = primitiveState?.elements.get(ref);
+          if (!fingerprint) return false;
+          try {
+            const semantic = JSON.parse(fingerprint) as { role?: string };
+            return semantic.role === "button" || semantic.role === "link";
+          } catch {
+            return false;
+          }
+        });
+      const primitiveReuseEpoch = primitiveCanReuse
+        ? (await readPerceptionSignal(page, primitiveRefs.filter((ref): ref is string => Boolean(ref)))).mainEpoch
+        : undefined;
       let primitiveConfirmationConsumed = false;
       const dispatch = async () => {
         await validateDecisionRefs(primitiveRefs);
@@ -1955,7 +1995,7 @@ export async function executeInteractiveAction(
           },
           authorize: async (refs, targets) => {
             await hooks.beforeTrustedInput?.();
-            await validateDecisionRefs(refs.length > 0 ? refs : [undefined]);
+            await validateDecisionRefs(refs.length > 0 ? refs : [undefined], true);
             pageLeases.assertMutationAllowed(request.browser, request.page, request.session);
             if (action.confirmToken && !primitiveConfirmationConsumed) {
               if (!targets[0] || !action.fromState)
@@ -1969,9 +2009,9 @@ export async function executeInteractiveAction(
         });
       };
       let summary: PrimitiveSummary;
-      const primitiveWait: WaitSpec | undefined = action.wait ??
+      const primitiveWait: InternalWaitSpec | undefined = action.wait ??
         (action.kind === "press"
-          ? { mode: "all", timeoutMs: PRESS_SETTLE_MS, conditions: [{ kind: "networkIdle", specialized: true, idleMs: 700 }] }
+          ? { mode: "all", timeoutMs: SETTLE_TIMEOUT_MS, conditions: [{ kind: "settled", minSettleMs: 50, maxSettleMs: 700 }] }
           : undefined);
       let resolveOuterPrimitivePopup: (() => void) | undefined;
       const outerPrimitivePopupArrived = new Promise<void>((resolve) => {
@@ -1991,7 +2031,13 @@ export async function executeInteractiveAction(
           const waited = await runWithWait(
             page,
             {
-              collect: () => perceive(page, { delta: true }, protocolVersion === 1),
+              collect: () => perceive(page, {
+                delta: true,
+                ...(primitiveScope ? { scope: primitiveScope } : {}),
+                ...(primitiveReuseEpoch !== undefined
+                  ? { reuseIfEpoch: primitiveReuseEpoch }
+                  : {}),
+              }, protocolVersion === 1),
               protocolVersion,
               onPopup: (popup) => openedPopups.push(popup),
               onDownload: (download) => startedDownloads.push(download),
@@ -2004,7 +2050,7 @@ export async function executeInteractiveAction(
           if (action.wait && !waitIncludes(action.wait, "popup") && !openedPopups[0])
             await Promise.race([
               outerPrimitivePopupArrived,
-              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+              new Promise<void>((resolve) => setTimeout(resolve, POPUP_SETTLE_MS)),
             ]);
           finishOuterPrimitivePopupCapture();
           if (openedPopups[0] && waited.waitResult.events.popup.length === 0)
@@ -2030,12 +2076,12 @@ export async function executeInteractiveAction(
             );
           }
           result.waitResult = action.wait ? waited.waitResult : undefined;
-          applyPerception(result, waited.state, request);
+          applyCurrentPerception(waited.state);
         } catch (error) {
           if (action.wait && !waitIncludes(action.wait, "popup") && !openedPopups[0])
             await Promise.race([
               outerPrimitivePopupArrived,
-              new Promise<void>((resolve) => setTimeout(resolve, PRESS_SETTLE_MS)),
+              new Promise<void>((resolve) => setTimeout(resolve, POPUP_SETTLE_MS)),
             ]);
           finishOuterPrimitivePopupCapture();
           const journal = dispatched?.attemptJournal;
@@ -2095,10 +2141,8 @@ export async function executeInteractiveAction(
           throw withAttemptJournal(attemptError(error, page), journal);
         }
       if (!result.stateId)
-        applyPerception(
-          result,
-          await perceive(page, { delta: true }, protocolVersion === 1),
-          request
+        applyCurrentPerception(
+          await perceive(page, { delta: true }, protocolVersion === 1)
         );
       break;
     }
@@ -2110,7 +2154,7 @@ export async function executeInteractiveAction(
         await validateDecisionRefs([action.ref]);
         const text = await requireExpectedText(page, action.expectText);
         const perception = await perceive(page, {}, false);
-        applyPerception(result, perception, request);
+        applyCurrentPerception(perception);
         const resolved = await resolveRef(page, action.ref, {
           pageName: request.page, timeoutMs: request.timeoutMs, scroll: false,
           hitTest: false, applicability: "pointer", legacyRefs: false,
@@ -2146,21 +2190,8 @@ export async function executeInteractiveAction(
 
   result.url = page.url();
   result.title = await page.title();
-  if (!result.coordinateSpace) {
-    if (action.kind === "text" || action.kind === "assert") {
-      // These actions already resolved their own scoped content above; avoid
-      // re-collecting the full unscoped tree/elements just to populate
-      // coordinateSpace (see coordinateSpaceOnly's doc comment).
-      result.coordinateSpace = await coordinateSpaceOnly(page, protocolVersion);
-    } else {
-      applyPerception(
-        result,
-        await perceive(page, {}, protocolVersion === 1),
-        request,
-        action.kind !== "find" || protocolVersion === 1
-      );
-    }
-  }
+  if (!result.coordinateSpace)
+    result.coordinateSpace = await coordinateSpaceOnly(page, protocolVersion);
 
   if (request.shot || request.annotate || action.kind === "shot") {
     const name =
@@ -2181,7 +2212,11 @@ export async function executeInteractiveAction(
         await resolved.cleanup();
       }
     }
-    const visualPerception = await perceive(page, { full: request.fullPage }, false);
+    const visualPerception =
+      !request.fullPage && finalPerception
+        ? finalPerception
+        : await perceive(page, { full: request.fullPage }, false);
+    finalPerception = visualPerception;
     const focusElement =
       action.kind === "shot" && action.ref
         ? visualPerception.elements.find((element) => element.ref === focusedShotTarget?.actualRef)

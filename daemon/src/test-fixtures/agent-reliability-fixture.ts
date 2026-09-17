@@ -373,6 +373,14 @@ export async function startAgentReliabilityFixture(): Promise<AgentReliabilityFi
       response.end(JSON.stringify({ status: "accepted" }));
       return;
     }
+    if (requestUrl.pathname === "/api/slow") {
+      const delay = Math.min(2_000, Math.max(0, Number(requestUrl.searchParams.get("ms")) || 400));
+      setTimeout(() => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "slow-complete", delay }));
+      }, delay);
+      return;
+    }
     if (requestUrl.pathname === "/api/failure") {
       request.socket.destroy();
       return;

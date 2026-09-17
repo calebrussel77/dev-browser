@@ -72,11 +72,14 @@ describe.sequential("scoped frame and shadow waits", () => {
       async () => {}
     )).rejects.toMatchObject({
       code: "WAIT_TIMEOUT",
-      details: { observations: [expect.objectContaining({ coverage: "truncated" }), expect.objectContaining({ coverage: "truncated" })] },
+      details: { observations: [
+        expect.objectContaining({ coverage: "complete", passed: false }),
+        expect.objectContaining({ coverage: "complete", passed: false }),
+      ] },
     });
   }, 60_000);
 
-  it("keeps truncated ref-transition baselines and text/surface absence unknown", async () => {
+  it("reads tracked refs and surface text independently of traversal budgets", async () => {
     await page.setContent('<input data-testid="target" value="before"><p id="needle">needle beyond cap</p>');
     const observed = await collectPageState(page, { full: true });
     const ref = observed.elements.find((element) => element.stableAttributes.testId === "target")!.ref;
@@ -85,7 +88,7 @@ describe.sequential("scoped frame and shadow waits", () => {
       for (let index = 0; index < 1_100; index += 1) fragment.append(document.createElement("div"));
       document.body.prepend(fragment);
     });
-    await expect(runWithWait(page, { collect: async () => null, protocolVersion: 2 }, {
+    const changed = await runWithWait(page, { collect: async () => null, protocolVersion: 2 }, {
       mode: "any", timeoutMs: 100, conditions: [
         { kind: "ref", ref, state: "valueChanged", expected: "after" },
         { kind: "text", state: "hidden", scope: "body", match: "contains", value: "needle beyond cap" },
@@ -95,17 +98,28 @@ describe.sequential("scoped frame and shadow waits", () => {
         document.querySelectorAll("body > div").forEach((element) => element.remove());
         document.querySelector<HTMLInputElement>('[data-testid="target"]')!.value = "after";
       });
-    })).rejects.toMatchObject({ code: "WAIT_TIMEOUT", details: { observations: expect.arrayContaining([expect.objectContaining({ coverage: "truncated", passed: false })]) } });
+    });
+    expect(changed.waitResult.passed).toEqual([
+      expect.objectContaining({ kind: "ref", ref, state: "valueChanged" }),
+    ]);
+    expect(changed.waitResult.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ condition: expect.objectContaining({ kind: "text" }), coverage: "complete", passed: false }),
+    ]));
 
     await page.setContent(`${Array.from({ length: 1_100 }, () => "<div></div>").join("")}<p>surface cap</p>`);
-    await expect(runWithWait(page, { collect: async () => null, protocolVersion: 2 }, {
+    const surfaces = await runWithWait(page, { collect: async () => null, protocolVersion: 2 }, {
       mode: "any", timeoutMs: 80, conditions: [
         { kind: "dialog", state: "opened" },
         { kind: "toast", state: "opened" },
       ],
     }, async () => {
       await page.evaluate(() => { document.querySelectorAll("div").forEach((element) => element.remove()); document.body.insertAdjacentHTML("beforeend", '<dialog open>opened</dialog><div role="alert">toast</div>'); });
-    })).rejects.toMatchObject({ code: "WAIT_TIMEOUT", details: { observations: [expect.objectContaining({ coverage: "truncated" }), expect.objectContaining({ coverage: "truncated" })] } });
+    });
+    expect(surfaces.waitResult.passed).toHaveLength(2);
+    expect(surfaces.waitResult.observations).toEqual([
+      expect.objectContaining({ coverage: "complete", passed: true }),
+      expect.objectContaining({ coverage: "complete", passed: true }),
+    ]);
   });
 
   it("collects bounded nested dialog and toast text across top, frame, and shadow realms", async () => {
@@ -128,7 +142,10 @@ describe.sequential("scoped frame and shadow waits", () => {
     await page.setContent('<dialog open id="huge"></dialog>');
     await page.locator("#huge").evaluate((surface) => { for (let index = 0; index < 1_100; index += 1) { const span = document.createElement("span"); span.textContent = index === 1_099 ? "Saved beyond surface cap" : "filler"; surface.append(span); } });
     await collectPageState(page, { full: true });
-    await expect(runWithWait(page, { collect: async () => null, protocolVersion: 2 }, { mode: "all", timeoutMs: 80, conditions: [{ kind: "text", state: "visible", scope: "dialog", match: "contains", value: "Saved beyond surface cap" }] }, async () => {})).rejects.toMatchObject({ code: "WAIT_TIMEOUT", details: { observations: [expect.objectContaining({ coverage: "truncated", passed: false })] } });
+    const deepSurface = await runWithWait(page, { collect: async () => null, protocolVersion: 2 }, { mode: "all", timeoutMs: 80, conditions: [{ kind: "text", state: "visible", scope: "dialog", match: "contains", value: "Saved beyond surface cap" }] }, async () => {});
+    expect(deepSurface.waitResult.observations).toEqual([
+      expect.objectContaining({ coverage: "complete", passed: true }),
+    ]);
   });
 
   it("marks global surface slicing across top and frames as truncated before absence checks", async () => {

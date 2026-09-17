@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BrowserManager } from "../browser-manager.js";
 import { executeInteractiveAction } from "../interactive-actions.js";
@@ -62,6 +62,106 @@ describe.sequential("trusted interaction primitives", () => {
     expect(pasted.pasted).toEqual({ ref: latest.ref, characters: secret.length, redacted: true });
     expect(pasted.attemptJournal).toHaveLength(2);
     expect(JSON.stringify(pasted.attemptJournal)).not.toContain(secret);
+  });
+
+  it("settles inert clicks quickly and waits for slow keyboard-triggered requests", async () => {
+    const page = await manager.getPage(browser, "main");
+    await page.setContent(`<button aria-label="Inert action">Inert action</button>`);
+    let target = await ref("Inert action");
+    const clickStarted = performance.now();
+    await executeInteractiveAction(manager, {
+      id: "primitive-fast-click",
+      type: "interactive",
+      protocolVersion: 2,
+      browser,
+      page: "main",
+      action: { kind: "click", ref: target.ref, method: "mouse", fromState: target.stateId },
+    });
+    expect(performance.now() - clickStarted).toBeLessThan(400);
+
+    await page.route("https://slow.test/api", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify({ status: "complete" }),
+      });
+    });
+    await page.setContent(`<input aria-label="Slow request"><output></output><script>
+      document.querySelector('input').addEventListener('keydown', async event => {
+        if (event.key !== 'Enter') return;
+        const response = await fetch('https://slow.test/api');
+        document.querySelector('output').textContent = (await response.json()).status;
+      });
+    </script>`);
+    target = await ref("Slow request");
+    const pressStarted = performance.now();
+    await executeInteractiveAction(manager, {
+      id: "primitive-slow-press",
+      type: "interactive",
+      protocolVersion: 2,
+      browser,
+      page: "main",
+      action: { kind: "press", ref: target.ref, key: "Enter", fromState: target.stateId },
+    });
+    const pressElapsed = performance.now() - pressStarted;
+    expect(pressElapsed).toBeGreaterThanOrEqual(380);
+    expect(pressElapsed).toBeLessThan(1_000);
+    expect(await page.locator("output").textContent()).toBe("complete");
+    await page.unroute("https://slow.test/api");
+  });
+
+  it("performs at most one full realm collection for click, click with shot, and type", async () => {
+    const page = await manager.getPage(browser, "main");
+    const frame = page.mainFrame();
+    const evaluate = frame.evaluate.bind(frame) as (...args: any[]) => Promise<any>;
+    let collections = 0;
+    const evaluateSpy = vi.spyOn(frame, "evaluate").mockImplementation(((...args: any[]) => {
+      if (typeof args[0] === "function" && args[0].name === "collectRealm") collections += 1;
+      return evaluate(...args);
+    }) as typeof frame.evaluate);
+    const compact = (action: Parameters<typeof executeInteractiveAction>[1]["action"], shot?: string) =>
+      executeInteractiveAction(manager, {
+        id: `single-collection-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        browser,
+        page: "main",
+        ...(shot ? { shot } : {}),
+        action,
+      });
+    try {
+      await page.setContent(`<button aria-label="Single collection click">Click</button>`);
+      let target = await ref("Single collection click");
+      collections = 0;
+      await compact({ kind: "click", ref: target.ref, method: "mouse", fromState: target.stateId });
+      expect(collections).toBeLessThanOrEqual(1);
+
+      target = await ref("Single collection click");
+      collections = 0;
+      const shot = await compact(
+        { kind: "click", ref: target.ref, method: "mouse", fromState: target.stateId },
+        `primitive-tests/single-collection-${Date.now()}.png`
+      );
+      expect(collections).toBeLessThanOrEqual(1);
+      await rm(shot.screenshotPath!, { force: true });
+
+      await page.setContent(`<input aria-label="Single collection type">`);
+      target = await ref("Single collection type");
+      collections = 0;
+      await compact({
+        kind: "type",
+        ref: target.ref,
+        text: "one perception",
+        clear: true,
+        delayMs: 0,
+        fromState: target.stateId,
+      });
+      expect(collections).toBeLessThanOrEqual(1);
+    } finally {
+      evaluateSpy.mockRestore();
+    }
   });
 
   it("rejects paste artifacts defensively without exposing or persisting plaintext", async () => {

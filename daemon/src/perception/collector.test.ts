@@ -104,6 +104,55 @@ describe.sequential("unified page perception", () => {
     expect(await page.locator("[data-dev-browser-ref]").count()).toBe(0);
   });
 
+  it("reuses an unchanged perception without walking layout and issues a new state id", async () => {
+    await page.setContent(`<main><button>Cached action</button></main>`);
+    await page.evaluate(() => {
+      const realm = window as Window & {
+        __rectReads?: number;
+        __originalRect?: typeof Element.prototype.getBoundingClientRect;
+      };
+      realm.__rectReads = 0;
+      realm.__originalRect = Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect = function (...args) {
+        realm.__rectReads = (realm.__rectReads ?? 0) + 1;
+        return realm.__originalRect!.apply(this, args);
+      };
+    });
+    try {
+      const first = await collectPageState(page, { track: "reuse" });
+      const epoch = await page.evaluate(() =>
+        (window as Window & {
+          __devBrowserPerceptionState?: { mutationEpoch: number };
+        }).__devBrowserPerceptionState!.mutationEpoch
+      );
+      await page.evaluate(() => {
+        (window as Window & { __rectReads?: number }).__rectReads = 0;
+      });
+
+      const reused = await collectPageState(page, {
+        track: "reuse",
+        delta: true,
+        reuseIfEpoch: epoch,
+      });
+
+      expect(reused.stateId).not.toBe(first.stateId);
+      expect(reused.tree).toBe(first.tree);
+      expect(reused.delta?.summary).toBe("no observable changes");
+      expect(await page.evaluate(() =>
+        (window as Window & { __rectReads?: number }).__rectReads
+      )).toBe(0);
+    } finally {
+      await page.evaluate(() => {
+        const realm = window as Window & {
+          __originalRect?: typeof Element.prototype.getBoundingClientRect;
+        };
+        if (realm.__originalRect)
+          Element.prototype.getBoundingClientRect = realm.__originalRect;
+        delete realm.__originalRect;
+      });
+    }
+  });
+
   it("reports focus, safe control state, context, and CSS scroll coordinates", async () => {
     await page.setContent(`
       <main><section><h2>Profile</h2><label for="name">Display name</label>

@@ -19,6 +19,7 @@ export interface CollectPageStateOptions {
   legacyRefs?: boolean;
   scope?: { ref?: string; within?: string };
   textOnly?: boolean;
+  reuseIfEpoch?: number;
 }
 
 export interface PerceptionElement {
@@ -156,6 +157,10 @@ const MAX_RECORDS_PER_OBSERVATION = 2_000;
 // LinkedIn-sized documents and silently hid late-DOM content (overflow menus)
 // from find, which then honestly — but uselessly — reported budget-exhausted.
 const MAX_WORK_PER_FRAME = 20_000;
+const perceptionCache = new WeakMap<
+  Page,
+  Map<string, { realmToken: string; mutationEpoch: number; perception: PagePerception }>
+>();
 
 function bounded(value: number | undefined, fallback: number, maximum: number): number {
   return Math.max(1, Math.min(maximum, Math.trunc(value ?? fallback)));
@@ -643,6 +648,91 @@ export async function collectPageState(
           ...(options.scope.within ? { within: options.scope.within } : {}),
         }
       : undefined;
+  const cacheKey = JSON.stringify({
+    full,
+    maxDepth,
+    breadth,
+    maxChars,
+    maxNodes: bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000),
+    scope: scope ?? null,
+    textOnly: options.textOnly ?? false,
+  });
+  if (options.reuseIfEpoch !== undefined && !options.continuation) {
+    const cached = perceptionCache.get(page)?.get(cacheKey);
+    if (cached && cached.mutationEpoch === options.reuseIfEpoch) {
+      const signal = await page.mainFrame().evaluate(() => {
+        const state = (window as Window & {
+          __devBrowserPerceptionState?: {
+            token: string;
+            mutationEpoch: number;
+            refs: WeakMap<Element, string>;
+          };
+        }).__devBrowserPerceptionState;
+        let active: Element | null = document.activeElement;
+        while (active instanceof HTMLElement && active.shadowRoot?.activeElement)
+          active = active.shadowRoot.activeElement;
+        return {
+          realmToken: state?.token ?? "",
+          mutationEpoch: state?.mutationEpoch ?? -1,
+          activeRef: active && state ? state.refs.get(active) ?? null : null,
+          url: location.href,
+          title: document.title,
+          viewport: { width: innerWidth, height: innerHeight },
+          devicePixelRatio,
+          scroll: { x: scrollX, y: scrollY },
+        };
+      });
+      if (
+        signal.realmToken === cached.realmToken &&
+        signal.mutationEpoch === options.reuseIfEpoch
+      ) {
+        const records = cached.perception.allElements.map((element) => ({
+          ...element,
+          focused: element.frameId === "F0" && element.ref === signal.activeRef,
+        }));
+        const maxNodes = bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000);
+        const built = buildCompactTree(records, maxNodes, maxChars, 0, maxDepth, breadth);
+        const history = recordPageState(page, signal.realmToken, options.track ?? "default", {
+          url: signal.url,
+          title: signal.title,
+          mutationEpoch: signal.mutationEpoch,
+          focusedRef: signal.activeRef,
+          elements: records,
+          scope,
+        }, options.delta ?? false);
+        const reused: PagePerception = {
+          ...cached.perception,
+          documentId: history.documentId,
+          stateId: history.stateId,
+          url: signal.url,
+          title: signal.title,
+          coordinateSpace: {
+            unit: "css-px",
+            viewport: signal.viewport,
+            devicePixelRatio: signal.devicePixelRatio,
+            scroll: signal.scroll,
+            screenshotScale: "css",
+          },
+          focusedRef: signal.activeRef,
+          tree: built.tree,
+          elements: built.elements,
+          allElements: records,
+          delta: history.delta,
+          truncation: {
+            truncated: built.omittedNodes > 0 || cached.perception.collection.truncated,
+            omittedNodes: built.omittedNodes + (cached.perception.collection.truncated ? 1 : 0),
+            continuation: built.omittedNodes > 0 ? encodeCursor(built.consumedNodes) : null,
+          },
+        };
+        perceptionCache.get(page)!.set(cacheKey, {
+          realmToken: signal.realmToken,
+          mutationEpoch: signal.mutationEpoch,
+          perception: reused,
+        });
+        return reused;
+      }
+    }
+  }
   // Refs arrive in scoped `F#:R#` (or bare `R#`) form; the realm registry is
   // keyed by the local `R#` part, so parse before the in-page lookup.
   let realmScope: { ref?: string; within?: string } | undefined = scope;
@@ -758,14 +848,14 @@ export async function collectPageState(
     throw new AgentProtocolError("STALE_STATE", "Invalid or expired continuation cursor", true, { nextCommands: ["dev-browser observe"] });
   const built = buildCompactTree(records, maxNodes, maxChars, offset, maxDepth, breadth);
   const history = recordPageState(page, top.realmToken, options.track ?? "default", {
-    url: top.url, title: top.title,
+    url: top.url, title: top.title, mutationEpoch: top.mutationEpoch,
     focusedRef: records.find((record) => record.focused)?.ref || null,
     elements: records,
     scope,
   }, options.delta ?? false);
   const viewport = top.viewport;
   const coordinate = await page.evaluate(() => ({ devicePixelRatio, scroll: { x: scrollX, y: scrollY } }));
-  return {
+  const perception: PagePerception = {
     documentId: history.documentId, stateId: history.stateId, url: top.url, title: top.title,
     coordinateSpace: { unit: "css-px", viewport, devicePixelRatio: coordinate.devicePixelRatio, scroll: coordinate.scroll, screenshotScale: "css" },
     focusedRef: records.find((record) => record.focused)?.ref || null,
@@ -779,4 +869,15 @@ export async function collectPageState(
         ? { text: top.text.text, truncation: { truncated: top.text.truncated, chars: top.text.text.length, maxChars } }
         : undefined,
   };
+  let pageCache = perceptionCache.get(page);
+  if (!pageCache) {
+    pageCache = new Map();
+    perceptionCache.set(page, pageCache);
+  }
+  pageCache.set(cacheKey, {
+    realmToken: top.realmToken,
+    mutationEpoch: top.mutationEpoch,
+    perception,
+  });
+  return perception;
 }
