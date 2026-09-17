@@ -228,7 +228,7 @@ const TRUSTED_INPUT_ACTION_KINDS = new Set<InteractiveRequest["action"]["kind"]>
   "upload",
 ]);
 const DEFAULT_READ_LIMIT = 100;
-const DEFAULT_FIND_LIMIT = 10;
+const DEFAULT_FIND_LIMIT = 3;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
 const MAX_ERROR_CONTEXT_LENGTH = 500;
 const CLICK_SETTLE_MS = 100;
@@ -729,6 +729,33 @@ function reportSearchCompleteness(
     "Collection hit a hard cap before covering the whole page; this empty result may be incomplete. Narrow the search with --root REF (a subtree from observe), --within, or --frame.",
   ];
   return { ...ambiguity, reason: "budget-exhausted" };
+}
+
+function compactFindMatch(match: TargetMatch, includeContext: boolean): TargetMatch {
+  const compact = {
+    ...compactElement(match),
+    score: match.score,
+    confidence: match.confidence,
+    matchedBecause: match.matchedBecause.slice(0, 3),
+    ...(includeContext ? { nearby: { context: match.nearby.context } } : {}),
+  };
+  return compact as unknown as TargetMatch;
+}
+
+function applyFindMatches(
+  result: InteractiveResult,
+  targeted: ReturnType<typeof findTargets>,
+  requestedLimit: number,
+  request: InteractiveRequest
+): void {
+  const protocolVersion = request.protocolVersion ?? 1;
+  const responseLimit = targeted.ambiguity.ambiguous ? 5 : requestedLimit;
+  const matches = targeted.matches.slice(0, responseLimit);
+  result.matches =
+    protocolVersion === 2 && request.verbose !== true
+      ? matches.map((match) => compactFindMatch(match, targeted.ambiguity.ambiguous))
+      : matches;
+  if (protocolVersion === 2 && request.verbose !== true) delete result.tree;
 }
 
 /**
@@ -1308,8 +1335,12 @@ export async function executeInteractiveAction(
         // large documents. Every targetable record is ref-registered, so
         // matches beyond the tree budget still resolve for click/type/etc.
         const candidates = perception.allElements.filter((element) => element.actionable);
-        const targeted = findTargets(candidates, findFilters, findLimit);
-        result.matches = targeted.matches;
+        const targeted = findTargets(
+          candidates,
+          findFilters,
+          protocolVersion === 2 ? Math.max(findLimit, 5) : findLimit
+        );
+        applyFindMatches(result, targeted, findLimit, request);
         result.ambiguity = reportSearchCompleteness(result, targeted.ambiguity, candidates.length, perception);
         break;
       }
@@ -1349,7 +1380,11 @@ export async function executeInteractiveAction(
             .filter((identity) => !seen.has(identity));
           for (const identity of newIdentities) seen.add(identity);
           if (initialCount === undefined) initialCount = seen.size;
-          targeted = findTargets(actionable, findFilters, findLimit);
+          targeted = findTargets(
+            actionable,
+            findFilters,
+            protocolVersion === 2 ? Math.max(findLimit, 5) : findLimit
+          );
 
           const scrollTop = await container.locator.evaluate((element) => (element as HTMLElement).scrollTop);
           positions.push(scrollTop);
@@ -1384,7 +1419,6 @@ export async function executeInteractiveAction(
       // The loop always completes at least one perception + findTargets pass
       // before any break (errors propagate before reaching here), so both
       // `targeted` and `lastPerception` are guaranteed to be assigned.
-      result.matches = targeted!.matches;
       result.ambiguity = reportSearchCompleteness(result, targeted!.ambiguity, seen.size, lastPerception!);
       result.scrollMetrics = {
         steps,
@@ -1394,6 +1428,7 @@ export async function executeInteractiveAction(
         positions,
       };
       applyPerception(result, lastPerception!, request, protocolVersion === 1);
+      applyFindMatches(result, targeted!, findLimit, request);
       break;
     }
 

@@ -397,6 +397,10 @@ describe("interactive request protocol", () => {
       action: { kind: "find", role: "button", name: "Connect", nameMode: "exact", within: "main", near: "Profile", frame: "F0", scope: "document", states: ["enabled", "collapsed"], index: 0, limit: 5 },
     }));
     expect(structured).toMatchObject({ success: true, request: { action: { kind: "find", scope: "document", states: ["enabled", "collapsed"] } } });
+    expect(parseRequest(JSON.stringify({
+      id: "default-find-limit", type: "interactive", protocolVersion: 2,
+      action: { kind: "find", query: "Connect" },
+    }))).toMatchObject({ success: true, request: { action: { limit: 3 } } });
     for (const action of [
       { kind: "find" },
       { kind: "find", nameMode: "contains" },

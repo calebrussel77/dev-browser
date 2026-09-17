@@ -300,7 +300,7 @@ const StructuredFindSchema = z
       .max(7)
       .default([]),
     index: z.number().int().nonnegative().max(999).optional(),
-    limit: z.number().int().positive().max(50).default(10),
+    limit: z.number().int().positive().max(50).default(3),
     // Scope collection to a subtree obtained from observe, so hard collection
     // caps are spent inside it instead of on the whole document. Filters
     // (within included) still apply as post-collection filters.

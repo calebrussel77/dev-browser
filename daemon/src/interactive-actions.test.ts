@@ -350,16 +350,57 @@ describe.sequential("interactive Playwright actions", () => {
     );
   });
 
-  it("returns compact v2 find matches without the full element dump", async () => {
+  it("returns at most three compact v2 find matches without a tree by default", async () => {
     const result = await executeInteractiveAction(manager, {
-      ...request({ kind: "find", query: "connect main", limit: 5 }),
+      ...request({ kind: "find", query: "connect", limit: 3 }),
       protocolVersion: 2,
     });
 
     expect(result.matches?.length).toBeGreaterThan(0);
+    expect(result.matches?.length).toBeLessThanOrEqual(3);
     expect(result.elements).toBeUndefined();
     expect(result.documentId).toMatch(/^doc-\d+$/);
-    expect(result.tree).toEqual(expect.any(String));
+    expect(result.tree).toBeUndefined();
+    for (const match of result.matches ?? []) {
+      expect(match).not.toHaveProperty("semanticAncestors");
+      expect(match).not.toHaveProperty("quad");
+      expect(match.matchedBecause.length).toBeLessThanOrEqual(3);
+    }
+  });
+
+  it("keeps the full find shape under verbose and returns five contextual ambiguous candidates", async () => {
+    const pageName = "ambiguous-find";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main>${Array.from({ length: 7 }, (_, index) =>
+      `<article><h2>Card ${index}</h2><button>Choose</button><p>Context ${index}</p></article>`
+    ).join("")}</main>`);
+
+    const compact = await executeInteractiveAction(manager, {
+      id: "ambiguous-find-compact",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "find", role: "button", name: "Choose", nameMode: "exact", scope: "document", states: [], limit: 3 },
+    });
+    expect(compact.ambiguity?.ambiguous).toBe(true);
+    expect(compact.matches).toHaveLength(5);
+    expect(compact.matches?.[0]).toMatchObject({
+      landmark: expect.any(String),
+      nearby: { context: expect.any(String) },
+    });
+
+    const verbose = await executeInteractiveAction(manager, {
+      id: "ambiguous-find-verbose",
+      type: "interactive",
+      protocolVersion: 2,
+      verbose: true,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "find", role: "button", name: "Choose", nameMode: "exact", scope: "document", states: [], limit: 3 },
+    });
+    expect(verbose.tree).toEqual(expect.any(String));
+    expect(verbose.matches?.[0]).toHaveProperty("semanticAncestors");
   });
 
   it("find reaches and can act on elements beyond the display budget", async () => {
@@ -385,8 +426,9 @@ describe.sequential("interactive Playwright actions", () => {
       action: { kind: "find", name: "Se connecter", nameMode: "exact", scope: "visible", states: [], limit: 10 },
     });
 
-    // The budgeted tree stops before the deep subtree, yet find matches it.
-    expect(found.tree).not.toContain("Se connecter");
+    // Compact find omits the budgeted tree, yet matching still covers the
+    // complete collected record set beyond that former display budget.
+    expect(found.tree).toBeUndefined();
     expect(found.matches?.[0]).toEqual(
       expect.objectContaining({ name: "Se connecter", confidence: "high" })
     );
