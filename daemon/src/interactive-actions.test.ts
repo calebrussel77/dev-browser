@@ -208,6 +208,15 @@ describe.sequential("interactive Playwright actions", () => {
       .toBeLessThan(200);
     expect(compact.elements?.[0]).not.toHaveProperty("visible");
     expect(compact.elements?.[0]).not.toHaveProperty("semanticAncestors");
+    expect(compact.tree).toBe(
+      verbose.tree
+        ?.split("\n")
+        .map((line) => {
+          const spaces = line.length - line.trimStart().length;
+          return `${" ".repeat(Math.floor(spaces / 2))}${line.trimStart()}`;
+        })
+        .join("\n")
+    );
     expect(Object.keys(verbose.elements?.[0] ?? {}).sort()).toEqual([
       "actionable", "box", "checked", "current", "depth", "description", "disabled",
       "expanded", "focused", "frameDocumentId", "frameId", "frameName", "framePath", "frameUrl",
@@ -263,6 +272,14 @@ describe.sequential("interactive Playwright actions", () => {
     ]) expect(result).not.toHaveProperty(key);
     expect(Object.keys(result.waitResult ?? {}).sort()).toEqual(["elapsedMs", "passed", "timedOut"]);
     expect(result.waitResult).toEqual(expect.objectContaining({ passed: ["dialog"], timedOut: [] }));
+    expect(result.clicked).toEqual(expect.objectContaining({
+      ref: found.matches![0]!.ref,
+      method: "mouse",
+      point: { x: expect.any(Number), y: expect.any(Number) },
+    }));
+    expect(result.clicked).not.toHaveProperty("box");
+    expect(result.clicked).not.toHaveProperty("scroll");
+    expect(result.clicked).not.toHaveProperty("actual");
   });
 
   it("preserves verbose diagnostics and rounds v2 response geometry", async () => {

@@ -336,6 +336,30 @@ function compactInteractiveResult(
   delete result.waitForText;
   delete result.waitSatisfied;
 
+  if (result.tree) {
+    result.tree = result.tree
+      .split("\n")
+      .map((line) => {
+        const spaces = line.length - line.trimStart().length;
+        return `${" ".repeat(Math.floor(spaces / 2))}${line.trimStart()}`;
+      })
+      .join("\n");
+  }
+  if (result.clicked) {
+    const clicked = result.clicked;
+    result.clicked = {
+      ref: clicked.ref,
+      method: clicked.method,
+      point: clicked.point,
+      ...(clicked.originalRef && clicked.originalRef !== clicked.ref
+        ? { originalRef: clicked.originalRef }
+        : {}),
+      ...(clicked.resolvedBy && clicked.resolvedBy !== "self"
+        ? { resolvedBy: clicked.resolvedBy, actual: clicked.actual }
+        : {}),
+    };
+  }
+
   if (result.waitResult && "passed" in result.waitResult) {
     result.waitResult = {
       elapsedMs: Math.round(result.waitResult.elapsedMs),
