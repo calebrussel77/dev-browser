@@ -518,6 +518,14 @@ const StopRequestSchema = RequestBaseSchema.extend({
   type: z.literal("stop"),
 });
 
+// A doctor-driven round trip through the real execute machinery (QuickJS
+// runtime + stdout channel + message queue), with no browser involved. `ok`
+// must mean "a script round trip just succeeded", not "the socket is up".
+const SelftestRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("selftest"),
+  token: z.string().min(1).max(200),
+});
+
 const HashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const HandshakeRequestSchema = RequestBaseSchema.extend({
   type: z.literal("handshake"),
@@ -589,6 +597,7 @@ const RequestSchema = z.union([
   RestartRequestSchema,
   SessionRequestSchema,
   TraceRequestSchema,
+  SelftestRequestSchema,
 ]);
 
 const ResponseBaseSchema = z.object({
@@ -608,6 +617,12 @@ const StderrMessageSchema = ResponseBaseSchema.extend({
 const CompleteMessageSchema = ResponseBaseSchema.extend({
   type: z.literal("complete"),
   success: z.literal(true),
+  // Execute only: how many stdout/stderr messages the daemon sent for this
+  // request. The CLI compares against what it received and turns any
+  // mismatch into a typed non-zero exit instead of a silent empty success.
+  outputCounts: z
+    .object({ stdout: z.number().int().nonnegative(), stderr: z.number().int().nonnegative() })
+    .optional(),
 });
 
 const ErrorMessageSchema = ResponseBaseSchema.extend({
@@ -638,6 +653,7 @@ export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
 export type RestartRequest = z.infer<typeof RestartRequestSchema>;
 export type TraceRequest = z.infer<typeof TraceRequestSchema>;
 export type VideoRequest = z.infer<typeof VideoRequestSchema>;
+export type SelftestRequest = z.infer<typeof SelftestRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }

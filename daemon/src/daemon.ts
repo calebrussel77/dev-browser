@@ -28,6 +28,7 @@ import {
   type HandshakeRequest,
   type InteractiveRequest,
   type RestartRequest,
+  type SelftestRequest,
   type SessionRequest,
   type TraceRequest,
   type VideoRequest,
@@ -36,6 +37,8 @@ import {
 import { videoRecordings } from "./video-recorder.js";
 import { pageLeases } from "./sessions.js";
 import { runScript } from "./sandbox/script-runner-quickjs.js";
+import { QuickJSHost } from "./sandbox/quickjs-host.js";
+import { ensureTrustedInputDeliverable } from "./window-visibility.js";
 import { ensureDevBrowserTempDir } from "./temp-files.js";
 import { redactSensitive } from "./redaction.js";
 import { traceCapabilityWarnings, traceSecretsForAction, traceStore } from "./trace-store.js";
@@ -185,63 +188,153 @@ async function prepareBrowser(request: {
   return timeoutMs;
 }
 
+/**
+ * A connected Chrome window that is fully covered by other windows freezes its
+ * renderer: evaluate-driven reads keep answering, but the page's own JS
+ * (timers, rAF, IntersectionObserver) stops, so scripts that scroll a
+ * lazy-loading feed read a plausible-looking frozen DOM. The interactive path
+ * already wakes the window before trusted input; scripts get the same wake
+ * here, as a warning rather than a failure, because a script may be read-only.
+ */
+async function wakeOccludedWindowForScript(
+  browserName: string,
+  onWarning: (message: string) => void
+): Promise<void> {
+  const entry = manager.getBrowser(browserName);
+  if (entry?.type !== "connected") return;
+  const page = entry.browser
+    .contexts()
+    .flatMap((context) => context.pages())
+    .find((candidate) => !candidate.isClosed());
+  if (!page) return;
+  try {
+    const remediation = await ensureTrustedInputDeliverable(page, "script");
+    for (const warning of remediation?.warnings ?? []) onWarning(warning);
+  } catch (error) {
+    onWarning(
+      error instanceof AgentProtocolError
+        ? error.message
+        : "The browser window appears occlusion-frozen and could not be woken; page JS (lazy loading, timers) may not run"
+    );
+  }
+}
+
 async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promise<void> {
-  await withBrowserLock(request.browser, async () => {
-    const output = createMessageQueue(socket);
+  // A killed CLI must not leave its script running blind for the rest of its
+  // timeout: it would keep driving pages and holding the browser lock with
+  // nobody listening. Abort the run the moment the submitting socket dies.
+  const clientGone = new AbortController();
+  const onSocketClosed = () => clientGone.abort();
+  socket.once("close", onSocketClosed);
 
-    try {
-      authorizeExecuteRequest(request);
-      const timeoutMs = await prepareBrowser(request);
-      await runScript(
-        request.script,
-        manager,
-        request.browser,
-        {
-          onStdout: (data) => {
-            void output.push({
-              id: request.id,
-              type: "stdout",
-              data,
-            });
+  try {
+    await withBrowserLock(request.browser, async () => {
+      const output = createMessageQueue(socket);
+      const outputCounts = { stdout: 0, stderr: 0 };
+
+      try {
+        authorizeExecuteRequest(request);
+        const timeoutMs = await prepareBrowser(request);
+        await wakeOccludedWindowForScript(request.browser, (message) => {
+          outputCounts.stderr += 1;
+          void output.push({ id: request.id, type: "stderr", data: `${message}\n` });
+        });
+        await runScript(
+          request.script,
+          manager,
+          request.browser,
+          {
+            onStdout: (data) => {
+              outputCounts.stdout += 1;
+              void output.push({
+                id: request.id,
+                type: "stdout",
+                data,
+              });
+            },
+            onStderr: (data) => {
+              outputCounts.stderr += 1;
+              void output.push({
+                id: request.id,
+                type: "stderr",
+                data,
+              });
+            },
           },
-          onStderr: (data) => {
-            void output.push({
-              id: request.id,
-              type: "stderr",
-              data,
-            });
-          },
-        },
-        {
-          timeout: timeoutMs,
+          {
+            timeout: timeoutMs,
+            signal: clientGone.signal,
+          }
+        );
+
+        await output.drain();
+        await writeMessage(socket, {
+          id: request.id,
+          type: "complete",
+          success: true,
+          outputCounts,
+        });
+      } catch (error) {
+        await output.drain().catch(() => undefined);
+        if (error instanceof AgentProtocolError) {
+          await writeMessage(socket, {
+            id: request.id,
+            type: "error",
+            message: error.message,
+            exitCode: agentErrorExitCode(error.code),
+            error: error.toAgentError(),
+          });
+          return;
         }
-      );
-
-      await output.drain();
-      await writeMessage(socket, {
-        id: request.id,
-        type: "complete",
-        success: true,
-      });
-    } catch (error) {
-      await output.drain().catch(() => undefined);
-      if (error instanceof AgentProtocolError) {
         await writeMessage(socket, {
           id: request.id,
           type: "error",
-          message: error.message,
-          exitCode: agentErrorExitCode(error.code),
-          error: error.toAgentError(),
+          message: formatError(error),
         });
-        return;
       }
-      await writeMessage(socket, {
-        id: request.id,
-        type: "error",
-        message: formatError(error),
-      });
+    });
+  } finally {
+    socket.off("close", onSocketClosed);
+  }
+}
+
+/**
+ * Doctor's proof of life: run a console round trip through the same QuickJS
+ * runtime and stdout message channel scripts use (no browser involved), so
+ * "ok" attests a working execute pipeline rather than a reachable socket.
+ */
+async function handleSelftest(socket: net.Socket, request: SelftestRequest): Promise<void> {
+  const output = createMessageQueue(socket);
+  const outputCounts = { stdout: 0, stderr: 0 };
+  try {
+    const host = await QuickJSHost.create({
+      cpuTimeoutMs: 5_000,
+      onConsole: (level, args) => {
+        const line = `${args.map(String).join(" ")}\n`;
+        if (level === "warn" || level === "error") {
+          outputCounts.stderr += 1;
+          void output.push({ id: request.id, type: "stderr", data: line });
+        } else {
+          outputCounts.stdout += 1;
+          void output.push({ id: request.id, type: "stdout", data: line });
+        }
+      },
+    });
+    try {
+      host.executeScriptSync(`console.log(${JSON.stringify(request.token)})`);
+    } finally {
+      host.dispose();
     }
-  });
+    await output.drain();
+    await writeMessage(socket, { id: request.id, type: "complete", success: true, outputCounts });
+  } catch (error) {
+    await output.drain().catch(() => undefined);
+    await writeMessage(socket, {
+      id: request.id,
+      type: "error",
+      message: formatError(error),
+    });
+  }
 }
 
 async function handleInteractive(socket: net.Socket, request: InteractiveRequest): Promise<void> {
@@ -648,6 +741,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
     switch (request.type) {
       case "execute":
         await handleExecute(socket, request);
+        return;
+
+      case "selftest":
+        await handleSelftest(socket, request);
         return;
 
       case "interactive":

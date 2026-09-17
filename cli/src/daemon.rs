@@ -7,16 +7,16 @@ use std::ffi::OsStr;
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use crate::connection::{read_line, send_message};
@@ -247,11 +247,46 @@ pub fn doctor_report(
         }
     }
 
+    // "ok" must mean "a script round trip just succeeded", not "the socket is
+    // up": run a console echo through the daemon's real QuickJS + stdout
+    // channel. Only a compatible running daemon is probed — an incompatible
+    // one already carries its own error code and restart path.
+    let selftest = if is_daemon_running()
+        && runtime.get("status").and_then(serde_json::Value::as_str) == Some("compatible")
+    {
+        match selftest_roundtrip(Duration::from_millis(timeout_ms)) {
+            Ok(true) => serde_json::json!({ "status": "ok" }),
+            Ok(false) => {
+                exit_code = 6;
+                codes.push(serde_json::json!({
+                    "code": "RUNTIME_SELFTEST_FAILED",
+                    "severity": "error",
+                    "message": "The daemon accepted a trivial script but its output never came back; the runtime or output channel is degraded",
+                    "recovery": "dev-browser stop, then retry"
+                }));
+                serde_json::json!({ "status": "failed" })
+            }
+            Err(error) => {
+                exit_code = 6;
+                codes.push(serde_json::json!({
+                    "code": "RUNTIME_SELFTEST_FAILED",
+                    "severity": "error",
+                    "message": sanitize_diagnostic_message(&error.to_string()),
+                    "recovery": "dev-browser stop, then retry"
+                }));
+                serde_json::json!({ "status": "failed" })
+            }
+        }
+    } else {
+        serde_json::json!({ "status": "skipped" })
+    };
+
     let extracted_hash = sha256_hex(&fs::read(&command.entry_path)?);
     let report = serde_json::json!({
         "schemaVersion": 1,
         "ok": exit_code == 0,
         "codes": codes,
+        "selftest": selftest,
         "cli": { "version": expected.cli_version, "buildHash": expected.cli_build_hash },
         "daemon": {
             "running": is_daemon_running(), "pid": daemon_pid(), "endpoint": daemon_endpoint_label(),
@@ -960,6 +995,82 @@ fn expected_runtime(command: &DaemonCommand) -> Result<ExpectedRuntime, Box<dyn 
     })
 }
 
+/// Sends a `selftest` request and reports whether the daemon echoed the token
+/// back over its stdout channel before completing. `Ok(false)` means the
+/// daemon answered but the round trip lost the output — exactly the silent
+/// degradation this probe exists to expose.
+fn selftest_roundtrip(timeout: Duration) -> Result<bool, Box<dyn Error>> {
+    selftest_roundtrip_with(timeout, connect_to_daemon)
+}
+
+/// Runs the complete connect/write/read exchange on a worker because Unix
+/// sockets expose read timeouts while the Windows named-pipe stream does not.
+/// The receiver deadline therefore bounds every blocking phase consistently
+/// on both platforms; a stuck worker is detached and dies with this short-lived
+/// CLI process.
+fn selftest_roundtrip_with<S, F>(timeout: Duration, connect: F) -> Result<bool, Box<dyn Error>>
+where
+    S: Read + Write + Send + 'static,
+    F: FnOnce() -> io::Result<S> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let outcome = perform_selftest_roundtrip(connect).map_err(|error| error.to_string());
+        let _ = sender.send(outcome);
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Runtime self-test timed out after {} ms",
+                timeout.as_millis()
+            ),
+        )
+        .into()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("Runtime self-test worker stopped before reporting a result".into())
+        }
+    }
+}
+
+fn perform_selftest_roundtrip<S, F>(connect: F) -> Result<bool, Box<dyn Error>>
+where
+    S: Read + Write,
+    F: FnOnce() -> io::Result<S>,
+{
+    let token = format!(
+        "dev-browser-selftest-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let mut stream = connect()?;
+    send_message(
+        &mut stream,
+        &serde_json::json!({ "id": token.clone(), "type": "selftest", "token": token }),
+    )?;
+    let mut reader = BufReader::new(stream);
+    let mut stdout_payload = String::new();
+    loop {
+        let line = read_line(&mut reader)?;
+        let response: serde_json::Value = serde_json::from_str(line.trim_end())?;
+        match response.get("type").and_then(serde_json::Value::as_str) {
+            Some("stdout") => {
+                if let Some(data) = response.get("data").and_then(serde_json::Value::as_str) {
+                    stdout_payload.push_str(data);
+                }
+            }
+            Some("complete") => return Ok(stdout_payload.contains(&token)),
+            Some("error") => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
 fn exchange_result(message: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut stream = connect_to_daemon()?;
     send_message(&mut stream, &message)?;
@@ -1367,5 +1478,40 @@ mod tests {
         assert_eq!(runtime["status"], "legacy");
         assert_eq!(codes[0]["code"], "DAEMON_HANDSHAKE_UNSUPPORTED");
         assert_eq!(exit_code, 6);
+    }
+
+    #[test]
+    fn doctor_selftest_timeout_bounds_a_stalled_connection_attempt() {
+        let started = Instant::now();
+        let error = selftest_roundtrip_with(Duration::from_millis(25), || {
+            thread::sleep(Duration::from_millis(300));
+            Ok(io::Cursor::new(Vec::<u8>::new()))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out after 25 ms"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn doctor_selftest_timeout_bounds_a_daemon_that_never_replies() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let started = Instant::now();
+        let error = selftest_roundtrip_with(Duration::from_millis(25), move || {
+            TcpStream::connect(address)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out after 25 ms"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
     }
 }

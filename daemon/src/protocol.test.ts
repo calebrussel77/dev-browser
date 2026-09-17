@@ -3,6 +3,15 @@ import { describe, expect, it } from "vitest";
 import { parseRequest, serialize } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("parses selftest round-trip requests and rejects unbounded tokens", () => {
+    expect(
+      parseRequest(JSON.stringify({ id: "selftest-1", type: "selftest", token: "probe-token" }))
+    ).toMatchObject({ success: true, request: { type: "selftest", token: "probe-token" } });
+    expect(
+      parseRequest(JSON.stringify({ id: "selftest-2", type: "selftest", token: "x".repeat(500) }))
+    ).toMatchObject({ success: false });
+  });
+
   it("parses opt-in traces and bounded trace lookup requests", () => {
     expect(parseRequest(JSON.stringify({ id: "click-trace", type: "interactive", protocolVersion: 2, trace: true, action: { kind: "click", ref: "R1" } }))).toMatchObject({ success: true, request: { trace: true } });
     expect(parseRequest(JSON.stringify({ id: "trace-last", type: "trace", action: "show", traceId: "LAST" }))).toMatchObject({ success: true, request: { traceId: "LAST" } });

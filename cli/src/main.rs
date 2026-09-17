@@ -1791,6 +1791,8 @@ fn stream_responses<R: BufRead>(
     reader: &mut R,
     result_mode: ResultMode,
 ) -> Result<i32, Box<dyn Error>> {
+    let mut received_stdout: u64 = 0;
+    let mut received_stderr: u64 = 0;
     loop {
         let line = read_line(reader)?;
         let message: Value = serde_json::from_str(line.trim_end())?;
@@ -1798,12 +1800,14 @@ fn stream_responses<R: BufRead>(
         match message.get("type").and_then(Value::as_str) {
             Some("stdout") => {
                 if let Some(data) = message.get("data").and_then(Value::as_str) {
+                    received_stdout += 1;
                     print!("{data}");
                     io::stdout().flush()?;
                 }
             }
             Some("stderr") => {
                 if let Some(data) = message.get("data").and_then(Value::as_str) {
+                    received_stderr += 1;
                     eprint!("{data}");
                     io::stderr().flush()?;
                 }
@@ -1813,7 +1817,22 @@ fn stream_responses<R: BufRead>(
                     render_result(data, &result_mode)?;
                 }
             }
-            Some("complete") => return Ok(0),
+            Some("complete") => {
+                // Silent success is the most harmful failure mode: if any
+                // output message the daemon sent never arrived, say so and
+                // exit non-zero instead of impersonating an empty success.
+                if let Some(counts) = message.get("outputCounts") {
+                    let sent_stdout = counts.get("stdout").and_then(Value::as_u64).unwrap_or(0);
+                    let sent_stderr = counts.get("stderr").and_then(Value::as_u64).unwrap_or(0);
+                    if sent_stdout != received_stdout || sent_stderr != received_stderr {
+                        eprintln!(
+                            "RUNTIME_CHANNEL_LOST: the daemon sent {sent_stdout} stdout / {sent_stderr} stderr message(s) but {received_stdout} / {received_stderr} arrived; treat this run's output as incomplete. If this recurs, restart the daemon with `dev-browser stop`."
+                        );
+                        return Ok(6);
+                    }
+                }
+                return Ok(0);
+            }
             Some("error") => {
                 let error_message = message
                     .get("message")
@@ -2025,6 +2044,24 @@ mod tests {
 
     fn response_exit_code(response: &str) -> i32 {
         stream_responses(&mut Cursor::new(response.as_bytes()), ResultMode::None).unwrap()
+    }
+
+    #[test]
+    fn complete_output_counts_guard_silent_output_loss() {
+        // Counts match: clean success.
+        let matched = concat!(
+            "{\"id\":\"x\",\"type\":\"stdout\",\"data\":\"hello\\n\"}\n",
+            "{\"id\":\"x\",\"type\":\"complete\",\"success\":true,\"outputCounts\":{\"stdout\":1,\"stderr\":0}}\n",
+        );
+        assert_eq!(response_exit_code(matched), 0);
+
+        // The daemon sent output that never arrived: refuse to exit 0.
+        let lost = "{\"id\":\"x\",\"type\":\"complete\",\"success\":true,\"outputCounts\":{\"stdout\":1,\"stderr\":0}}\n";
+        assert_eq!(response_exit_code(lost), 6);
+
+        // Old daemons without counts keep the legacy behavior.
+        let legacy = "{\"id\":\"x\",\"type\":\"complete\",\"success\":true}\n";
+        assert_eq!(response_exit_code(legacy), 0);
     }
 
     #[test]
