@@ -178,6 +178,7 @@ const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 
 #[derive(Parser)]
 #[command(name = "dev-browser")]
+#[command(version = Box::leak(daemon::cli_build_identity().into_boxed_str()) as &'static str)]
 #[command(about = "Control browsers with JavaScript automation scripts")]
 #[command(
     long_about = "Agent-friendly browser automation with persistent pages, trusted interactive actions, and sandboxed QuickJS scripts. Run `dev-browser schema --json` for the machine contract, `dev-browser capabilities --compact` for feature discovery, or `dev-browser examples COMMAND` for a focused recipe."

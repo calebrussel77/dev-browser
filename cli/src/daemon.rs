@@ -39,6 +39,23 @@ const EMBEDDED_PACKAGE_JSON: &str = r#"{
   }
 }"#;
 
+/// Build identity for `--version` and bug reports: the crate version plus a
+/// short hash of the embedded daemon and sandbox bundles — the part that
+/// actually changes between local builds sharing one crate version. Uses the
+/// same formula as the handshake's cliBuildHash so the two always agree.
+pub fn cli_build_identity() -> String {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let embedded_daemon_hash = sha256_hex(EMBEDDED_DAEMON.as_bytes());
+    let build_hash = sha256_hex(
+        format!(
+            "{cli_version}:{embedded_daemon_hash}:{}",
+            sha256_hex(EMBEDDED_SANDBOX_CLIENT.as_bytes())
+        )
+        .as_bytes(),
+    );
+    format!("{cli_version} (build {})", &build_hash[..12])
+}
+
 struct DaemonCommand {
     program: String,
     args: Vec<String>,
