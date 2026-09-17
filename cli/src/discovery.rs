@@ -133,6 +133,12 @@ pub fn focused_example(command: &str) -> Option<&'static str> {
         "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled"),
         "type" => Some("dev-browser type --page TARGET --ref F0:R9 --from-state doc-7:184 --text \"hello\" --clear"),
         "confirm" => Some("dev-browser confirm --page TARGET --ref F0:R14 --expect \"Recipient\""),
+        "scroll" => Some(concat!(
+            "dev-browser scroll --page TARGET --delta-y 800\n",
+            "dev-browser scroll --page TARGET --direction down --pages 3\n",
+            "dev-browser scroll --page TARGET --ref R2 --until \"text:Conversation 47\" --max-steps 20\n",
+            "# Plain window.scrollBy inside a sandboxed script's page.evaluate is also fine for lazy-loading feeds"
+        )),
         "upload" => Some("dev-browser upload --page TARGET --ref F0:R5 --file upload.bin"),
         "doctor" => Some("dev-browser doctor --connect --json"),
         "schema" => Some("dev-browser schema --json"),

@@ -773,6 +773,9 @@ enum Command {
         #[command(flatten)]
         wait: WaitArgs,
     },
+    #[command(
+        override_usage = "dev-browser scroll --page <NAME_OR_TARGET_ID> --ref <REF>\n       dev-browser scroll --page <NAME_OR_TARGET_ID> --delta-y <PX> [--delta-x <PX>]\n       dev-browser scroll --page <NAME_OR_TARGET_ID> --direction <up|down|left|right> --pages <N>\n       dev-browser scroll --page <NAME_OR_TARGET_ID> --until <CONDITION> --max-steps <N>\n       dev-browser scroll --page <NAME_OR_TARGET_ID> --ref <CONTAINER> --until <CONDITION> --max-steps <N>"
+    )]
     Scroll {
         #[command(flatten)]
         output: PageActionArgs,
@@ -791,7 +794,11 @@ enum Command {
         // only with delta/direction, not with `ref`.
         #[arg(long, conflicts_with_all = ["delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
         until: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
+        // clap does not enforce `requires = "until"` when `until` also
+        // conflicts with a present argument, so the conflicts are stated
+        // directly — otherwise `--direction --pages --max-steps` parses here
+        // and dies daemon-side with a confusing cross-field error.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until", conflicts_with_all = ["delta_y", "direction"])]
         max_steps: Option<u8>,
         #[command(flatten)]
         wait: WaitArgs,
@@ -2840,6 +2847,30 @@ mod tests {
             Some(Command::Scroll { ref_id: Some(ref r), until: Some(ref u), max_steps: Some(10), .. })
                 if r == "R2" && u == "text:Row 47"
         ));
+    }
+
+    #[test]
+    fn rejects_max_steps_with_direction_or_delta_scroll_modes() {
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "scroll",
+            "--direction",
+            "down",
+            "--pages",
+            "1",
+            "--max-steps",
+            "10",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dev-browser",
+            "scroll",
+            "--delta-y",
+            "800",
+            "--max-steps",
+            "10",
+        ])
+        .is_err());
     }
 
     #[test]
