@@ -700,7 +700,7 @@ enum Command {
         states: Vec<FindState>,
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..=999))]
         index: Option<u16>,
-        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
         #[arg(
             long = "root",
@@ -2763,6 +2763,12 @@ mod tests {
 
     #[test]
     fn parses_and_serializes_every_structured_find_filter() {
+        let defaults = Cli::try_parse_from(["dev-browser", "find", "Connect"]).unwrap();
+        assert!(matches!(
+            defaults.command,
+            Some(Command::Find { limit: 3, .. })
+        ));
+
         let parsed = Cli::try_parse_from([
             "dev-browser",
             "find",
