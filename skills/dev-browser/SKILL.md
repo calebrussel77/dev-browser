@@ -15,7 +15,7 @@ Three moving parts, and understanding them prevents almost every mistake:
 - **A background daemon** holds all the real state — the live browser(s), the open tabs, and the CDP connections. It starts automatically on the first command and keeps running between your commands. This is why *the browser and its pages stay alive between calls*: you navigate in one command and interact in the next without re-loading anything.
 - **A QuickJS WASM sandbox** runs your scripts. It is **not** Node.js. There is no `require`, `import`, `fetch`, `process`, `fs`, or `path`. File I/O is limited to three helper functions writing under `~/.dev-browser/tmp/`. A script that reaches for Node APIs fails, and the reported line number is often off by a bit, so recognize the cause rather than trusting the trace.
 
-Because the daemon persists state, think in **small, focused commands** that each do one thing and end by reporting the state you need for the next decision — not one giant script. Short commands fail fast, are easy to retry, and keep the browser exactly where it stopped when something goes wrong.
+Because the daemon persists state, keep each decision bounded. Use one focused command when the next step depends on its result, and one `batch` when a predictable reversible sequence needs no intermediate reasoning.
 
 ## The three decisions, in order
 
@@ -35,6 +35,24 @@ Because the daemon persists state, think in **small, focused commands** that eac
 Full detail: `references/browsers-and-pages.md` for decisions 1 and 2.
 
 ## The interactive perception-action loop
+
+### Fast path
+
+For reversible work, minimize round trips before entering the full safety loop:
+
+1. Act directly with a semantic target (`--role`, `--name`, `--within`, and related `find` filters) when the target should be unique. The daemon performs a fresh find and refuses missing or ambiguous matches before trusted input.
+2. Use `text --within` to read. Use `observe` to choose a target, not to extract long page content.
+3. Use `batch` for every predictable sequence whose steps do not require agent judgment between them.
+4. Use a sandboxed script for bulk extraction from a known page.
+5. Request `--shot` only before an irreversible action, when spatial layout matters, or when structured perception is insufficient.
+
+Keep the full **perceive → find → act → verify** flow below for irreversible actions. Preserve fresh refs/state guards, screenshots when useful, recipient checks, confirmation tokens, and explicit outcome verification.
+
+```bash
+dev-browser --connect click --page TARGET --role button --name "Open" --within main --then-text main
+dev-browser --connect type --page TARGET --role textbox --name "Search" --text "query" --press Enter
+'{"page":"TARGET","steps":[{"kind":"click","role":"button","name":"Open"},{"kind":"assert","within":"main","text":"Ready"}]}' | dev-browser --connect batch
+```
 
 The loop is: **perceive → find → act → verify**, one step per command, opening any returned screenshot before the next consequential action.
 
@@ -85,12 +103,14 @@ Full detail — both paths, the overlay API, and the limitations you must know b
 This SKILL.md is the mental model and the *why*. The exhaustive, versioned, machine-readable contract lives in the CLI itself — consult it rather than guessing flags or memorizing grammar that may have changed:
 
 ```bash
-dev-browser --help                 # concise command + flag map
-dev-browser schema --json          # AUTHORITATIVE: every command, action grammar, wait grammar, error codes, limits
 dev-browser capabilities --compact # fast one-line feature discovery
 dev-browser examples click         # a focused copy/paste recipe for one command
+dev-browser --help                 # concise command + flag map
+dev-browser schema --json          # only after a grammar failure: exhaustive versioned contract
 dev-browser doctor --connect --json  # diagnose CLI/daemon/browser/CDP health with typed recovery codes
 ```
+
+Start with `capabilities --compact`; read `schema --json` only if a command fails for a grammar reason.
 
 Full detail — recovery playbook, lifecycle commands, the pitfalls checklist, and installation: `references/diagnostics-and-recovery.md`.
 

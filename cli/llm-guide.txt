@@ -1,362 +1,60 @@
-LLM USAGE GUIDE:
-  Write small, focused scripts. Each script should do ONE thing: navigate, click, fill, or check.
-  End each script by logging the state you need for the next decision.
-  Use descriptive page names like "login", "checkout", or "results" instead of "page1".
-  Named pages from browser.getPage("name") persist between script runs, so you usually do not need to re-navigate.
-  When reusing an existing Chrome tab, call browser.listPages() first and pass its target ID
-  to browser.getPage(targetId). An unknown name such as "main" creates a new named page.
-  Inside page.evaluate(...), write plain JavaScript only - no TypeScript syntax in the browser context.
-  On Windows/PowerShell, use here-strings to pipe multiline scripts:
-    @"
-    const page = await browser.getPage("main");
-    console.log(await page.title());
-    "@ | dev-browser --connect
+LLM QUICK GUIDE:
+  Start with `dev-browser capabilities --compact`. Read `dev-browser schema
+  --json` only when a command fails for a grammar reason. Use
+  `dev-browser examples COMMAND` for a focused recipe.
 
-  Choose the browser mode from the task:
-    - Existing login, cookies, or user tabs matter: use `dev-browser --connect`.
-    - Clean persistent automation: use `dev-browser --browser <task-name>`.
-    - Disposable unattended automation: add `--headless` to a managed browser.
-    - A CDP URL was explicitly supplied: use `dev-browser --connect <http-or-ws-url>`.
-    `--headless` and `--ignore-https-errors` do not change an external browser
-    attached through `--connect`.
+  Browser choice:
+    - Existing login, cookies, or user tabs: `dev-browser --connect`.
+    - Clean persistent profile: `dev-browser --browser TASK`.
+    - Disposable run: add `--headless` to a managed browser.
+  Run `pages` first and select an existing tab by URL/title and target id.
+  An unknown page name creates a new persistent page.
 
-  Prefer the interactive perception-action loop for consequential UI work:
-    dev-browser --connect pages
-    dev-browser --connect observe --page TARGET_ID --within main
-    dev-browser --connect observe --page TARGET_ID --within main --elements
-    dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
-    dev-browser --connect click --page TARGET_ID --ref R12 --from-state doc-7:184 --wait-text "visible,body,contains,Add a note" --shot modal.png
-    dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
-    dev-browser --connect type --page TARGET_ID --ref R13 --text "Invitation note" --clear --shot typed.png
-    dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190 --confirm-token TOKEN --shot sent.png
-    dev-browser --connect click --page TARGET_ID --ref R12 --trace
+  FAST PATH FOR REVERSIBLE UI:
+    1. Use a semantic action directly; it performs a fresh find and acts only
+       on one unambiguous target:
+         dev-browser --connect click --page TARGET --role button --name "Open" --within main
+    2. Read with `text --within`; use `observe --within` to choose a target,
+       not to read long content.
+    3. Combine predictable steps with `batch` (JSON from stdin or --file).
+    4. Use sandboxed scripts for bulk extraction on known pages.
+    5. Add `--shot` only when layout matters or before an irreversible action.
+
+  Useful compounds:
+    dev-browser type --page TARGET --role textbox --name "Search" --text "query" --press Enter
+    dev-browser type --page TARGET --fill R1=Ada --fill R2=Lovelace
+    dev-browser navigate --page TARGET https://example.com --observe main
+    dev-browser click --page TARGET --role button --name "Open" --then-text main
+
+  `batch` accepts 1..20 protocol-v2 actions plus standalone wait steps:
+    {"page":"TARGET","steps":[
+      {"kind":"click","role":"button","name":"Open","within":"main"},
+      {"kind":"assert","within":"main","text":"Ready"}
+    ],"stopOnError":true,"observeAfter":"delta"}
+
+  SAFETY PATH FOR IRREVERSIBLE UI:
+    Observe/find the exact target, use fresh refs and --from-state, inspect a
+    screenshot when layout matters, then run `confirm --ref REF --expect TEXT`.
+    Consume its short-lived token only on the final guarded action with
+    `--from-state STATE --confirm-token TOKEN`. If no dialog exists, use
+    `click --require-ancestor-text TEXT`. Never retry an irreversible action
+    without proof that no side effect began.
+
+  Output is compact JSON by default. `observe` omits element records; add
+  `--elements` for compact boxes or `--verbose` only for diagnostics. `find`
+  returns compact candidates. Refs are R# or F#:R# and states are versioned;
+  after rerender, use the semantic recovery command returned by stale/target
+  errors. Typed waits (`--wait-*`) replace sleeps.
+
+  Sandboxed scripts are QuickJS, not Node.js: no require/import/process/fs or
+  network APIs. Pages are Playwright Page objects. End scripts with bounded
+  structured output, preferably `console.json(value)`. File helpers are
+  restricted to ~/.dev-browser/tmp. Prefer `goto(..., {waitUntil:
+  "domcontentloaded"})` for streaming/HMR pages.
+
+  Diagnostics:
+    dev-browser doctor --connect --json
+    dev-browser examples click
     dev-browser trace show LAST
-
-    JSON output is one compact line by default; add global `--pretty` only for
-    human inspection. `observe` returns a compact protocol-v2 tree with stable
-    refs, roles, names, states, and main/aside/dialog landmark paths. It omits
-    `elements` and coordinate metadata by default. Add `--elements` for compact
-    actionable records and boxes, or `--verbose` for full records and diagnostic
-    journals. `--verbose` wins when both response controls are present.
-    `find` takes a fresh snapshot on every call. It keeps the natural query form
-    and also accepts combinable role/name/within/near/frame/scope/state filters;
-    use index only as an explicit last resort. Matches report exact reasons,
-    confidence, score gap, ambiguity, and duplicate-disambiguating context.
-    It returns at most three compact matches by default and no tree unless
-    `--verbose` is set. `find` matches over the full collected snapshot, not
-    the display-budgeted tree `observe` prints, so it reaches mid-page elements
-    on large documents; its `search` field reports coverage. An empty result
-    with `ambiguity.reason: "no-match"` means the traversal completed and the
-    element genuinely is absent; `"budget-exhausted"` (with `search.truncated:
-    true`) means collection hit a hard cap and absence was NOT proven — narrow
-    with `find --root REF` (a subtree ref from observe), --within, or --frame
-    instead of falling back to raw selectors. `click` and `type` automatically
-    return a refreshed compact tree and bounded delta. Ref actions share bounded visibility,
-    stability, enabled-state, scrolling, and obstruction checks. `click` reports URL/snapshot/dialog/aria-expanded
-    changes. Typed `--wait-*` conditions are event-driven and cover text, URL,
-    refs, dialogs, toasts, popups, downloads, file choosers, navigation,
-    responses, failed requests, and network idle. A retry requires evidence that
-    the prior attempt had no side effect; guarded and irreversible actions are
-    never retried. Link refs fall back to an interactive button descendant
-    or ancestor. Input uses trusted Playwright mouse/keyboard events and never
-    HTMLElement.click(). The browser and page remain alive between commands.
-
-    Every `--shot` result contains an absolute PNG path. Open that path with the
-    available image-viewing tool before the next consequential action. Screenshot
-    pixels, ref boxes, and `--xy X,Y` are all CSS pixels, regardless of DPR. Refs
-    remain valid while the same DOM element survives; use fresh returned refs.
-    Before irreversible actions, run `confirm --ref REF --expect RECIPIENT`, then
-    consume its short-lived single-use token on the final ref action with
-    `--from-state STATE --confirm-token TOKEN`. `--expect-text` remains v1 compatibility.
-    Invalid, expired, reused, or out-of-scope tokens return
-    `CONFIRMATION_INVALID` with process exit status 8.
-    When the irreversible control opens NO dialog (nothing for confirm to read),
-    use `click --ref REF --require-ancestor-text "Recipient Name"`: the daemon
-    walks up to the target's nearest self-contained card ancestor (article, li,
-    listitem, dialog, section, ... or the outermost block inside the enclosing
-    landmark) and refuses to click — typed ASSERTION_FAILED, exit 3, no input
-    dispatched — unless that card's text contains the value. This addresses the
-    duplicate-label problem (a sidebar full of buttons with the same label as
-    the one you mean): the click fails closed instead of hitting a lookalike.
-
-    Machine discovery and diagnostics:
-      dev-browser schema --json
-      dev-browser capabilities --compact
-      dev-browser examples click
-      dev-browser doctor --connect --json
-    The CLI automatically restarts an idle daemon when its embedded runtime,
-    protocol, Playwright, or QuickJS provenance is stale. It refuses to kill
-    in-flight work. Use `--trace` only when detailed diagnostics are needed;
-    traces are redacted, size-bounded, retained under ~/.dev-browser/tmp/traces,
-    and available with `dev-browser trace show LAST`. External CDP tracing is
-    best-effort and reports a warning when full context tracing is unavailable.
-
-  Screenshots have a hard deadline:
-    `--shot-timeout MILLISECONDS` (250..120000, default min(--timeout, 8000))
-    applies to `shot`, `observe --shot`, and action screenshots. Capture
-    prefers a single CDP Page.captureScreenshot call so it never waits on
-    perpetual CSS animations, a blinking caret, or document.fonts.ready;
-    Playwright's page.screenshot() is used only once, as a fallback, and
-    never after a CDP deadline has already elapsed. Result metadata reports
-    captureMode: "cdp" | "playwright".
-
-  Scope observe/text/assert instead of re-reading the whole page:
-    `observe`, `text`, and `assert` share find's --within grammar: a landmark
-    substring (main/aside/dialog), role:<role>, or name:<exact name>. Scoping
-    keeps node/character/depth/breadth budgets focused on the relevant
-    subtree, not repeated chrome around it.
-      dev-browser observe --page TARGET_ID --within main --max-nodes 300
-      dev-browser text --page TARGET_ID --ref R42
-      dev-browser assert --page TARGET_ID --within main --text "Jane Doe" --match contains
-    `observe --root REF` scopes to a specific ref's subtree instead
-    (mutually exclusive with --within); `find --root REF` does the same for
-    find. `observe --text-only` returns bounded normalized innerText with
-    truncation metadata (under the `textOnly` object). `assert` never attempts
-    trusted input; on failure it returns the typed ASSERTION_FAILED error
-    (exit 3) instead of silently proceeding.
-    Very large SPAs can exceed even the maximum observe budgets; when
-    `truncation.truncated` stays true at max budget, paging with
-    `--continuation` (or scoping with --root/--within) is required, not
-    optional.
-
-  Virtualized/infinite-scroll containers need container-relative scrolling:
-    A recycled virtual list keeps only a handful of DOM nodes for dozens or
-    hundreds of logical rows, so a single snapshot cannot see them all.
-      dev-browser scroll --page TARGET_ID --ref R2 --until "text:Conversation 47" --max-steps 20
-      dev-browser find --page TARGET_ID --name "Conversation 47" --scroll-container R2 --max-steps 20
-    `find --scroll-container` repeats fresh find -> one container scroll ->
-    fresh find until confident, exhausted, or --max-steps. It never
-    auto-clicks the result. The response includes scrollMetrics: { steps,
-    uniqueItems, newItems, exhausted, positions[] }.
-
-  React-safe exact text entry (`type`):
-    `type` invokes the resolved field's native value setter and dispatches
-    composed bubbling beforeinput/input/change events for input/textarea
-    (so React-style controlled components commit the change), or
-    page.keyboard.insertText for contenteditable -- with an automatic
-    fall back to real key-by-key typing when a rich-text editor (Draft.js /
-    Lexical-style) drops a bulk insertText. It returns
-    { typed, inputStrategy, verifiedValue } where inputStrategy is
-    native-setter, insert-text, or keyboard. The field is reread afterward;
-    contenteditable verification is newline-normalized so a block/paragraph
-    editor rendering a typed newline as a paragraph break still verifies. A
-    genuine mismatch returns the typed INPUT_VALUE_MISMATCH error (exit 3)
-    instead of reporting success. --clear (default false) controls whether the
-    existing content is replaced or appended to.
-
-  Error codes (exit status 3 unless noted): STALE_REF, STALE_STATE,
-    AMBIGUOUS_TARGET, TARGET_MISSING, TARGET_HIDDEN, TARGET_OBSCURED,
-    TARGET_DISABLED, ASSERTION_FAILED, INPUT_VALUE_MISMATCH. WAIT_TIMEOUT is
-    exit 4, LEASE_CONFLICT is exit 5, CONFIRMATION_INVALID is exit 8. See
-    `dev-browser schema --json` for the authoritative, versioned list.
-
-  Two site-agnostic recipes for messaging-style UIs:
-    1. Detect an unavailable send button before clicking it:
-         dev-browser find --page TARGET_ID --role button --name "Send" --state disabled
-         dev-browser click --page TARGET_ID --ref R9   # returns TARGET_DISABLED (exit 3)
-    2. Verify a thread actually opened before composing into it. A deep link
-       into an SPA conversation view can resolve the URL before the panel
-       hydrates, so do a real click, then assert rather than trusting the
-       click alone:
-         dev-browser click --page TARGET_ID --ref R14 --wait-url "contains,/thread/"
-         dev-browser assert --page TARGET_ID --within main --text "Jane Doe" --match contains
-         dev-browser type --page TARGET_ID --ref R13 --text "Hello" --clear
-
-  console.json for scripted output:
-    Inside a piped script, console.json(value) emits value as exactly one
-    bounded, parseable JSON line (serialized with the sandbox's own
-    JSON.stringify, so circular references are rejected instead of hanging
-    the sandbox). Oversized values (over 64 KiB serialized) are rejected with
-    a short, bounded diagnostic instead of being emitted truncated. Prefer it
-    over console.log(JSON.stringify(...)) when a caller must parse exactly
-    one line of output.
-      dev-browser <<'EOF'
-      console.json({ ok: true, count: 3 });
-      EOF
-
-  Video recording of a session (WebM):
-    Record a QA journey or proof of work. Recording state lives in the daemon,
-    so navigation, clicks, and chapter markers happen between separate commands.
-      dev-browser --connect video start recordings/login-flow.webm --page TARGET_ID --size 1280x800
-      dev-browser --connect video chapter "Sign in" --page TARGET_ID --description "Entering credentials" --duration 2000
-      dev-browser --connect click --page TARGET_ID --ref R12
-      dev-browser --connect video stop --page TARGET_ID
-    `video start` and `video stop` both return the absolute .webm path. Without
-    a FILE argument the recording lands under ~/.dev-browser/tmp/videos; a
-    relative FILE resolves against your working directory. One active recording
-    per page; two different pages can record at the same time.
-    `--max-duration SECONDS` overrides the 600-second cap after which the
-    daemon finalizes the file on its own. Popups and new tabs are not captured,
-    and a connected Chrome window that is covered mid-recording freezes the
-    picture. Video errors (VIDEO_ALREADY_RECORDING, VIDEO_NOT_RECORDING,
-    VIDEO_LIMIT_REACHED, VIDEO_ENCODER_MISSING) exit with status 6.
-    For a paced "hero" video with annotations, script it instead:
-      dev-browser --connect <<'EOF'
-      const page = await browser.getPage("main");
-      await page.screencast.start({ path: "demo.webm", size: { width: 1280, height: 800 } });
-      await page.screencast.showChapter("Adding items", { description: "...", duration: 2000 });
-      const note = await page.screencast.showOverlay('<div style="position:absolute;top:8px;right:8px">Done</div>');
-      await note.dispose();
-      await page.screencast.stop();
-      EOF
-    Overlays are pointer-events: none, so actions keep working while they are
-    visible. screencast.start({ onFrame }) is not supported in the sandbox.
-
-  Quick inspection:
-    dev-browser --connect <<'EOF'
-    const tabs = await browser.listPages();
-    console.log(JSON.stringify(tabs, null, 2));
-    EOF
-
-    dev-browser --connect <<'EOF'
-    const tabs = await browser.listPages();
-    const target = tabs.find(tab => tab.url.includes("app.example.com"));
-    if (!target) throw new Error("No matching tab");
-    const page = await browser.getPage(target.id);
-    console.log(JSON.stringify({
-      id: target.id,
-      url: page.url(),
-      title: await page.title(),
-    }, null, 2));
-    EOF
-
-  AI snapshots for element discovery:
-    dev-browser <<'EOF'
-    const page = await browser.getPage("main");
-    const result = await page.snapshotForAI();
-    console.log(result.full);
-    // Returns { full: string, incremental?: string }.
-    // Optional args: { track?: string, depth?: number, timeout?: number }.
-    // Read result.full to identify the right element.
-    // Then interact with it using Playwright:
-    // await page.getByRole("button", { name: "Continue" }).click();
-    // Re-run page.snapshotForAI({ track: "main" }) after the page changes.
-    EOF
-
-  Choosing your approach:
-    Unknown pages: use page.snapshotForAI() first to discover the page, then interact based on what you find.
-    Known pages/selectors: skip the snapshot and use direct Playwright selectors like page.click(), page.fill(), or page.locator() for faster, more reliable automation.
-    Existing browser tabs: match with both URL and title, because either value can be duplicated or stale.
-    After navigation, submission, or another material state change, re-read the URL/title or snapshot instead of assuming success.
-
-  Screenshots for visual state:
-    dev-browser <<'EOF'
-    const page = await browser.getPage("main");
-    const buf = await page.screenshot();
-    const path = await saveScreenshot(buf, "debug.png");
-    console.log(path);
-    EOF
-
-  Waiting patterns:
-    dev-browser <<'EOF'
-    const page = await browser.getPage("search-results");
-    await page.waitForSelector(".results");
-    await page.waitForURL("**/success");
-    console.log(JSON.stringify({
-      url: page.url(),
-      title: await page.title(),
-    }, null, 2));
-    EOF
-
-  Dev server navigation:
-    For local dev servers (Next.js, Vite, etc.), prefer:
-      await page.goto(url, { waitUntil: "domcontentloaded" });
-    The default "load" wait can hang on HMR, streaming, or other long-lived dev-server connections.
-    Use "load" only when you specifically need every subresource to finish loading.
-
-  Error recovery:
-    If a script fails, the page usually stays where it stopped.
-    Reconnect to the same page name, take a screenshot, and log the URL/title:
-    dev-browser <<'EOF'
-    const page = await browser.getPage("checkout");
-    const path = await saveScreenshot(await page.screenshot(), "debug.png");
-    console.log(JSON.stringify({
-      screenshot: path,
-      url: page.url(),
-      title: await page.title(),
-    }, null, 2));
-    EOF
-
-    Diagnose before restarting the workflow:
-      dev-browser doctor --json
-      dev-browser status
-      dev-browser browsers
-      dev-browser stop
-
-    Runtime mismatches are normally repaired automatically when the daemon is idle.
-    Use `dev-browser stop` only for explicit recovery or shutdown.
-
-  Common Playwright Page methods:
-    page.goto(url, { waitUntil: "domcontentloaded" })
-                                           Navigate to a URL; prefer this on dev servers
-    page.title()                           Get the current page title
-    page.url()                             Get the current URL
-    page.snapshotForAI(options)            Get an AI-optimized snapshot; returns { full, incremental? }
-                                           Options: { track?: string, depth?: number, timeout?: number }
-    page.getByRole(role, { name })         Target elements discovered from the snapshot
-    page.textContent(selector)             Get the text content of an element
-    page.innerHTML(selector)               Get the inner HTML of an element
-    page.fill(selector, value)             Fill an input field
-    page.click(selector)                   Click an element
-    page.type(selector, text)              Type text character by character
-    page.press(selector, key)              Press a key such as Enter or Tab
-    page.waitForSelector(selector)         Wait for an element to appear
-    page.waitForURL(url)                   Wait for navigation to a URL
-    page.screenshot()                      Capture a screenshot buffer; save it with saveScreenshot(...)
-    page.$$eval(selector, fn)              Run a function on all matching elements
-    page.$eval(selector, fn)               Run a function on the first matching element
-    page.evaluate(fn)                      Run JavaScript in the page context (plain JS only)
-    page.locator(selector)                 Create a locator for chained actions
-
-  Connecting to a running Chrome instance:
-    Auto-discover Chrome with debugging enabled:
-      dev-browser --connect <<'EOF'
-        console.log(JSON.stringify(await browser.listPages(), null, 2));
-      EOF
-
-    Connect to a specific CDP endpoint:
-      dev-browser --connect http://localhost:9222 <<'EOF'
-        console.log(JSON.stringify(await browser.listPages(), null, 2));
-      EOF
-
-    To launch Chrome with debugging enabled:
-      chrome.exe --remote-debugging-port=9222
-      google-chrome --remote-debugging-port=9222
-
-    Or visit chrome://inspect/#remote-debugging to configure.
-
-    Reliability checklist for agents:
-      1. Prefer `dev-browser --connect` with no URL. This lets dev-browser read
-         Chrome's DevToolsActivePort file and probe common CDP ports.
-      2. Call browser.listPages() before browser.getPage(targetId). Target listing
-         does not attach every renderer; only the selected page is attached.
-      3. If `http://localhost:9222/json/version` returns 404, do not assume CDP
-         is unusable. Retry with `dev-browser --connect` or pass the exact
-         ws://127.0.0.1:<port>/devtools/browser/... URL from DevToolsActivePort.
-      4. If listPages() succeeds but getPage(id) fails, the browser connection is
-         healthy and the selected renderer is the likely problem. Test one known-light
-         tab before treating the entire browser or CDP endpoint as broken.
-      5. A CDP-unresponsive selected renderer may be replaced by a fresh tab at the
-         same URL in the same authenticated browser context. Continue with the Page
-         returned by getPage(), but do not assume it is the original physical tab.
-         Cookies and login state survive; unsaved DOM-only form/editor state does not.
-         If exact tab identity or unsaved state matters, use desktop/browser control
-         or ask the user to recover the original tab instead of retrying indefinitely.
-      6. If Playwright logs `<ws connected>` and then times out, raw Chrome/CDP
-         may be reachable while Playwright failed during attach. Use a short
-         timeout such as `--timeout 10`, then run `dev-browser doctor --connect --json`.
-         Follow its typed recovery command; stop the daemon only when doctor
-         explicitly recommends it as recovery.
-      7. `--timeout SECONDS` controls both the Playwright CDP attach timeout and
-         the script execution timeout.
-
-  Tips:
-    - Use console.log(JSON.stringify(...)) for structured output.
-    - Prefer page.snapshotForAI() for structure; use screenshots when visual layout or styling matters.
-    - Keep page names stable across scripts so you can resume work after failures.
-    - Close only pages the automation created or the user explicitly asked to close.
-      Never close pre-existing user tabs merely to clean up.
-    - Each --browser name maps to a separate daemon-managed browser instance.
-    - Use --connect to attach to an existing browser; omit the URL to auto-discover Chrome with debugging enabled.
-    - Use short timeouts (--timeout 10) so scripts fail fast instead of hanging on missing elements or stuck CDP attach.
-    - Add --headless for unattended automation; omit it when you want to watch the browser window.
+  Use `--trace` only when normal typed errors are insufficient. Close only
+  pages created by the automation or explicitly authorized by the user.
