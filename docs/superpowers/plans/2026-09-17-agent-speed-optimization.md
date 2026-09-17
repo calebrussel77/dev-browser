@@ -140,8 +140,8 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 
 ### Tâche 0.4 — Confort d'itération (petit, optionnel mais recommandé)
 
-- [ ] Dans `daemon/src/sandbox/playwright-internals.ts` `tryResolvePlaywrightInternal`, ajouter le candidat `path.resolve(currentDir, "../node_modules/playwright-core", modulePath)` pour que `DEV_BROWSER_DAEMON=<repo>/daemon/dist/daemon.bundle.mjs` fonctionne après `pnpm bundle`, sans `cargo build`.
-- [ ] Vérifier que `dev-browser status` puis `dev-browser --connect http://127.0.0.1:9223 pages` fonctionnent avec cette variable.
+- [x] Dans `daemon/src/sandbox/playwright-internals.ts` `tryResolvePlaywrightInternal`, ajouter le candidat `path.resolve(currentDir, "../node_modules/playwright-core", modulePath)` pour que `DEV_BROWSER_DAEMON=<repo>/daemon/dist/daemon.bundle.mjs` fonctionne après `pnpm bundle`, sans `cargo build`.
+- [x] Vérifier que `dev-browser status` puis `dev-browser --connect http://127.0.0.1:9223 pages` fonctionnent avec cette variable.
 
 ---
 
