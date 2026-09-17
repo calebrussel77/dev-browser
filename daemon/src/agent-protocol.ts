@@ -94,6 +94,15 @@ export class AgentProtocolError extends Error {
     this.name = "AgentProtocolError";
     const { allowOutputPath = false, ...errorFields } = options;
     this.allowOutputPath = allowOutputPath;
+    // Oversized or non-JSON-safe details must degrade to a stub, not turn
+    // into a Zod validation error that replaces the real failure: an error
+    // about the error hides exactly the information the caller needed.
+    if (errorFields.details !== undefined && !isBoundedJson(errorFields.details)) {
+      errorFields.details = {
+        truncated: true,
+        note: `details exceeded the ${MAX_DETAILS_LENGTH}-character bound or were not JSON-safe and were dropped`,
+      };
+    }
     const parsed = AgentErrorSchema.parse(
       redactSensitive({ code, message, recoverable, ...errorFields }, { allowOutputPath })
     );

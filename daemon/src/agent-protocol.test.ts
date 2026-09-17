@@ -97,6 +97,15 @@ describe("agent protocol v2", () => {
     ).toThrow();
   });
 
+  it("degrades oversized error details to a stub instead of failing to construct", () => {
+    const error = new AgentProtocolError("WAIT_TIMEOUT", "timed out", true, {
+      details: { journal: "x".repeat(50_000) },
+    });
+    expect(error.message).toBe("timed out");
+    expect(error.code).toBe("WAIT_TIMEOUT");
+    expect(error.details).toMatchObject({ truncated: true });
+  });
+
   it("bounds messages from untyped runtime errors", () => {
     const error = toAgentError(new Error("x".repeat(5_000)));
 
