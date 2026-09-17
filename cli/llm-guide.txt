@@ -64,14 +64,23 @@ LLM USAGE GUIDE:
     `--from-state STATE --confirm-token TOKEN`. `--expect-text` remains v1 compatibility.
     Invalid, expired, reused, or out-of-scope tokens return
     `CONFIRMATION_INVALID` with process exit status 8.
+    `confirm` reads the confirmation text from the dialog that CONTAINS the
+    target ref (real pages keep unrelated [role=dialog] surfaces mounted —
+    e.g. a messaging overlay — and "the last visible dialog" is often the
+    wrong one); without a dialog ancestor it falls back to the last visible
+    dialog, then body. On mismatch the error reports which scope was read and
+    a bounded sample of the text it actually saw.
     When the irreversible control opens NO dialog (nothing for confirm to read),
     use `click --ref REF --require-ancestor-text "Recipient Name"`: the daemon
-    walks up to the target's nearest self-contained card ancestor (article, li,
-    listitem, dialog, section, ... or the outermost block inside the enclosing
-    landmark) and refuses to click — typed ASSERTION_FAILED, exit 3, no input
-    dispatched — unless that card's text contains the value. This addresses the
-    duplicate-label problem (a sidebar full of buttons with the same label as
-    the one you mean): the click fails closed instead of hitting a lookalike.
+    collects the target's self-contained card ancestors (article, li, listitem,
+    form, section, dialog, ...) nearest-first and refuses to click — typed
+    ASSERTION_FAILED, exit 3, no input dispatched — unless one of them contains
+    the value. It escalates outward through enclosing cards (a composer's form
+    rarely holds the recipient shown in the same dialog's header) but never
+    past a dialog ancestor or the enclosing landmark: text outside a modal can
+    never vouch for a target inside it. This addresses the duplicate-label
+    problem (a sidebar full of buttons with the same label as the one you
+    mean): the click fails closed instead of hitting a lookalike.
 
     Machine discovery and diagnostics:
       dev-browser schema --json

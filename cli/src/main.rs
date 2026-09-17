@@ -719,7 +719,7 @@ enum Command {
             long = "require-ancestor-text",
             value_name = "TEXT",
             conflicts_with = "xy",
-            help = "Refuse to click unless the target's nearest self-contained card ancestor contains this text (fails closed with a typed error)"
+            help = "Refuse to click unless one of the target's self-contained card ancestors contains this text (nearest first, escalating up to but never past the enclosing dialog or landmark; fails closed with a typed error)"
         )]
         require_ancestor_text: Option<String>,
         #[arg(long, value_name = "TEXT")]
