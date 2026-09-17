@@ -51,7 +51,7 @@ function resolvePlaywrightInternal(modulePath: string): string {
   throw new Error(`Could not locate Playwright internals at ${modulePath}`);
 }
 
-function tryResolvePlaywrightInternal(modulePath: string): string | null {
+export function tryResolvePlaywrightInternal(modulePath: string): string | null {
   const candidates = [
     path.resolve(currentDir, "../../node_modules/playwright-core", modulePath),
     path.resolve(currentDir, "../node_modules/playwright-core", modulePath),

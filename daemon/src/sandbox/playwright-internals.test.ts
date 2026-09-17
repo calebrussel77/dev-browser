@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -10,27 +10,60 @@ import { afterAll, describe, expect, it } from "vitest";
 const execFileAsync = promisify(execFile);
 const daemonDir = fileURLToPath(new URL("../../", import.meta.url));
 const repoDir = path.resolve(daemonDir, "..");
-const entryPoint = path.resolve(daemonDir, "src/sandbox/playwright-internals.ts");
 const testId = `${process.pid}-${Date.now()}`;
 const temporaryDir = path.resolve(daemonDir, `.playwright-internals-${testId}`);
 const generatedFiles: string[] = [];
 
-async function expectBundleToResolvePlaywright(outfile: string, cwd: string): Promise<void> {
+async function buildResolutionProbe(outfile: string): Promise<void> {
   await mkdir(path.dirname(outfile), { recursive: true });
   generatedFiles.push(outfile);
 
   await build({
-    entryPoints: [entryPoint],
+    stdin: {
+      contents: `
+        import { tryResolvePlaywrightInternal } from "./src/sandbox/playwright-internals.js";
+        console.log(tryResolvePlaywrightInternal("lib/coreBundle.js"));
+      `,
+      loader: "ts",
+      resolveDir: daemonDir,
+      sourcefile: "playwright-resolution-probe.ts",
+    },
     bundle: true,
     format: "esm",
     outfile,
     platform: "node",
     target: "node20",
   });
+}
 
-  await expect(execFileAsync(process.execPath, [outfile], { cwd })).resolves.toMatchObject({
-    stderr: "",
-  });
+async function runResolutionProbe(outfile: string, cwd: string): Promise<string> {
+  const result = await execFileAsync(process.execPath, [outfile], { cwd });
+  expect(result.stderr).toBe("");
+  return result.stdout.trim();
+}
+
+async function createPlaywrightCoreFixture(packageDir: string): Promise<void> {
+  await mkdir(path.resolve(packageDir, "lib"), { recursive: true });
+  await writeFile(path.resolve(packageDir, "package.json"), '{"type":"commonjs"}\n');
+  await writeFile(
+    path.resolve(packageDir, "lib/coreBundle.js"),
+    `
+      module.exports = {
+        inprocess: {
+          playwright: {
+            _connection: { constructor: class Connection {} },
+            _platform: {},
+          },
+        },
+        server: {
+          createPlaywright() {},
+          DispatcherConnection: class DispatcherConnection {},
+          RootDispatcher: class RootDispatcher {},
+          PlaywrightDispatcher: class PlaywrightDispatcher {},
+        },
+      };
+    `
+  );
 }
 
 afterAll(async () => {
@@ -40,29 +73,37 @@ afterAll(async () => {
 
 describe("Playwright internal resolution", () => {
   it("resolves playwright-core from daemon/node_modules for the direct daemon bundle", async () => {
-    await expectBundleToResolvePlaywright(
-      path.resolve(daemonDir, "dist", `playwright-internals-${testId}.mjs`),
-      repoDir
+    const outfile = path.resolve(daemonDir, "dist", `playwright-internals-${testId}.mjs`);
+    await buildResolutionProbe(outfile);
+
+    await expect(runResolutionProbe(outfile, repoDir)).resolves.toBe(
+      path.resolve(daemonDir, "node_modules/playwright-core/lib/coreBundle.js")
     );
   });
 
   it.each([
-    {
-      name: "two directories above the current module",
-      outfile: path.resolve(temporaryDir, "sandbox", "playwright-internals.mjs"),
-      cwd: repoDir,
-    },
-    {
-      name: "below the current module directory",
-      outfile: path.resolve(daemonDir, `playwright-internals-${testId}.mjs`),
-      cwd: repoDir,
-    },
-    {
-      name: "below the process working directory",
-      outfile: path.resolve(repoDir, `playwright-internals-${testId}.mjs`),
-      cwd: daemonDir,
-    },
-  ])("keeps the existing fallback $name", async ({ outfile, cwd }) => {
-    await expectBundleToResolvePlaywright(outfile, cwd);
+    { candidateIndex: 0, name: "two directories above the current module" },
+    { candidateIndex: 1, name: "one directory above the current module" },
+    { candidateIndex: 2, name: "below the current module directory" },
+    { candidateIndex: 3, name: "below the process working directory" },
+  ])("selects $name before every later fallback", async ({ candidateIndex, name }) => {
+    const fixtureDir = path.resolve(temporaryDir, name.replaceAll(" ", "-"));
+    const bundleDir = path.resolve(fixtureDir, "levels/one");
+    const cwd = path.resolve(fixtureDir, "cwd");
+    const outfile = path.resolve(bundleDir, "playwright-internals.mjs");
+    const candidates = [
+      path.resolve(bundleDir, "../../node_modules/playwright-core"),
+      path.resolve(bundleDir, "../node_modules/playwright-core"),
+      path.resolve(bundleDir, "node_modules/playwright-core"),
+      path.resolve(cwd, "node_modules/playwright-core"),
+    ];
+
+    await mkdir(cwd, { recursive: true });
+    await Promise.all(candidates.slice(candidateIndex).map(createPlaywrightCoreFixture));
+    await buildResolutionProbe(outfile);
+
+    await expect(runResolutionProbe(outfile, cwd)).resolves.toBe(
+      path.resolve(candidates[candidateIndex]!, "lib/coreBundle.js")
+    );
   });
 });
