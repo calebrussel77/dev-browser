@@ -188,4 +188,41 @@ describe.sequential("QuickJS sandbox security", () => {
     expect(output.stderr).toEqual([]);
     expect(leakedToHostStdout).toBe(false);
   });
+
+  it("starts the second script from a warm isolated sandbox", async () => {
+    const poolOptions = { memoryLimitBytes: 384 * 1024 * 1024 };
+    await runSandboxScript(
+      `globalThis.__sandboxLeak = "must-not-survive";`,
+      poolOptions
+    );
+
+    let startupMs = Number.POSITIVE_INFINITY;
+    const startedAt = performance.now();
+    const output = createOutput();
+    output.sink.onStdout = (data) => {
+      startupMs = Math.min(startupMs, performance.now() - startedAt);
+      output.stdout.push(data);
+    };
+
+    await runScript(
+      `console.log(typeof globalThis.__sandboxLeak);`,
+      manager,
+      browserName,
+      output.sink,
+      poolOptions
+    );
+
+    expect(output.stdout.join("")).toContain("undefined");
+    expect(startupMs).toBeLessThan(40);
+  }, 120_000);
+
+  it("invalidates the warm sandbox when the browser reconnects", async () => {
+    await manager.stopBrowser(browserName);
+    await manager.ensureBrowser(browserName, { headless: true });
+
+    const output = await runSandboxScript(`console.log("reconnected");`);
+
+    expect(output.stdout.join("")).toContain("reconnected");
+    expect(output.stderr).toEqual([]);
+  }, 120_000);
 });
