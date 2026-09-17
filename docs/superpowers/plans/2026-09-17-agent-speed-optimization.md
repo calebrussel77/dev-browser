@@ -195,7 +195,7 @@ Mesure intermédiaire 1.1 : `observe` 4,2 KB, `observe --elements` 22,6 KB, `obs
 
 **Critères d'acceptation :** bench 0.1 : taille compact d'un `click` ≤ 4 KB ; `--verbose` ≥ taille d'avant.
 
-Mesure intermédiaire 1.3 : `click` lourd = 4 677 octets compacts et `observe --verbose` = 102 262 octets pretty. Les champs diagnostics prévus ont été retirés ; le seuil `click` reste bloquant pour la fin de phase et sera remesuré après la suppression des warnings permanents de 1.5.
+Mesure finale 1.3 : `click` lourd = 4 043 octets compacts (3,95 KiB) après compaction de l'indentation de l'arbre v2 et retrait de la géométrie dupliquée dans `clicked` ; l'arbre et le delta restent présents. `observe --verbose` = 102 228 octets pretty contre 105 890 avant (-3,46 %) : la liste de champs complète est préservée, la baisse vient des arrondis numériques obligatoires et des warnings permanents retirés en 1.5.
 
 ### Tâche 1.4 — `find` compact
 
