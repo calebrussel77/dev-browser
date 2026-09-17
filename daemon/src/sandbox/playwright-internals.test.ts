@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,38 +73,65 @@ afterAll(async () => {
 });
 
 describe("Playwright internal resolution", () => {
-  it("resolves playwright-core from daemon/node_modules for the direct daemon bundle", async () => {
+  it("selects the first installed playwright-core candidate for the direct daemon bundle", async () => {
     const outfile = path.resolve(daemonDir, "dist", `playwright-internals-${testId}.mjs`);
+    const modulePath = "lib/coreBundle.js";
+    const rootCandidate = path.resolve(repoDir, "node_modules/playwright-core", modulePath);
+    const expected = [
+      rootCandidate,
+      path.resolve(daemonDir, "node_modules/playwright-core", modulePath),
+      path.resolve(daemonDir, "dist/node_modules/playwright-core", modulePath),
+      rootCandidate,
+    ].find(existsSync);
+
+    expect(expected).toBeDefined();
     await buildResolutionProbe(outfile);
 
-    await expect(runResolutionProbe(outfile, repoDir)).resolves.toBe(
-      path.resolve(daemonDir, "node_modules/playwright-core/lib/coreBundle.js")
-    );
+    await expect(runResolutionProbe(outfile, repoDir)).resolves.toBe(expected);
   });
 
   it.each([
-    { candidateIndex: 0, name: "two directories above the current module" },
-    { candidateIndex: 1, name: "one directory above the current module" },
-    { candidateIndex: 2, name: "below the current module directory" },
-    { candidateIndex: 3, name: "below the process working directory" },
-  ])("selects $name before every later fallback", async ({ candidateIndex, name }) => {
-    const fixtureDir = path.resolve(temporaryDir, name.replaceAll(" ", "-"));
-    const bundleDir = path.resolve(fixtureDir, "levels/one");
-    const cwd = path.resolve(fixtureDir, "cwd");
-    const outfile = path.resolve(bundleDir, "playwright-internals.mjs");
-    const candidates = [
-      path.resolve(bundleDir, "../../node_modules/playwright-core"),
-      path.resolve(bundleDir, "../node_modules/playwright-core"),
-      path.resolve(bundleDir, "node_modules/playwright-core"),
-      path.resolve(cwd, "node_modules/playwright-core"),
-    ];
+    {
+      candidateIndex: 0,
+      expectedPackage: "node_modules/playwright-core",
+      name: "two directories above the current module",
+    },
+    {
+      candidateIndex: 1,
+      expectedPackage: "daemon/node_modules/playwright-core",
+      name: "daemon/node_modules from a daemon/dist bundle",
+    },
+    {
+      candidateIndex: 2,
+      expectedPackage: "daemon/dist/node_modules/playwright-core",
+      name: "below the current module directory",
+    },
+    {
+      candidateIndex: 3,
+      expectedPackage: "cwd/node_modules/playwright-core",
+      name: "below the process working directory",
+    },
+  ])(
+    "selects $name before every later fallback",
+    async ({ candidateIndex, expectedPackage, name }) => {
+      const fixtureDir = path.resolve(temporaryDir, name.replaceAll(" ", "-"));
+      const bundleDir = path.resolve(fixtureDir, "daemon/dist");
+      const cwd = path.resolve(fixtureDir, "cwd");
+      const outfile = path.resolve(bundleDir, "playwright-internals.mjs");
+      const candidates = [
+        path.resolve(bundleDir, "../../node_modules/playwright-core"),
+        path.resolve(bundleDir, "../node_modules/playwright-core"),
+        path.resolve(bundleDir, "node_modules/playwright-core"),
+        path.resolve(cwd, "node_modules/playwright-core"),
+      ];
 
-    await mkdir(cwd, { recursive: true });
-    await Promise.all(candidates.slice(candidateIndex).map(createPlaywrightCoreFixture));
-    await buildResolutionProbe(outfile);
+      await mkdir(cwd, { recursive: true });
+      await Promise.all(candidates.slice(candidateIndex).map(createPlaywrightCoreFixture));
+      await buildResolutionProbe(outfile);
 
-    await expect(runResolutionProbe(outfile, cwd)).resolves.toBe(
-      path.resolve(candidates[candidateIndex]!, "lib/coreBundle.js")
-    );
-  });
+      await expect(runResolutionProbe(outfile, cwd)).resolves.toBe(
+        path.resolve(fixtureDir, expectedPackage, "lib/coreBundle.js")
+      );
+    }
+  );
 });
