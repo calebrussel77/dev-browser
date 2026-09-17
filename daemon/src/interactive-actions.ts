@@ -665,8 +665,8 @@ function confirmationScope(
   };
 }
 
-function automaticScreenshotName(action: string): string {
-  return `interactive/${Date.now()}-${action}.png`;
+function automaticScreenshotName(action: string, format: "png" | "jpeg"): string {
+  return `interactive/${Date.now()}-${action}.${format === "jpeg" ? "jpg" : "png"}`;
 }
 
 function limitSnapshotDepth(snapshot: string, depth: number): string {
@@ -1247,6 +1247,7 @@ export async function executeInteractiveAction(
           continuation: action.continuation,
           scope: action.root || action.within ? { ref: action.root, within: action.within } : undefined,
           textOnly: action.textOnly,
+          verbose: request.verbose,
         },
         false
       );
@@ -2194,8 +2195,17 @@ export async function executeInteractiveAction(
     result.coordinateSpace = await coordinateSpaceOnly(page, protocolVersion);
 
   if (request.shot || request.annotate || action.kind === "shot") {
+    const inferredFormat = request.shot?.match(/\.png$/i)
+      ? "png"
+      : request.shot?.match(/\.jpe?g$/i)
+        ? "jpeg"
+        : undefined;
+    const shotFormat = request.shotFormat ?? inferredFormat ??
+      (action.kind === "shot" || request.annotateMode === "raster" ? "png" : "jpeg");
     const name =
-      request.shot && request.shot !== "auto" ? request.shot : automaticScreenshotName(action.kind);
+      request.shot && request.shot !== "auto"
+        ? request.shot
+        : automaticScreenshotName(action.kind, shotFormat);
     let focusedShotTarget: ActionTargetMetadata | undefined;
     if (action.kind === "shot" && action.ref) {
       const resolved = await resolveRef(page, action.ref, {
@@ -2235,7 +2245,10 @@ export async function executeInteractiveAction(
       screenshotName: request.annotate ? undefined : name,
       annotatedName: request.annotate ? name : undefined,
       annotate: request.annotate,
+      annotateMode: request.annotateMode,
       fullPage: request.fullPage,
+      format: shotFormat,
+      scale: request.shotScale,
       timeoutMs: request.shotTimeoutMs ?? Math.min(request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, 8_000),
       annotationElements: matchRefs
         ? visualPerception.allElements.filter((element) => matchRefs.has(element.ref))

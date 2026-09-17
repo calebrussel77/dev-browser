@@ -46,7 +46,10 @@ pub struct InteractiveRequestOptions<'a> {
     pub page: &'a str,
     pub shot: Option<&'a str>,
     pub annotate: bool,
+    pub annotate_mode: &'a str,
     pub full_page: bool,
+    pub shot_format: Option<&'a str>,
+    pub shot_scale: &'a str,
     pub shot_timeout_ms: u64,
     pub connect: Option<&'a str>,
     pub headless: bool,
@@ -143,8 +146,17 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if options.annotate {
         request["annotate"] = Value::Bool(true);
     }
+    if options.annotate_mode != "dom" {
+        request["annotateMode"] = Value::String(options.annotate_mode.to_string());
+    }
     if options.full_page {
         request["fullPage"] = Value::Bool(true);
+    }
+    if let Some(format) = options.shot_format {
+        request["shotFormat"] = Value::String(format.to_string());
+    }
+    if options.shot_scale != "css" {
+        request["shotScale"] = Value::String(options.shot_scale.to_string());
     }
     request["shotTimeoutMs"] = Value::Number(options.shot_timeout_ms.into());
     if let Some(connect) = options.connect {
@@ -201,7 +213,10 @@ mod tests {
                 page: "TARGET",
                 shot: Some("state.png"),
                 annotate: true,
+                annotate_mode: "raster",
                 full_page: true,
+                shot_format: Some("jpeg"),
+                shot_scale: "device",
                 shot_timeout_ms: 8_000,
                 connect: Some("auto"),
                 headless: false,
@@ -222,7 +237,10 @@ mod tests {
         assert_eq!(request["connect"], "auto");
         assert_eq!(request["shot"], "state.png");
         assert_eq!(request["annotate"], true);
+        assert_eq!(request["annotateMode"], "raster");
         assert_eq!(request["fullPage"], true);
+        assert_eq!(request["shotFormat"], "jpeg");
+        assert_eq!(request["shotScale"], "device");
         assert_eq!(request["shotTimeoutMs"], 8_000);
         assert_eq!(request["action"]["kind"], "read");
         assert_eq!(request["session"], "opaque-session");
@@ -302,7 +320,10 @@ mod tests {
                 page: "main",
                 shot: None,
                 annotate: false,
+                annotate_mode: "dom",
                 full_page: false,
+                shot_format: None,
+                shot_scale: "css",
                 shot_timeout_ms: 8_000,
                 connect: None,
                 headless: false,
