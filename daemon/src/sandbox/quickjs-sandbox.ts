@@ -190,9 +190,26 @@ export class QuickJSSandbox {
   #flushPromise?: Promise<void>;
   #disposed = false;
   #initialized = false;
+  #signalAbort?: () => void;
+  readonly #abortNotice = new Promise<void>((resolve) => {
+    this.#signalAbort = resolve;
+  });
 
   constructor(options: QuickJSSandboxOptions) {
     this.#options = options;
+  }
+
+  /**
+   * Cancels the running script from the outside: the pending-work drain loop
+   * observes the injected error on its next pass and `executeScript` rejects,
+   * so the sandbox, its pages, and the caller's browser lock are released
+   * instead of the script running to its full timeout with nobody listening.
+   * The primary caller is the daemon when the CLI that submitted the script
+   * dies (killed process, closed socket) before the script finishes.
+   */
+  abort(reason: Error): void {
+    this.#asyncError ??= reason;
+    this.#signalAbort?.();
   }
 
   async initialize(): Promise<void> {
@@ -642,7 +659,9 @@ export class QuickJSSandbox {
       return;
     }
 
-    await Promise.race(this.#pendingHostOperations);
+    // Race the abort notice too: a long host operation (a slow navigation, a
+    // multi-second wait) must not delay an external abort until it settles.
+    await Promise.race([...this.#pendingHostOperations, this.#abortNotice]);
     this.#throwIfAsyncError();
     await this.#flushTransportQueue();
     this.#throwIfAsyncError();

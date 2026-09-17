@@ -80,6 +80,35 @@ describe.sequential("QuickJS sandbox integration", () => {
     expect(output.stderr.join("")).toBe("");
   }, 120_000);
 
+  it("aborts a running script promptly when the submitting client goes away", async () => {
+    const output = createOutput();
+    const controller = new AbortController();
+    const started = Date.now();
+
+    const run = runScript(
+      `
+        const page = await browser.getPage("abort");
+        await page.waitForTimeout(120_000);
+        console.log("unreachable");
+      `,
+      manager,
+      "default",
+      output.sink,
+      {
+        timeout: 180_000,
+        signal: controller.signal,
+      }
+    );
+    setTimeout(() => controller.abort(), 1_000);
+
+    // The abort must interrupt the in-flight host wait, not ride out the
+    // script timeout: a killed CLI otherwise leaves the daemon driving the
+    // browser blind for minutes while holding the browser lock.
+    await expect(run).rejects.toThrow(/disconnected/);
+    expect(Date.now() - started).toBeLessThan(30_000);
+    expect(output.stdout.join("")).not.toContain("unreachable");
+  }, 120_000);
+
   it("supports locator operations", async () => {
     const output = createOutput();
 

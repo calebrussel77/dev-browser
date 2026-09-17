@@ -11,7 +11,7 @@ export async function runScript(
   manager: BrowserManager,
   browserName: string,
   output: ScriptOutput,
-  options: { timeout?: number; memoryLimitBytes?: number } = {}
+  options: { timeout?: number; memoryLimitBytes?: number; signal?: AbortSignal } = {}
 ): Promise<void> {
   const sandbox = new QuickJSSandbox({
     manager,
@@ -22,10 +22,21 @@ export async function runScript(
     timeoutMs: options.timeout,
   });
 
+  const onAbort = () => {
+    sandbox.abort(
+      new Error(
+        "Script aborted: the client that submitted it disconnected before it finished"
+      )
+    );
+  };
+  if (options.signal?.aborted) onAbort();
+  options.signal?.addEventListener("abort", onAbort);
+
   try {
     await sandbox.initialize();
     await sandbox.executeScript(`(async () => {\n${script}\n})()`);
   } finally {
+    options.signal?.removeEventListener("abort", onAbort);
     await sandbox.dispose();
   }
 }
