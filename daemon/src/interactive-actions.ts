@@ -411,37 +411,93 @@ async function readConfirmationText(page: Page): Promise<string> {
   return text.replace(/\s+/g, " ").trim().slice(0, MAX_CONFIRMATION_TEXT_LENGTH);
 }
 
-async function requireExpectedText(page: Page, expected: string): Promise<string> {
-  const text = await readConfirmationText(page);
-  if (!normalizeText(text).includes(normalizeText(expected))) {
-    throw new AgentProtocolError(
-      "CONFIRMATION_INVALID",
-      "Current confirmation text does not match the expected recipient or action",
-      true
-    );
-  }
-  return text;
+interface ConfirmationRead {
+  text: string;
+  scope: "target-dialog" | "last-dialog" | "body";
 }
 
-// The dialog-less addressing guard (click --require-ancestor-text): the
-// "card" is the nearest ancestor that plausibly forms a self-contained block.
-// Nearest-first keeps the checked region small (a sidebar row's <li> wins over
-// the section that contains every row), which is what makes the guard
-// meaningful; when nothing card-like exists below a landmark, the outermost
-// ancestor still inside that landmark is the block. Failures are typed and
-// happen before any input is attempted — the guard fails closed.
+/**
+ * Reads the confirmation text from the dialog that actually CONTAINS the
+ * target, not from "the last visible dialog on the page". Real pages keep
+ * unrelated [role=dialog] surfaces mounted permanently (LinkedIn's messaging
+ * overlay is one), and those can sit after the real modal in DOM order — a
+ * page-level read then verifies the wrong surface and refuses every value,
+ * including the target's own label. Falls back to the historical page-level
+ * read when the target has no dialog ancestor (or no target was given).
+ */
+async function readConfirmationContext(
+  page: Page,
+  resolved?: ResolvedActionTarget
+): Promise<ConfirmationRead> {
+  if (resolved) {
+    const dialogText = await resolved.locator
+      .evaluate((element) => {
+        const dialog = element.closest('dialog,[role="dialog"]');
+        if (!dialog) return null;
+        return (dialog as HTMLElement).innerText ?? dialog.textContent ?? "";
+      })
+      .catch(() => null);
+    if (dialogText !== null) {
+      return {
+        text: dialogText.replace(/\s+/g, " ").trim().slice(0, MAX_CONFIRMATION_TEXT_LENGTH),
+        scope: "target-dialog",
+      };
+    }
+  }
+  const dialogs = page.locator('[role="dialog"]:visible, dialog:visible');
+  const count = await dialogs.count();
+  const text =
+    count > 0 ? await dialogs.nth(count - 1).innerText() : await page.locator("body").innerText();
+  return {
+    text: text.replace(/\s+/g, " ").trim().slice(0, MAX_CONFIRMATION_TEXT_LENGTH),
+    scope: count > 0 ? "last-dialog" : "body",
+  };
+}
+
+async function requireExpectedText(
+  page: Page,
+  expected: string,
+  resolved?: ResolvedActionTarget
+): Promise<string> {
+  const read = await readConfirmationContext(page, resolved);
+  if (!normalizeText(read.text).includes(normalizeText(expected))) {
+    throw new AgentProtocolError(
+      "CONFIRMATION_INVALID",
+      `Current confirmation text does not match the expected recipient or action (read from ${read.scope})`,
+      true,
+      // Surfacing what was actually read turns "it does not match" from a
+      // dead end into a one-look diagnosis. The expected value itself is
+      // request-scoped sensitive and is redacted by the response pipeline.
+      { details: { scope: read.scope, observed: read.text.slice(0, 300) } }
+    );
+  }
+  return read.text;
+}
+
+// The dialog-less addressing guard (click --require-ancestor-text): candidate
+// "cards" are the ancestors that plausibly form self-contained blocks,
+// examined nearest-first so the smallest region wins (a sidebar row's <li>
+// beats the section containing every row). When the nearest card does not
+// carry the text, the guard escalates outward through enclosing cards — a
+// composer's <form> rarely contains the recipient name shown in the header
+// of the same dialog — but never past two hard boundaries: a dialog ancestor
+// (a modal is self-contained; the page underneath it must not vouch for it)
+// and the enclosing landmark (main/nav/header/footer) or body. Failures are
+// typed and happen before any input is attempted — the guard fails closed.
 const CARD_ANCESTOR_SELECTOR =
   "article,li,dialog,td,tr,fieldset,form,section,aside," +
   "[role='listitem'],[role='article'],[role='group'],[role='row'],[role='dialog'],[role='region']";
 const LANDMARK_BOUNDARY_SELECTOR = "main,nav,header,footer";
+const DIALOG_BOUNDARY_SELECTOR = "dialog,[role='dialog']";
 const MAX_ANCESTOR_GUARD_TEXT_LENGTH = 8_000;
+const MAX_ANCESTOR_GUARD_CANDIDATES = 5;
 
 async function enforceAncestorGuard(
   resolved: ResolvedActionTarget,
   required: string,
   pageName: string
 ): Promise<{ matched: boolean; card: string }> {
-  const found = await resolved.locator.evaluate(
+  const candidates = await resolved.locator.evaluate(
     (element, selectors) => {
       const describe = (node: Element) => {
         const tag = node.tagName.toLowerCase();
@@ -449,43 +505,53 @@ async function enforceAncestorGuard(
         const role = node.getAttribute("role");
         return `${tag}${id}${role ? `[role=${role}]` : ""}`;
       };
-      let card: Element | null = null;
+      const textOf = (node: Element) =>
+        ((node as HTMLElement).innerText ?? node.textContent ?? "").slice(0, selectors.maxChars);
+      const cards: Array<{ card: string; text: string }> = [];
       let below: Element = element;
       let current: Element | null = element.parentElement;
-      while (current && current !== document.body) {
+      while (current && current !== document.body && cards.length < selectors.maxCandidates) {
         if (current.matches(selectors.card)) {
-          card = current;
-          break;
-        }
-        if (current.matches(selectors.landmark)) {
-          card = below;
+          cards.push({ card: describe(current), text: textOf(current) });
+          // A dialog is self-contained: nothing above it may vouch for a
+          // target inside it, so it is always the outermost candidate.
+          if (current.matches(selectors.dialog)) break;
+        } else if (current.matches(selectors.landmark)) {
           break;
         }
         below = current;
         current = current.parentElement;
       }
-      card ??= below;
-      const text = ((card as HTMLElement).innerText ?? card.textContent ?? "").slice(
-        0,
-        selectors.maxChars
-      );
-      return { card: describe(card), text };
+      // Nothing card-like below the boundary: the outermost plain block
+      // still inside it is the only bounded region available.
+      if (cards.length === 0) cards.push({ card: describe(below), text: textOf(below) });
+      return cards;
     },
     {
       card: CARD_ANCESTOR_SELECTOR,
       landmark: LANDMARK_BOUNDARY_SELECTOR,
+      dialog: DIALOG_BOUNDARY_SELECTOR,
       maxChars: MAX_ANCESTOR_GUARD_TEXT_LENGTH,
+      maxCandidates: MAX_ANCESTOR_GUARD_CANDIDATES,
     }
   );
-  if (!normalizeText(found.text).includes(normalizeText(required))) {
+  const requiredNormalized = normalizeText(required);
+  const match = candidates.find((candidate) =>
+    normalizeText(candidate.text).includes(requiredNormalized)
+  );
+  if (!match) {
+    const examined = candidates.map((candidate) => candidate.card).join(", ");
     throw new AgentProtocolError(
       "ASSERTION_FAILED",
-      `Ancestor guard failed: the target's nearest self-contained card (${found.card}) does not contain the required text, so the click was not attempted. The target likely belongs to a different block than intended.`,
+      `Ancestor guard failed: none of the target's self-contained card ancestors (${examined}) contain the required text, so the click was not attempted. The target likely belongs to a different block than intended.`,
       true,
-      { details: { card: found.card }, nextCommands: [observeRecoveryCommand(pageName)] }
+      {
+        details: { cards: candidates.map((candidate) => candidate.card) },
+        nextCommands: [observeRecoveryCommand(pageName)],
+      }
     );
   }
-  return { matched: true, card: found.card };
+  return { matched: true, card: match.card };
 }
 
 function confirmationScope(
@@ -995,7 +1061,7 @@ export async function executeInteractiveAction(
           if (!action.fromState)
             throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
           confirmationTokens.consume(action.confirmToken, confirmationScope(
-            request, page, resolved, "", await readConfirmationText(page), action.fromState
+            request, page, resolved, "", (await readConfirmationContext(page, resolved)).text, action.fromState
           ));
         }
         await resolved.locator.setInputFiles({
@@ -1289,7 +1355,9 @@ export async function executeInteractiveAction(
         if (action.confirmToken && !confirmationConsumed) {
           if (!resolved || !action.fromState)
             throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
-          const confirmationText = await readConfirmationText(page);
+          // Same scoped read as issuance: the token's confirmationText hash
+          // must be computed from the target's own dialog on both sides.
+          const confirmationText = (await readConfirmationContext(page, resolved)).text;
           confirmationTokens.consume(action.confirmToken, confirmationScope(
             request, page, resolved, "", confirmationText, action.fromState
           ));
@@ -1598,7 +1666,7 @@ export async function executeInteractiveAction(
             if (!resolvedTypeTarget || !action.fromState)
               throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
             confirmationTokens.consume(action.confirmToken, confirmationScope(
-              request, page, resolvedTypeTarget, "", await readConfirmationText(page), action.fromState
+              request, page, resolvedTypeTarget, "", (await readConfirmationContext(page, resolvedTypeTarget)).text, action.fromState
             ));
             typeConfirmationConsumed = true;
           }
@@ -1765,7 +1833,7 @@ export async function executeInteractiveAction(
               if (!targets[0] || !action.fromState)
                 throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation token requires its issued state and ref target", true);
               confirmationTokens.consume(action.confirmToken, confirmationScope(
-                request, page, targets[0], "", await readConfirmationText(page), action.fromState
+                request, page, targets[0], "", (await readConfirmationContext(page, targets[0])).text, action.fromState
               ));
               primitiveConfirmationConsumed = true;
             }
@@ -1912,7 +1980,6 @@ export async function executeInteractiveAction(
         if (!action.expectText || !action.ref)
           throw new AgentProtocolError("CONFIRMATION_INVALID", "Protocol v2 confirmation requires --ref and --expect", true);
         await validateDecisionRefs([action.ref]);
-        const text = await requireExpectedText(page, action.expectText);
         const perception = await perceive(page, {}, false);
         applyPerception(result, perception, protocolVersion);
         const resolved = await resolveRef(page, action.ref, {
@@ -1920,6 +1987,10 @@ export async function executeInteractiveAction(
           hitTest: false, applicability: "pointer", legacyRefs: false,
         });
         try {
+          // Read the confirmation text from the target's own dialog: the
+          // token binds this exact text, and the consuming click re-reads it
+          // the same way, so both sides verify the surface being acted on.
+          const text = await requireExpectedText(page, action.expectText, resolved);
           const issued = confirmationTokens.issue(confirmationScope(
             request, page, resolved, action.expectText, text, perception.stateId
           ));

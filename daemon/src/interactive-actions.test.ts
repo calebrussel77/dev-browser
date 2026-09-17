@@ -10,6 +10,7 @@ import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js"
 import { executeInteractiveAction, type InteractiveResult } from "./interactive-actions.js";
 import { pageLeases } from "./sessions.js";
 import { redactSensitive } from "./redaction.js";
+import { writeDevBrowserTempFile } from "./temp-files.js";
 import {
   startAgentReliabilityFixture,
   type AgentReliabilityFixture,
@@ -1156,6 +1157,149 @@ describe.sequential("interactive Playwright actions", () => {
       ...request({ kind: "click", ref, method: "locator", fromState: fresh.stateId!, confirmToken: fresh.confirmationToken! }),
       protocolVersion: 2,
     }, { beforeTrustedInput: () => page.locator("#send").evaluate((button) => button.replaceWith(button.cloneNode(true))) })).rejects.toMatchObject({ code: "STALE_REF" });
+  });
+
+  it("confirm reads the target's own dialog even when an unrelated dialog comes later in the DOM", async () => {
+    // LinkedIn keeps its messaging overlay ([role=dialog]) mounted after the
+    // invitation modal in DOM order; a last-visible-dialog read verifies the
+    // wrong surface and refuses every value, including the target's label.
+    const page = await manager.getPage(browserName, "modal-page");
+    await page.setContent(`
+      <div role="dialog" aria-label="Ajouter une note à votre invitation ?">
+        Personnalisez l'invitation que vous envoyez à Steve Salomon MADIBA N. en ajoutant une note.
+        <button id="send-no-note">Envoyer sans note</button>
+      </div>
+      <div role="dialog" aria-label="Messagerie">Messagerie Vous êtes à jour</div>
+      <script>window.__sent = 0; document.querySelector('#send-no-note').onclick = () => window.__sent++;</script>
+    `);
+    const run = (action: Parameters<typeof executeInteractiveAction>[1]["action"]) =>
+      executeInteractiveAction(manager, {
+        id: "test-scoped-confirm",
+        type: "interactive",
+        protocolVersion: 2,
+        browser: browserName,
+        page: "modal-page",
+        action,
+      });
+
+    const observed = await run({ kind: "observe", full: false, delta: false, track: "scoped-confirm", maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 });
+    const ref = observed.elements!.find((element) => element.name === "Envoyer sans note")!.ref;
+
+    // The recipient's name lives only in the FIRST dialog; the read must
+    // come from the target's dialog, not the page's last one.
+    const confirmed = await run({ kind: "confirm", ref, expectText: "Steve Salomon MADIBA" });
+    expect(confirmed.confirmationToken).toMatch(/^[A-Za-z0-9_-]{32}$/);
+
+    // A wrong recipient still fails, and the error names what was read.
+    await expect(run({ kind: "confirm", ref, expectText: "Une Autre Personne" })).rejects.toMatchObject({
+      code: "CONFIRMATION_INVALID",
+      details: expect.objectContaining({ scope: "target-dialog", observed: expect.stringContaining("MADIBA") }),
+    });
+
+    // The token consumes against the same scoped read: the guarded click works.
+    const fresh = await run({ kind: "confirm", ref, expectText: "Steve Salomon MADIBA" });
+    await run({ kind: "click", ref, method: "locator", fromState: fresh.stateId!, confirmToken: fresh.confirmationToken! });
+    expect(await page.evaluate(() => (window as { __sent?: number }).__sent)).toBe(1);
+  });
+
+  it("consumes upload, type, and primitive confirmation tokens against each target dialog", async () => {
+    const run = (pageName: string, action: Parameters<typeof executeInteractiveAction>[1]["action"]) =>
+      executeInteractiveAction(manager, {
+        id: `test-scoped-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        browser: browserName,
+        page: pageName,
+        action,
+      });
+    const prepare = async (pageName: string, markup: string, targetName: string) => {
+      const page = await manager.getPage(browserName, pageName);
+      await page.setContent(`${markup}<div role="dialog">Unrelated persistent messaging overlay</div>`);
+      const observed = await run(pageName, {
+        kind: "observe", full: false, delta: false, track: pageName,
+        maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50,
+      });
+      const ref = observed.elements!.find((element) => element.name === targetName)!.ref;
+      const confirmation = await run(pageName, {
+        kind: "confirm", ref, expectText: "Scoped Recipient", fromState: observed.stateId,
+      });
+      return { page, ref, confirmation };
+    };
+
+    const typed = await prepare(
+      "scoped-type",
+      '<div role="dialog">Scoped Recipient <input aria-label="Invitation note"></div>',
+      "Invitation note"
+    );
+    await run("scoped-type", {
+      kind: "type", ref: typed.ref, text: "hello", clear: true, delayMs: 0,
+      fromState: typed.confirmation.stateId!, confirmToken: typed.confirmation.confirmationToken!,
+    });
+    expect(await typed.page.getByLabel("Invitation note").inputValue()).toBe("hello");
+
+    const checked = await prepare(
+      "scoped-primitive",
+      '<div role="dialog">Scoped Recipient <label><input type="checkbox"> Approve invitation</label></div>',
+      "Approve invitation"
+    );
+    await run("scoped-primitive", {
+      kind: "check", ref: checked.ref,
+      fromState: checked.confirmation.stateId!, confirmToken: checked.confirmation.confirmationToken!,
+    });
+    expect(await checked.page.getByRole("checkbox").isChecked()).toBe(true);
+
+    const uploaded = await prepare(
+      "scoped-upload",
+      '<div role="dialog">Scoped Recipient <input type="file" aria-label="Invitation attachment"></div>',
+      "Invitation attachment"
+    );
+    const controlled = await writeDevBrowserTempFile("uploads/scoped-confirmation.txt", "safe");
+    await run("scoped-upload", {
+      kind: "upload", ref: uploaded.ref, file: controlled,
+      fromState: uploaded.confirmation.stateId!, confirmToken: uploaded.confirmation.confirmationToken!,
+    });
+    expect(await uploaded.page.getByLabel("Invitation attachment").evaluate(
+      (input) => (input as HTMLInputElement).files?.[0]?.name
+    )).toBe("scoped-confirmation.txt");
+  });
+
+  it("ancestor guard escalates through enclosing cards but never past a dialog boundary", async () => {
+    const page = await manager.getPage(browserName, "composer-page");
+    await page.setContent(`
+      <main>
+        Eric Nahounou est mentionné quelque part dans la page, hors du composeur.
+        <div role="dialog" aria-label="Composer">
+          <header>Rasheed Bello</header>
+          <form><textarea aria-label="Message"></textarea><button type="button" id="composer-send">Envoyer</button></form>
+        </div>
+      </main>
+      <script>window.__composerClicks = 0; document.querySelector('#composer-send').onclick = () => window.__composerClicks++;</script>
+    `);
+    const run = (action: Parameters<typeof executeInteractiveAction>[1]["action"]) =>
+      executeInteractiveAction(manager, {
+        id: "test-guard-escalation",
+        type: "interactive",
+        protocolVersion: 2,
+        browser: browserName,
+        page: "composer-page",
+        action,
+      });
+    const found = await run({ kind: "find", name: "Envoyer", nameMode: "exact", scope: "visible", states: [], limit: 5 });
+    const ref = found.matches![0]!.ref;
+
+    // The <form> card lacks the recipient shown in the composer header, but
+    // the enclosing dialog carries it: escalation makes the guard pass.
+    const clicked = await run({ kind: "click", ref, method: "mouse", requireAncestorText: "Rasheed Bello" });
+    expect(clicked.ancestorGuard).toMatchObject({ matched: true, card: expect.stringContaining("dialog") });
+    expect(await page.evaluate(() => (window as { __composerClicks?: number }).__composerClicks)).toBe(1);
+
+    // A dialog is self-contained: text outside it must never vouch for a
+    // target inside it, however present it is on the page.
+    const refound = await run({ kind: "find", name: "Envoyer", nameMode: "exact", scope: "visible", states: [], limit: 5 });
+    await expect(
+      run({ kind: "click", ref: refound.matches![0]!.ref, method: "mouse", requireAncestorText: "Eric Nahounou" })
+    ).rejects.toMatchObject({ code: "ASSERTION_FAILED" });
+    expect(await page.evaluate(() => (window as { __composerClicks?: number }).__composerClicks)).toBe(1);
   });
 
   it("rejects stale v2 decisions before trusted input and allows unrelated attributes", async () => {
