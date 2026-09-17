@@ -125,9 +125,9 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 
 **Fichiers :** créer `scripts/bench-cli.mjs` (annexe B).
 
-- [ ] Script Node sans dépendance : lance N fois (défaut 5) chaque commande d'une liste, mesure le temps mur du processus `dev-browser`, la taille de stdout, le code de sortie ; imprime la médiane et l'écart par commande en Markdown.
-- [ ] Paramètres : `DEV_BROWSER_BIN` (chemin du binaire, défaut `dev-browser`), `CONNECT` (défaut `http://127.0.0.1:9223`), `PAGE` (target id ou nom de page), `URL_FILTER` (pour retrouver la cible via `pages` si `PAGE` est absent).
-- [ ] Les commandes incluent uniquement des actions autorisées (section 4) : `pages`, `observe`, `observe --within main`, `find --role button --name-mode contains --name <valeur passée en paramètre> --within main`, `text --within main`, `shot`, `click --ref <ref d'une ligne de conversation trouvée par find>`, `press --ref <ref> Escape`, `scroll --direction down --pages 1`.
+- [x] Script Node sans dépendance : lance N fois (défaut 5) chaque commande d'une liste, mesure le temps mur du processus `dev-browser`, la taille de stdout, le code de sortie ; imprime la médiane et l'écart par commande en Markdown.
+- [x] Paramètres : `DEV_BROWSER_BIN` (chemin du binaire, défaut `dev-browser`), `CONNECT` (défaut `http://127.0.0.1:9223`), `PAGE` (target id ou nom de page), `URL_FILTER` (pour retrouver la cible via `pages` si `PAGE` est absent).
+- [x] Les commandes incluent uniquement des actions autorisées (section 4) : `pages`, `observe`, `observe --within main`, `find --role button --name-mode contains --name <valeur passée en paramètre> --within main`, `text --within main`, `shot`, `click --ref <ref d'une ligne de conversation trouvée par find>`, `press --ref <ref> Escape`, `scroll --direction down --pages 1`.
 
 **Critères d'acceptation :** exécution en PowerShell et en bash ; tableau produit avec médianes ; aucune commande interdite dans la liste.
 
