@@ -114,10 +114,10 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 
 **Fichiers :** créer `daemon/src/perf/bench-actions.test.ts`, `daemon/src/perf/heavy-page.ts` (générateur de page synthétique), `scripts/count-cdp.mjs`.
 
-- [ ] Créer le test Vitest de l'annexe A. Il est ignoré sauf si `BENCH=1` (`it.skipIf(!process.env.BENCH)`), pour ne pas ralentir la CI.
-- [ ] Il mesure pour chaque commande : latence (ms), taille de la réponse en JSON pretty (ce que le CLI imprime aujourd'hui) et compact, tokens estimés (caractères / 4), et écrit un tableau Markdown dans le fichier `BENCH_OUT`.
-- [ ] Le comptage CDP se fait en lançant avec `DEBUG=pw:protocol` et en redirigeant stderr vers un fichier, puis `node scripts/count-cdp.mjs <fichier>` (annexe A) compte les `SEND ►` entre les marqueurs `@@MARK <étape> START/END` écrits par le bench.
-- [ ] Ajouter dans `daemon/package.json` : `"bench": "cross-env BENCH=1 vitest run src/perf/bench-actions.test.ts"` ou, sans dépendance, documenter la commande PowerShell `$env:BENCH=1; $env:BENCH_OUT="../docs/perf/local.md"; pnpm vitest run src/perf/bench-actions.test.ts`.
+- [x] Créer le test Vitest de l'annexe A. Il est ignoré sauf si `BENCH=1` (`it.skipIf(!process.env.BENCH)`), pour ne pas ralentir la CI.
+- [x] Il mesure pour chaque commande : latence (ms), taille de la réponse en JSON pretty (ce que le CLI imprime aujourd'hui) et compact, tokens estimés (caractères / 4), et écrit un tableau Markdown dans le fichier `BENCH_OUT`.
+- [x] Le comptage CDP se fait en lançant avec `DEBUG=pw:protocol` et en redirigeant stderr vers un fichier, puis `node scripts/count-cdp.mjs <fichier>` (annexe A) compte les `SEND ►` entre les marqueurs `@@MARK <étape> START/END` écrits par le bench.
+- [x] Ajouter dans `daemon/package.json` : `"bench": "cross-env BENCH=1 vitest run src/perf/bench-actions.test.ts"` ou, sans dépendance, documenter la commande PowerShell `$env:BENCH=1; $env:BENCH_OUT="../docs/perf/local.md"; pnpm vitest run src/perf/bench-actions.test.ts`.
 
 **Critères d'acceptation :** le bench tourne en < 60 s sur la machine du propriétaire ; il produit les colonnes latence / bytes pretty / bytes compact / tokens / messages CDP pour au moins : `observe` défaut, `observe --within main`, `find`, `click --ref`, `click --ref --shot`, `click --ref --wait-text`, `type --ref`, `press`, `scroll`, `text`, `assert`, `shot`, `navigate`, script sandbox ×2, et les primitives brutes `collectPageState`, `collectLiveSnapshot`, `resolveActionTarget`.
 
