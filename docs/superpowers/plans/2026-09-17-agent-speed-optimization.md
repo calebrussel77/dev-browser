@@ -133,8 +133,8 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 
 ### Tâche 0.3 — Ligne de base consignée
 
-- [ ] Exécuter 0.1 (local) et 0.2 (live : onglet `/messaging/` et onglet `/feed/` de LinkedIn, plus un onglet d'une autre application) sur la machine du propriétaire, **avant** toute modification.
-- [ ] Commiter `docs/perf/baseline.md` avec les trois tableaux, la version de Chrome (`/json/version`), le DPR, la date, le commit.
+- [x] Exécuter 0.1 (local) et 0.2 (live : onglet `/messaging/` et onglet `/feed/` de LinkedIn, plus un onglet d'une autre application) sur la machine du propriétaire, **avant** toute modification.
+- [x] Commiter `docs/perf/baseline.md` avec les trois tableaux, la version de Chrome (`/json/version`), le DPR, la date, le commit.
 
 **Critères d'acceptation :** `docs/perf/baseline.md` existe, contient les tableaux, et la commande utilisée pour chaque tableau est reproduite dedans.
 
