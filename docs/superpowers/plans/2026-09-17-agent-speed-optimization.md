@@ -151,11 +151,11 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 
 **Fichiers :** `daemon/src/interactive-actions.ts` (`applyPerception`, `InteractiveResult`), `daemon/src/protocol.ts` (nouveau champ de requête `elements?: boolean` et `verbose?: boolean`), `cli/src/main.rs` (flag global `--elements` et `--verbose` dans `PageActionArgs` et pour `Observe`), `cli/src/interactive.rs` (`build_interactive_request`), `cli/src/discovery.rs`, `daemon/src/perception/collector.ts` (fonction `compactElement`), tests.
 
-- [ ] Ajouter `compactElement(element: PerceptionElement)` dans `daemon/src/perception/collector.ts` qui renvoie uniquement : `ref`, `role`, `name`, `box` (entiers arrondis), `landmark`, et les booléens/états **non nuls et non par défaut** (`disabled: true`, `checked`, `expanded`, `selected`, `pressed`, `scrollable: true`, `obscured: true`, `focused: true`, `inViewport: false`), `frameId` seulement si différent de `F0`, `value`/`placeholder`/`inputType` seulement pour les champs de saisie, `stableAttributes` seulement les clés non vides. Pas de `quad`, `framePath`, `frameUrl`, `frameName`, `frameDocumentId`, `semanticAncestors`, `nearby` vide, `description` vide, `shadowContext` vide, `depth`.
-- [ ] Dans `applyPerception`, ne pas remplir `result.elements` sauf si la requête porte `elements: true` (forme compacte) ou `verbose: true` (forme complète actuelle). `find` continue de renvoyer `matches` (voir 1.4), pas `elements`.
-- [ ] `tree` reste renvoyé par défaut. Les refs des conteneurs scrollables restent visibles dans l'arbre (suffixe `(scrollable)` déjà présent).
-- [ ] CLI : `--elements` et `--verbose` acceptés sur toutes les commandes interactives ; `observe --verbose` équivaut à l'ancien comportement.
-- [ ] `schema --json` : `responseGrammar.commonOptional` retire `elements` du défaut et documente `elements` (compact, sur `--elements`) et `verbose`. Incrémenter `DISCOVERY_SCHEMA_VERSION`.
+- [x] Ajouter `compactElement(element: PerceptionElement)` dans `daemon/src/perception/collector.ts` qui renvoie uniquement : `ref`, `role`, `name`, `box` (entiers arrondis), `landmark`, et les booléens/états **non nuls et non par défaut** (`disabled: true`, `checked`, `expanded`, `selected`, `pressed`, `scrollable: true`, `obscured: true`, `focused: true`, `inViewport: false`), `frameId` seulement si différent de `F0`, `value`/`placeholder`/`inputType` seulement pour les champs de saisie, `stableAttributes` seulement les clés non vides. Pas de `quad`, `framePath`, `frameUrl`, `frameName`, `frameDocumentId`, `semanticAncestors`, `nearby` vide, `description` vide, `shadowContext` vide, `depth`.
+- [x] Dans `applyPerception`, ne pas remplir `result.elements` sauf si la requête porte `elements: true` (forme compacte) ou `verbose: true` (forme complète actuelle). `find` continue de renvoyer `matches` (voir 1.4), pas `elements`.
+- [x] `tree` reste renvoyé par défaut. Les refs des conteneurs scrollables restent visibles dans l'arbre (suffixe `(scrollable)` déjà présent).
+- [x] CLI : `--elements` et `--verbose` acceptés sur toutes les commandes interactives ; `observe --verbose` équivaut à l'ancien comportement.
+- [x] `schema --json` : `responseGrammar.commonOptional` retire `elements` du défaut et documente `elements` (compact, sur `--elements`) et `verbose`. Incrémenter `DISCOVERY_SCHEMA_VERSION`.
 
 **Tests :**
 - `daemon/src/perception/collector.test.ts` : `compactElement` omet les champs vides/nuls et arrondit `box` ; un élément désactivé garde `disabled: true` ; un élément de frame garde `frameId`.
@@ -164,6 +164,8 @@ Aucune optimisation n'est acceptée sans mesure avant/après produite par ces ou
 - `cli/src/main.rs` tests : `--elements`/`--verbose` parsent et se retrouvent dans la requête.
 
 **Critères d'acceptation :** bench 0.1 : `observe` défaut ≤ 8 KB pretty sur la page synthétique ; `click`/`type` défaut ≤ 6 KB ; `observe --elements` ≤ 25 KB ; `observe --verbose` = taille d'avant ± 5 %.
+
+Mesure intermédiaire 1.1 : `observe` 4,2 KB, `observe --elements` 22,6 KB, `observe --verbose` 105,9 KB contre 105,8 KB avant (+0,07 %). `click`/`type` sont à 8,0/8,1 KB ; la suppression des champs de bruit prévue en 1.3 est nécessaire pour franchir le seuil de 6 KB.
 
 **Test live :** `observe --page <messagerie> --within main` renvoie l'arbre avec les lignes de conversation et leurs refs ; `find` puis `click --ref` sur une ligne fonctionne sans `elements` ; `observe --elements` donne les boxes nécessaires à un `--xy`.
 
