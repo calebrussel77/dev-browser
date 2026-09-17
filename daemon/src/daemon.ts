@@ -13,7 +13,7 @@ import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
 import { getLatestStateId } from "./page-state.js";
 import { authorizeExecuteRequest } from "./execute-policy.js";
-import { createKeyedLock, createMutex } from "./lock.js";
+import { createBrowserPageLock, createMutex } from "./lock.js";
 import {
   getBrowsersDir,
   getDaemonEndpoint,
@@ -65,7 +65,7 @@ const EMBEDDED_PACKAGE_JSON = JSON.stringify({
 
 const manager = new BrowserManager(BROWSERS_DIR);
 const startedAt = Date.now();
-const withBrowserLock = createKeyedLock<string>();
+const { withBrowserLock, withPageLock } = createBrowserPageLock<string, string>();
 const withInstallLock = createMutex();
 const clients = new Set<net.Socket>();
 const operations = new OperationTracker();
@@ -165,6 +165,16 @@ async function prepareBrowser(request: {
   ignoreHTTPSErrors?: boolean;
   timeoutMs?: number;
 }): Promise<number> {
+  return withBrowserLock(request.browser, () => prepareBrowserUnlocked(request));
+}
+
+async function prepareBrowserUnlocked(request: {
+  browser: string;
+  connect?: string;
+  headless?: boolean;
+  ignoreHTTPSErrors?: boolean;
+  timeoutMs?: number;
+}): Promise<number> {
   const timeoutMs = request.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
 
   if (request.connect === "auto") {
@@ -191,7 +201,7 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
 
     try {
       authorizeExecuteRequest(request);
-      const timeoutMs = await prepareBrowser(request);
+      const timeoutMs = await prepareBrowserUnlocked(request);
       await runScript(
         request.script,
         manager,
@@ -245,7 +255,8 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
 }
 
 async function handleInteractive(socket: net.Socket, request: InteractiveRequest): Promise<void> {
-  await withBrowserLock(request.browser, async () => {
+  await prepareBrowser(request);
+  await withPageLock(request.browser, request.page, async () => {
     const startedAt = new Date().toISOString();
     const started = Date.now();
     const traceId = request.trace ? traceStore.allocateId() : undefined;
@@ -304,7 +315,6 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
       return { id: record.id, path: record.path, nextCommand: `dev-browser trace show ${record.id}` };
     };
     try {
-      await prepareBrowser(request);
       if (traceId) {
         traceWarnings.push(...traceCapabilityWarnings(manager.getBrowser(request.browser)?.type));
         tracePage = await manager.getPage(request.browser, request.page);
@@ -410,11 +420,13 @@ async function handleSession(socket: net.Socket, request: SessionRequest): Promi
 }
 
 async function handleVideo(socket: net.Socket, request: VideoRequest): Promise<void> {
-  await withBrowserLock(request.browser, async () => {
+  if (request.action === "start") {
+    await prepareBrowser(request);
+  }
+  await withPageLock(request.browser, request.page, async () => {
     try {
       let data: Record<string, unknown>;
       if (request.action === "start") {
-        await prepareBrowser(request);
         const page = await manager.getPage(request.browser, request.page);
         const started = await videoRecordings.start({
           browser: request.browser,
@@ -680,10 +692,12 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
         return;
 
       case "browser-stop":
-        // A recording cannot be salvaged once its browser is gone, so it is
-        // finalized while the browser is still connected.
-        await videoRecordings.finalizeAll(request.browser);
-        await manager.stopBrowser(request.browser);
+        await withBrowserLock(request.browser, async () => {
+          // A recording cannot be salvaged once its browser is gone, so it is
+          // finalized while the browser is still connected.
+          await videoRecordings.finalizeAll(request.browser);
+          await manager.stopBrowser(request.browser);
+        });
         await writeMessage(socket, {
           id: request.id,
           type: "result",
