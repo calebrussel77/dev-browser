@@ -39,6 +39,7 @@ pub fn agent_schema() -> Value {
             "observeMaxNodes": 1000,
             "observeMaxChars": 100000,
             "findMatches": 50,
+            "shadowDom": "observation covers light DOM and open shadow roots; closed shadow roots cannot be inspected",
             "refLength": 32,
             "confirmationTokenSeconds": 30,
             "shotTimeoutMsRange": "250..120000, defaults to min(timeoutMs, 8000)",
@@ -164,6 +165,10 @@ mod tests {
         assert_eq!(schema["protocolVersions"], json!([1, 2]));
         assert_eq!(schema["errors"]["confirmation"]["exitStatus"], 8);
         assert_eq!(schema["schemaVersion"], 2);
+        assert!(schema["limits"]["shadowDom"]
+            .as_str()
+            .unwrap()
+            .contains("closed shadow roots cannot be inspected"));
         assert!(!schema["responseGrammar"]["commonOptional"]
             .as_array()
             .unwrap()
