@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod connection;
 mod daemon;
 mod discovery;
@@ -48,6 +50,14 @@ fn parse_ref_id(value: &str) -> Result<String, String> {
     {
         return Err("ref must match R# or F#:R#".into());
     }
+    Ok(value.to_owned())
+}
+
+fn parse_fill_assignment(value: &str) -> Result<String, String> {
+    let (ref_id, _) = value
+        .split_once('=')
+        .ok_or_else(|| "fill must match REF=TEXT".to_owned())?;
+    parse_ref_id(ref_id)?;
     Ok(value.to_owned())
 }
 
@@ -330,10 +340,19 @@ struct PageActionArgs {
     )]
     shot_timeout: Option<u32>,
 
-    #[arg(long, value_enum, help = "Encode screenshots as PNG or JPEG (action --shot defaults to JPEG; shot defaults to PNG)")]
+    #[arg(
+        long,
+        value_enum,
+        help = "Encode screenshots as PNG or JPEG (action --shot defaults to JPEG; shot defaults to PNG)"
+    )]
     shot_format: Option<ShotFormat>,
 
-    #[arg(long, value_enum, default_value_t, help = "Use one pixel per CSS pixel or preserve device-pixel density")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        help = "Use one pixel per CSS pixel or preserve device-pixel density"
+    )]
     shot_scale: ShotScale,
 
     #[arg(
@@ -342,7 +361,12 @@ struct PageActionArgs {
     )]
     annotate: bool,
 
-    #[arg(long, value_enum, default_value_t, help = "Render annotations in a temporary DOM overlay or the PNG compatibility renderer")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        help = "Render annotations in a temporary DOM overlay or the PNG compatibility renderer"
+    )]
     annotate_mode: AnnotateMode,
 
     #[arg(
@@ -378,6 +402,24 @@ struct PageActionArgs {
         help = "Consume a scoped single-use confirmation token immediately before trusted input"
     )]
     confirm_token: Option<String>,
+}
+
+#[derive(Args)]
+struct SemanticTargetArgs {
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, value_enum, default_value = "exact", requires = "name")]
+    name_mode: NameMode,
+    #[arg(long)]
+    within: Option<String>,
+    #[arg(long)]
+    near: Option<String>,
+    #[arg(long)]
+    frame: Option<String>,
+    #[arg(long = "state", value_enum, action = clap::ArgAction::Append)]
+    states: Vec<FindState>,
 }
 
 #[derive(Subcommand)]
@@ -585,6 +627,61 @@ fn apply_retry_policy(action: &mut Value, retry: RetryPolicy) {
     action["retry"] = Value::String(retry.as_str().to_string());
 }
 
+fn has_semantic_target(target: &SemanticTargetArgs) -> bool {
+    target.role.is_some()
+        || target.name.is_some()
+        || target.within.is_some()
+        || target.near.is_some()
+        || target.frame.is_some()
+        || !target.states.is_empty()
+}
+
+fn apply_semantic_target(action: &mut Value, target: &SemanticTargetArgs) {
+    if let Some(role) = &target.role {
+        action["role"] = json!(role);
+    }
+    if let Some(name) = &target.name {
+        action["name"] = json!(name);
+        action["nameMode"] = json!(target.name_mode.as_str());
+    }
+    if let Some(within) = &target.within {
+        action["within"] = json!(within);
+    }
+    if let Some(near) = &target.near {
+        action["near"] = json!(near);
+    }
+    if let Some(frame) = &target.frame {
+        action["frame"] = json!(frame);
+    }
+    if !target.states.is_empty() {
+        action["states"] = json!(target
+            .states
+            .iter()
+            .map(|state| state.as_str())
+            .collect::<Vec<_>>());
+    }
+}
+
+fn apply_ref_or_semantic_target(
+    action: &mut Value,
+    ref_id: Option<&String>,
+    target: &SemanticTargetArgs,
+) -> Result<(), io::Error> {
+    let semantic = has_semantic_target(target);
+    if ref_id.is_some() == semantic {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provide exactly one of --ref or semantic target flags",
+        ));
+    }
+    if let Some(ref_id) = ref_id {
+        action["ref"] = json!(ref_id);
+    } else {
+        apply_semantic_target(action, target);
+    }
+    Ok(())
+}
+
 #[derive(Subcommand)]
 enum Command {
     #[command(
@@ -619,6 +716,14 @@ enum Command {
         url: Option<String>,
         #[arg(long = "url", value_name = "URL", id = "url_flag")]
         url_flag: Option<String>,
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            num_args = 0..=1,
+            default_missing_value = "main",
+            help = "Return the resulting observation scoped to SCOPE (defaults to main)"
+        )]
+        observe: Option<String>,
         #[command(flatten)]
         output: PageActionArgs,
     },
@@ -775,20 +880,29 @@ enum Command {
         about = "Click through trusted Playwright mouse or locator input",
         long_about = "Click exactly one ref or X,Y coordinate with trusted Playwright input, then return a fresh accessibility snapshot and change signals. Mouse mode clicks the center of a ref's current bounding box. Locator mode uses locator.click(). Retries default to never; --retry safe permits one retry only with strong evidence that no side effect or page change began, while --retry once is explicit but remains blocked for guarded or irreversible actions. Screenshot pixels and --xy coordinates both use CSS pixels."
     )]
-    #[command(group(clap::ArgGroup::new("click_target").required(true).args(["ref_id", "xy"])))]
     Click {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
+        #[arg(
+            long = "ref",
+            value_name = "REF",
+            value_parser = parse_ref_id,
+            conflicts_with = "xy",
+            required_unless_present_any = ["xy", "role", "name", "within", "near", "frame", "states"]
+        )]
         ref_id: Option<String>,
         #[arg(long, value_name = "X,Y")]
         xy: Option<Coordinates>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[arg(long, value_enum, default_value = "mouse")]
         method: ClickMethod,
         #[arg(long, value_enum, default_value = "never")]
         retry: RetryPolicy,
         #[arg(long, value_name = "TEXT")]
         expect_text: Option<String>,
+        #[arg(long = "then-text", value_name = "SCOPE")]
+        then_text: Option<String>,
         #[arg(
             long = "require-ancestor-text",
             value_name = "TEXT",
@@ -805,13 +919,26 @@ enum Command {
         about = "Focus and type through trusted Playwright keyboard input",
         long_about = "Focus an optional interactive ref with a real mouse click and enter text with a React-safe, input-kind-specific strategy (native value setter for input/textarea, insertText for contenteditable, keyboard fallback otherwise); the entered value is reread and a mismatch fails with typed INPUT_VALUE_MISMATCH. Use --clear to replace existing input or contenteditable text; without --clear, input/textarea entry deterministically appends to the end of the existing value regardless of caret position. --delay applies only to the keyboard fallback strategy."
     )]
+    #[command(group(clap::ArgGroup::new("type_input").required(true).args(["text", "fill"])))]
     Type {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_name = "REF", value_parser = parse_ref_id)]
         ref_id: Option<String>,
-        #[arg(long, value_name = "TEXT")]
-        text: String,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
+        #[arg(long, value_name = "TEXT", group = "type_input")]
+        text: Option<String>,
+        #[arg(
+            long,
+            value_name = "REF=TEXT",
+            value_parser = parse_fill_assignment,
+            action = clap::ArgAction::Append,
+            group = "type_input"
+        )]
+        fill: Vec<String>,
+        #[arg(long, value_name = "KEY")]
+        press: Option<String>,
         #[arg(long)]
         clear: bool,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
@@ -823,7 +950,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -831,7 +960,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[arg(long)]
         key: String,
         #[command(flatten)]
@@ -850,20 +981,22 @@ enum Command {
     Scroll {
         #[command(flatten)]
         output: PageActionArgs,
-        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction"], required_unless_present_any = ["delta_y", "direction", "until"])]
+        #[arg(long = "ref", value_parser = parse_ref_id, conflicts_with_all = ["delta_y", "direction"])]
         ref_id: Option<String>,
-        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"], required_unless_present_any = ["ref_id", "direction", "until"])]
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["ref_id", "direction", "until"])]
         delta_y: Option<f64>,
         #[arg(long, allow_hyphen_values = true, requires = "delta_y")]
         delta_x: Option<f64>,
-        #[arg(long, value_enum, conflicts_with_all = ["ref_id", "delta_y", "until"], requires = "pages", required_unless_present_any = ["ref_id", "delta_y", "until"])]
+        #[arg(long, value_enum, conflicts_with_all = ["ref_id", "delta_y", "until"], requires = "pages")]
         direction: Option<ScrollDirection>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "direction")]
         pages: Option<u8>,
         // `--ref CONTAINER --until ...` is a distinct container-relative scan
         // mode (see build of the scroll action below), so `until` conflicts
         // only with delta/direction, not with `ref`.
-        #[arg(long, conflicts_with_all = ["delta_y", "direction"], requires = "max_steps", required_unless_present_any = ["ref_id", "delta_y", "direction"])]
+        #[arg(long, conflicts_with_all = ["delta_y", "direction"], requires = "max_steps")]
         until: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=50), requires = "until")]
         max_steps: Option<u8>,
@@ -874,7 +1007,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[arg(long, conflicts_with = "label", required_unless_present = "label")]
         value: Option<String>,
         #[arg(long, conflicts_with = "value", required_unless_present = "value")]
@@ -886,7 +1021,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -894,7 +1031,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -902,7 +1041,9 @@ enum Command {
         #[command(flatten)]
         output: PageActionArgs,
         #[arg(long = "ref", value_parser = parse_ref_id)]
-        ref_id: String,
+        ref_id: Option<String>,
+        #[command(flatten)]
+        semantic: SemanticTargetArgs,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -979,6 +1120,18 @@ enum Command {
         strict_state: bool,
         #[arg(long, value_name = "SESSION_ID")]
         session: Option<String>,
+    },
+    #[command(
+        about = "Execute up to 20 interactive actions under one page lock",
+        long_about = "Read a batch JSON object from stdin or --file. The object contains page, steps, stopOnError, and observeAfter. Every step uses the same protocol-v2 action schema and keeps leases, confirmation tokens, and state guards enabled."
+    )]
+    Batch {
+        #[arg(
+            long,
+            value_name = "JSON_FILE",
+            help = "Read batch JSON from this file instead of stdin"
+        )]
+        file: Option<String>,
     },
     #[command(about = "Diagnose CLI, daemon, browser, and CDP runtime health")]
     Doctor {
@@ -1115,13 +1268,18 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Navigate {
             url,
             url_flag,
+            observe,
             output,
         }) => {
             let url = url
                 .as_deref()
                 .or(url_flag.as_deref())
                 .expect("clap enforces one URL form");
-            run_page_action(&cli, output, json!({ "kind": "navigate", "url": url }))
+            let mut action = json!({ "kind": "navigate", "url": url });
+            if let Some(observe) = observe {
+                action["observe"] = json!(observe);
+            }
+            run_page_action(&cli, output, action)
         }
         Some(Command::Back { output, wait }) => {
             let mut action = json!({ "kind": "back" });
@@ -1245,13 +1403,27 @@ fn run() -> Result<i32, Box<dyn Error>> {
             output,
             ref_id,
             xy,
+            semantic,
             method,
             retry,
             expect_text,
+            then_text,
             require_ancestor_text,
             wait_for,
             wait,
         }) => {
+            let semantic_target = has_semantic_target(semantic);
+            if usize::from(ref_id.is_some())
+                + usize::from(xy.is_some())
+                + usize::from(semantic_target)
+                != 1
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provide exactly one of --ref, --xy, or semantic target flags",
+                )
+                .into());
+            }
             if xy.is_some() && matches!(method, ClickMethod::Locator) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1271,8 +1443,14 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 action["x"] = json!(coordinates.x);
                 action["y"] = json!(coordinates.y);
             }
+            if semantic_target {
+                apply_semantic_target(&mut action, semantic);
+            }
             if let Some(expect_text) = expect_text {
                 action["expectText"] = Value::String(expect_text.clone());
+            }
+            if let Some(then_text) = then_text {
+                action["thenText"] = Value::String(then_text.clone());
             }
             if let Some(require_ancestor_text) = require_ancestor_text {
                 action["requireAncestorText"] = Value::String(require_ancestor_text.clone());
@@ -1291,19 +1469,53 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Type {
             output,
             ref_id,
+            semantic,
             text,
+            fill,
+            press,
             clear,
             delay,
             wait,
         }) => {
             let mut action = json!({
                 "kind": "type",
-                "text": text,
                 "clear": clear,
                 "delayMs": delay,
             });
+            if let Some(text) = text {
+                action["text"] = json!(text);
+            } else {
+                action["fills"] = Value::Array(
+                    fill.iter()
+                        .map(|assignment| {
+                            let (ref_id, text) = assignment
+                                .split_once('=')
+                                .expect("clap validates fill assignments");
+                            json!({ "ref": ref_id, "text": text })
+                        })
+                        .collect(),
+                );
+            }
+            if !fill.is_empty() && (ref_id.is_some() || has_semantic_target(semantic)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--fill cannot be combined with --ref or semantic target flags",
+                )
+                .into());
+            }
             if let Some(ref_id) = ref_id {
                 action["ref"] = Value::String(ref_id.clone());
+            }
+            if ref_id.is_some() && has_semantic_target(semantic) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--ref cannot be combined with semantic target flags",
+                )
+                .into());
+            }
+            apply_semantic_target(&mut action, semantic);
+            if let Some(press) = press {
+                action["press"] = json!(press);
             }
             if let Some(spec) = wait
                 .build_spec(None)
@@ -1316,20 +1528,23 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Focus {
             output,
             ref_id,
+            semantic,
             wait,
         }) => {
-            let mut action = build_primitive_action("focus", &[("ref", json!(ref_id))]);
+            let mut action = json!({ "kind": "focus" });
+            apply_ref_or_semantic_target(&mut action, ref_id.as_ref(), semantic)?;
             apply_wait(&mut action, wait)?;
             run_page_action(&cli, output, action)
         }
         Some(Command::Press {
             output,
             ref_id,
+            semantic,
             key,
             wait,
         }) => {
-            let mut action =
-                build_primitive_action("press", &[("ref", json!(ref_id)), ("key", json!(key))]);
+            let mut action = build_primitive_action("press", &[("key", json!(key))]);
+            apply_ref_or_semantic_target(&mut action, ref_id.as_ref(), semantic)?;
             apply_wait(&mut action, wait)?;
             run_page_action(&cli, output, action)
         }
@@ -1348,6 +1563,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Scroll {
             output,
             ref_id,
+            semantic,
             delta_y,
             delta_x,
             direction,
@@ -1360,6 +1576,14 @@ fn run() -> Result<i32, Box<dyn Error>> {
             if let Some(value) = ref_id {
                 action["ref"] = json!(value);
             }
+            if ref_id.is_some() && has_semantic_target(semantic) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--ref cannot be combined with semantic target flags",
+                )
+                .into());
+            }
+            apply_semantic_target(&mut action, semantic);
             if let Some(value) = delta_y {
                 action["deltaY"] = json!(value);
             }
@@ -1384,11 +1608,13 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Select {
             output,
             ref_id,
+            semantic,
             value,
             label,
             wait,
         }) => {
-            let mut action = json!({ "kind": "select", "ref": ref_id });
+            let mut action = json!({ "kind": "select" });
+            apply_ref_or_semantic_target(&mut action, ref_id.as_ref(), semantic)?;
             if let Some(value) = value {
                 action["value"] = json!(value);
             }
@@ -1401,16 +1627,19 @@ fn run() -> Result<i32, Box<dyn Error>> {
         Some(Command::Check {
             output,
             ref_id,
+            semantic,
             wait,
         })
         | Some(Command::Uncheck {
             output,
             ref_id,
+            semantic,
             wait,
         })
         | Some(Command::Hover {
             output,
             ref_id,
+            semantic,
             wait,
         }) => {
             let kind = match &cli.command {
@@ -1418,7 +1647,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 Some(Command::Uncheck { .. }) => "uncheck",
                 _ => "hover",
             };
-            let mut action = json!({ "kind": kind, "ref": ref_id });
+            let mut action = json!({ "kind": kind });
+            apply_ref_or_semantic_target(&mut action, ref_id.as_ref(), semantic)?;
             apply_wait(&mut action, wait)?;
             run_page_action(&cli, output, action)
         }
@@ -1593,6 +1823,44 @@ fn run() -> Result<i32, Box<dyn Error>> {
         }
         Some(Command::Video(command)) => {
             let request = build_video_request(&cli, command)?;
+            ensure_daemon()?;
+            send_request(request, ResultMode::Json { pretty: cli.pretty })
+        }
+        Some(Command::Batch { file }) => {
+            let source = match file {
+                Some(path) => fs::read_to_string(path)?,
+                None => read_script_from_stdin()?,
+            };
+            let mut request: Value = serde_json::from_str(&source).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid batch JSON: {error}"),
+                )
+            })?;
+            if !request.is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "batch input must be a JSON object",
+                )
+                .into());
+            }
+            request["id"] = json!(request_id("batch"));
+            request["type"] = json!("batch");
+            request["protocolVersion"] = json!(2);
+            request["browser"] = json!(cli.browser);
+            request["timeoutMs"] = json!(timeout_ms(&cli)?);
+            if let Some(connect) = &cli.connect {
+                request["connect"] = json!(connect);
+            }
+            if cli.headless {
+                request["headless"] = json!(true);
+            }
+            if cli.ignore_https_errors {
+                request["ignoreHTTPSErrors"] = json!(true);
+            }
+            if let Some(session) = &cli.session {
+                request["session"] = json!(session);
+            }
             ensure_daemon()?;
             send_request(request, ResultMode::Json { pretty: cli.pretty })
         }
@@ -2147,7 +2415,7 @@ mod tests {
         apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
         build_video_request, cli_error_exit_code, format_json_result, parse_video_size,
         read_text_stream, stream_responses, AnnotateMode, Cli, Command, ResultMode,
-        SessionCommand, ShotFormat, ShotScale, TraceCommand, VideoCommand,
+        SemanticTargetArgs, SessionCommand, ShotFormat, ShotScale, TraceCommand, VideoCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2280,6 +2548,124 @@ mod tests {
                 panic!("failed to parse {command:?}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn parses_semantic_targets_for_trusted_actions() {
+        for args in [
+            vec![
+                "dev-browser",
+                "click",
+                "--role",
+                "button",
+                "--name",
+                "Connect",
+                "--within",
+                "main",
+            ],
+            vec![
+                "dev-browser",
+                "type",
+                "--role",
+                "textbox",
+                "--name",
+                "Note",
+                "--text",
+                "hello",
+            ],
+            vec![
+                "dev-browser",
+                "press",
+                "--role",
+                "textbox",
+                "--name",
+                "Search",
+                "--key",
+                "Enter",
+            ],
+            vec![
+                "dev-browser",
+                "select",
+                "--role",
+                "combobox",
+                "--name",
+                "Country",
+                "--label",
+                "Nigeria",
+            ],
+            vec![
+                "dev-browser",
+                "scroll",
+                "--role",
+                "list",
+                "--name",
+                "Messages",
+            ],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+
+        let semantic = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--role",
+            "button",
+            "--name",
+            "Connect",
+            "--name-mode",
+            "contains",
+            "--state",
+            "enabled",
+        ])
+        .unwrap();
+        assert!(matches!(
+            semantic.command,
+            Some(Command::Click { semantic: SemanticTargetArgs { role: Some(_), name: Some(_), states, .. }, .. })
+                if states.len() == 1
+        ));
+    }
+
+    #[test]
+    fn parses_compound_action_shortcuts() {
+        let navigate = Cli::try_parse_from([
+            "dev-browser",
+            "navigate",
+            "https://example.com",
+            "--observe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            navigate.command,
+            Some(Command::Navigate { observe: Some(ref scope), .. }) if scope == "main"
+        ));
+
+        let click =
+            Cli::try_parse_from(["dev-browser", "click", "--ref", "R1", "--then-text", "main"])
+                .unwrap();
+        assert!(matches!(
+            click.command,
+            Some(Command::Click { then_text: Some(ref scope), .. }) if scope == "main"
+        ));
+
+        let typed = Cli::try_parse_from([
+            "dev-browser",
+            "type",
+            "--fill",
+            "R1=Ada",
+            "--fill",
+            "F2:R3=Lovelace",
+            "--press",
+            "Enter",
+        ])
+        .unwrap();
+        assert!(matches!(
+            typed.command,
+            Some(Command::Type { fill, press: Some(ref key), .. }) if fill.len() == 2 && key == "Enter"
+        ));
+
+        assert!(
+            Cli::try_parse_from(["dev-browser", "type", "--fill", "not-a-ref=value",]).is_err()
+        );
     }
 
     #[test]

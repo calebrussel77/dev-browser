@@ -161,9 +161,85 @@ const RetryPolicySchema = z.enum(["never", "safe", "once"]);
 const RefSchema = ScopedRefSchema;
 const PrimitiveBaseSchema = StateGuardSchema.merge(WaitableActionSchema);
 const RefPrimitiveSchema = PrimitiveBaseSchema.extend({ ref: RefSchema });
+const TargetStateSchema = z.enum([
+  "enabled",
+  "disabled",
+  "checked",
+  "unchecked",
+  "expanded",
+  "collapsed",
+  "selected",
+]);
+const SemanticTargetFields = {
+  role: z.string().min(1).max(100).optional(),
+  name: z.string().min(1).max(2_000).optional(),
+  nameMode: z.enum(["exact", "contains"]).default("exact"),
+  within: z.string().min(1).max(500).optional(),
+  near: z.string().min(1).max(2_000).optional(),
+  frame: z.string().min(1).max(200).optional(),
+  states: z.array(TargetStateSchema).max(7).default([]),
+};
+type SemanticTargetValue = {
+  ref?: string;
+  role?: string;
+  name?: string;
+  nameMode?: "exact" | "contains";
+  within?: string;
+  near?: string;
+  frame?: string;
+  states?: string[];
+};
+function hasSemanticTarget(value: SemanticTargetValue): boolean {
+  return Boolean(
+    value.role ||
+      value.name ||
+      value.within ||
+      value.near ||
+      value.frame ||
+      (value.states?.length ?? 0) > 0
+  );
+}
+function requireRefOrSemanticTarget(
+  value: SemanticTargetValue,
+  context: z.RefinementCtx
+): void {
+  const semantic = hasSemanticTarget(value);
+  if (Boolean(value.ref) === semantic) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "provide exactly one of ref or semantic target filters",
+    });
+  }
+  if (!value.name && value.nameMode !== "exact") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nameMode"],
+      message: "nameMode requires name",
+    });
+  }
+}
+function rejectRefWithSemanticTarget(
+  value: SemanticTargetValue,
+  context: z.RefinementCtx
+): void {
+  if (value.ref && hasSemanticTarget(value)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "ref cannot be combined with semantic target filters",
+    });
+  }
+  if (!value.name && value.nameMode !== "exact") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nameMode"],
+      message: "nameMode requires name",
+    });
+  }
+}
 const ScrollActionSchema = PrimitiveBaseSchema.extend({
   kind: z.literal("scroll"),
   ref: RefSchema.optional(),
+  ...SemanticTargetFields,
   deltaX: z.number().finite().min(-100_000).max(100_000).optional(),
   deltaY: z.number().finite().min(-100_000).max(100_000).optional(),
   direction: z.enum(["up", "down", "left", "right"]).optional(),
@@ -177,7 +253,7 @@ const ScrollActionSchema = PrimitiveBaseSchema.extend({
   // A ref combined with until is a distinct "scroll this container until"
   // mode (container-relative scrolling); ref alone remains scrollIntoView.
   const modes = [
-    value.ref !== undefined && value.until === undefined,
+    (value.ref !== undefined || hasSemanticTarget(value)) && value.until === undefined,
     value.deltaX !== undefined || value.deltaY !== undefined,
     value.direction !== undefined,
     value.until !== undefined,
@@ -197,18 +273,53 @@ const ScrollActionSchema = PrimitiveBaseSchema.extend({
       code: z.ZodIssueCode.custom,
       message: "until and maxSteps are required together",
     });
+  if (value.ref && hasSemanticTarget(value))
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "ref cannot be combined with semantic target filters",
+    });
+  if (value.until && hasSemanticTarget(value) && !value.ref)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "semantic target filters cannot be combined with until",
+    });
+  if (!value.name && value.nameMode !== "exact")
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nameMode"],
+      message: "nameMode requires name",
+    });
 });
-const SelectActionSchema = RefPrimitiveSchema.extend({
-  kind: z.literal("select"),
+const SelectFields = {
   value: z.string().max(2000).optional(),
   label: z.string().max(2000).optional(),
-}).superRefine((value, context) => {
+};
+const validateSelectChoice = (
+  value: { value?: string; label?: string },
+  context: z.RefinementCtx
+) => {
   if ((value.value === undefined) === (value.label === undefined))
     context.addIssue({
       code: z.ZodIssueCode.custom,
       message: "exactly one of value or label is required",
     });
+};
+const SelectByRefActionSchema = RefPrimitiveSchema.extend({
+  kind: z.literal("select"),
+  ...SelectFields,
+}).strict().superRefine(validateSelectChoice);
+const SelectBySemanticActionSchema = PrimitiveBaseSchema.extend({
+  kind: z.literal("select"),
+  ...SemanticTargetFields,
+  ...SelectFields,
+}).strict().superRefine((value, context) => {
+  requireRefOrSemanticTarget(value, context);
+  validateSelectChoice(value, context);
 });
+const SelectActionSchema = z.union([
+  SelectByRefActionSchema,
+  SelectBySemanticActionSchema,
+]);
 const HistoryNavigationActionSchema = PrimitiveBaseSchema.extend({
   kind: z.enum(["back", "forward", "reload"]),
 });
@@ -228,19 +339,24 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
   session: z.string().min(1).max(500).optional(),
 });
 
-const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
-  kind: z.literal("click"),
-  ref: ScopedRefSchema,
+const ClickTargetFields = {
   method: z.enum(["mouse", "locator"]).default("mouse"),
   expectText: z.string().min(1).optional(),
-  // In-page addressing guard: resolve the target, walk up to its nearest
-  // self-contained card ancestor, and refuse to click (typed, fail-closed)
-  // unless that card's text contains this value. The dialog-less counterpart
-  // of confirm --expect.
+  thenText: z.string().min(1).max(500).optional(),
   requireAncestorText: z.string().min(1).max(2_000).optional(),
   waitForText: WaitValueSchema.optional(),
   retry: RetryPolicySchema.optional(),
-});
+};
+const InteractiveClickByRefSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
+  kind: z.literal("click"),
+  ref: ScopedRefSchema,
+  ...ClickTargetFields,
+}).strict();
+const InteractiveClickBySemanticSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
+  kind: z.literal("click"),
+  ...SemanticTargetFields,
+  ...ClickTargetFields,
+}).strict().superRefine(requireRefOrSemanticTarget);
 
 const InteractiveClickByCoordinatesSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
   kind: z.literal("click"),
@@ -248,6 +364,7 @@ const InteractiveClickByCoordinatesSchema = StateGuardSchema.merge(WaitableActio
   y: z.number().finite().nonnegative(),
   method: z.literal("mouse").default("mouse"),
   expectText: z.string().min(1).optional(),
+  thenText: z.string().min(1).max(500).optional(),
   waitForText: WaitValueSchema.optional(),
   retry: RetryPolicySchema.optional(),
 });
@@ -293,12 +410,7 @@ const StructuredFindSchema = z
     near: z.string().min(1).max(2_000).optional(),
     frame: z.string().min(1).max(200).optional(),
     scope: z.enum(["visible", "viewport", "document"]).default("visible"),
-    states: z
-      .array(
-        z.enum(["enabled", "disabled", "checked", "unchecked", "expanded", "collapsed", "selected"])
-      )
-      .max(7)
-      .default([]),
+    states: z.array(TargetStateSchema).max(7).default([]),
     index: z.number().int().nonnegative().max(999).optional(),
     limit: z.number().int().positive().max(50).default(3),
     // Scope collection to a subtree obtained from observe, so hard collection
@@ -369,11 +481,74 @@ const AssertActionSchema = ContentScopeFieldsSchema.extend({
   match: AssertMatchSchema.default("contains"),
 }).superRefine(requireExactlyOneScope);
 
+const FocusActionSchema = z.union([
+  RefPrimitiveSchema.extend({ kind: z.literal("focus") }).strict(),
+  PrimitiveBaseSchema.extend({
+    kind: z.literal("focus"),
+    ...SemanticTargetFields,
+  }).strict().superRefine(requireRefOrSemanticTarget),
+]);
+const PressFields = {
+  key: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9+ -]+$/),
+};
+const TypeFillSchema = z.object({
+  ref: ScopedRefSchema,
+  text: z.string(),
+}).strict();
+const TypeActionSchema = StateGuardSchema.merge(WaitableActionSchema).extend({
+  kind: z.literal("type"),
+  ref: ScopedRefSchema.optional(),
+  ...SemanticTargetFields,
+  text: z.string().optional(),
+  fills: z.array(TypeFillSchema).min(1).max(20).optional(),
+  press: PressFields.key.optional(),
+  clear: z.boolean().default(false),
+  delayMs: z.number().int().nonnegative().max(1_000).default(0),
+}).superRefine((value, context) => {
+  rejectRefWithSemanticTarget(value, context);
+  if ((value.text === undefined) === (value.fills === undefined))
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exactly one of text or fills is required",
+    });
+  if (value.fills && (value.ref || hasSemanticTarget(value)))
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["fills"],
+      message: "fills cannot be combined with ref or semantic target fields",
+    });
+});
+const PressActionSchema = z.union([
+  RefPrimitiveSchema.extend({ kind: z.literal("press"), ...PressFields }).strict(),
+  PrimitiveBaseSchema.extend({
+    kind: z.literal("press"),
+    ...SemanticTargetFields,
+    ...PressFields,
+  }).strict().superRefine(requireRefOrSemanticTarget),
+]);
+const semanticPrimitiveAction = (kind: "check" | "uncheck" | "hover") =>
+  z.union([
+    RefPrimitiveSchema.extend({ kind: z.literal(kind) }).strict(),
+    PrimitiveBaseSchema.extend({
+      kind: z.literal(kind),
+      ...SemanticTargetFields,
+    }).strict().superRefine(requireRefOrSemanticTarget),
+  ]);
+const CheckActionSchema = semanticPrimitiveAction("check");
+const UncheckActionSchema = semanticPrimitiveAction("uncheck");
+const HoverActionSchema = semanticPrimitiveAction("hover");
+
 const InteractiveActionSchema = z.union([
   z.object({ kind: z.literal("pages") }),
+  z.object({ kind: z.literal("wait"), wait: WaitSpecSchema }),
   WaitableActionSchema.extend({
     kind: z.literal("navigate"),
     url: z.string().url(),
+    observe: z.string().min(1).max(500).optional(),
   }),
   ObserveOptionsSchema.extend({ kind: z.literal("observe") }).superRefine(
     rejectCombinedRootAndWithin
@@ -387,32 +562,20 @@ const InteractiveActionSchema = z.union([
   TextActionSchema,
   AssertActionSchema,
   InteractiveClickByRefSchema,
+  InteractiveClickBySemanticSchema,
   InteractiveClickByCoordinatesSchema,
-  RefPrimitiveSchema.extend({ kind: z.literal("focus") }),
-  RefPrimitiveSchema.extend({
-    kind: z.literal("press"),
-    key: z
-      .string()
-      .min(1)
-      .max(64)
-      .regex(/^[A-Za-z0-9+ -]+$/),
-  }),
+  FocusActionSchema,
+  PressActionSchema,
   RefPrimitiveSchema.extend({ kind: z.literal("paste"), text: z.string().max(1_000_000) }),
   ScrollActionSchema,
   SelectActionSchema,
-  RefPrimitiveSchema.extend({ kind: z.literal("check") }),
-  RefPrimitiveSchema.extend({ kind: z.literal("uncheck") }),
-  RefPrimitiveSchema.extend({ kind: z.literal("hover") }),
+  CheckActionSchema,
+  UncheckActionSchema,
+  HoverActionSchema,
   PrimitiveBaseSchema.extend({ kind: z.literal("drag"), from: RefSchema, to: RefSchema }),
   HistoryNavigationActionSchema,
   UploadActionSchema,
-  StateGuardSchema.merge(WaitableActionSchema).extend({
-    kind: z.literal("type"),
-    ref: ScopedRefSchema.optional(),
-    text: z.string(),
-    clear: z.boolean().default(false),
-    delayMs: z.number().int().nonnegative().max(1_000).default(0),
-  }),
+  TypeActionSchema,
   StateGuardSchema.extend({
     kind: z.literal("confirm"),
     expectText: z.string().min(1).optional(),
@@ -473,12 +636,11 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
     });
   if ("confirmToken" in value.action && value.action.confirmToken) {
     const trustedRefAction =
-      (value.action.kind === "click" && "ref" in value.action) ||
-      (value.action.kind === "type" && Boolean(value.action.ref)) ||
-      ["focus", "press", "paste", "select", "check", "uncheck", "hover", "drag", "upload"].includes(
-        value.action.kind
-      ) ||
-      (value.action.kind === "scroll" && Boolean(value.action.ref));
+      (value.action.kind === "click" && ("ref" in value.action || hasSemanticTarget(value.action as SemanticTargetValue))) ||
+      (value.action.kind === "type" && (Boolean(value.action.ref) || hasSemanticTarget(value.action as SemanticTargetValue))) ||
+      ["focus", "press", "select", "check", "uncheck", "hover"].includes(value.action.kind) ||
+      ["paste", "drag", "upload"].includes(value.action.kind) ||
+      (value.action.kind === "scroll" && (Boolean(value.action.ref) || hasSemanticTarget(value.action as SemanticTargetValue)));
     if (value.protocolVersion !== 2 || !trustedRefAction || !value.action.fromState)
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -486,6 +648,21 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
         message: "confirmToken requires a v2 trusted ref action and fromState",
       });
   }
+});
+
+const BatchRequestSchema = RequestBaseSchema.extend({
+  type: z.literal("batch"),
+  protocolVersion: z.literal(2).default(2),
+  browser: z.string().min(1).default("default"),
+  page: z.string().min(1).default("main"),
+  steps: z.array(InteractiveActionSchema).min(1).max(20),
+  stopOnError: z.boolean().default(true),
+  observeAfter: z.enum(["delta", "tree", "none"]).default("delta"),
+  headless: z.boolean().optional(),
+  ignoreHTTPSErrors: z.boolean().optional(),
+  connect: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  session: z.string().min(1).max(500).optional(),
 });
 
 const SessionRequestSchema = z.union([
@@ -592,6 +769,7 @@ const RequestSchema = z.union([
   ExecuteRequestSchema,
   VideoRequestSchema,
   InteractiveRequestSchema,
+  BatchRequestSchema,
   BrowsersRequestSchema,
   BrowserStopRequestSchema,
   StatusRequestSchema,
@@ -650,6 +828,7 @@ export type HandshakeRequest = z.infer<typeof HandshakeRequestSchema>;
 export type RestartRequest = z.infer<typeof RestartRequestSchema>;
 export type TraceRequest = z.infer<typeof TraceRequestSchema>;
 export type VideoRequest = z.infer<typeof VideoRequestSchema>;
+export type BatchRequest = z.infer<typeof BatchRequestSchema>;
 type ParsedInteractiveAction = z.infer<typeof InteractiveActionSchema>;
 type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   ? Action extends { kind: string }

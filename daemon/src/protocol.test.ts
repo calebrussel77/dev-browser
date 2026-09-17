@@ -3,6 +3,62 @@ import { describe, expect, it } from "vitest";
 import { parseRequest, serialize } from "./protocol.js";
 
 describe("interactive request protocol", () => {
+  it("accepts semantic action targets and rejects mixed ref targets", () => {
+    for (const action of [
+      { kind: "click", role: "button", name: "Connect", within: "main" },
+      { kind: "type", role: "textbox", name: "Note", text: "hello" },
+      { kind: "press", role: "textbox", name: "Search", key: "Enter" },
+      { kind: "select", role: "combobox", name: "Country", label: "Nigeria" },
+      { kind: "scroll", role: "list", name: "Messages" },
+    ]) {
+      expect(parseRequest(JSON.stringify({
+        id: `semantic-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        action,
+      }))).toMatchObject({ success: true });
+    }
+
+    expect(parseRequest(JSON.stringify({
+      id: "mixed-target",
+      type: "interactive",
+      protocolVersion: 2,
+      action: { kind: "click", ref: "R1", role: "button", name: "Connect" },
+    }))).toMatchObject({ success: false });
+  });
+  it("parses bounded batches with standalone wait steps", () => {
+    const base = {
+      id: "batch-1",
+      type: "batch",
+      protocolVersion: 2,
+      page: "main",
+      stopOnError: true,
+      observeAfter: "delta",
+    };
+    const steps = [
+      { kind: "find", role: "button", name: "Connect" },
+      { kind: "click", role: "button", name: "Connect", within: "main" },
+      {
+        kind: "wait",
+        wait: {
+          mode: "all",
+          timeoutMs: 500,
+          conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "Done" }],
+        },
+      },
+      { kind: "assert", within: "main", text: "Done" },
+    ];
+
+    expect(parseRequest(JSON.stringify({ ...base, steps }))).toMatchObject({
+      success: true,
+      request: {
+        type: "batch",
+        steps: [{ kind: "find" }, { kind: "click" }, { kind: "wait" }, { kind: "assert" }],
+      },
+    });
+    expect(parseRequest(JSON.stringify({ ...base, steps: Array.from({ length: 21 }, () => ({ kind: "pages" })) })))
+      .toMatchObject({ success: false });
+  });
   it("parses opt-in traces and bounded trace lookup requests", () => {
     expect(parseRequest(JSON.stringify({ id: "click-trace", type: "interactive", protocolVersion: 2, trace: true, action: { kind: "click", ref: "R1" } }))).toMatchObject({ success: true, request: { trace: true } });
     expect(parseRequest(JSON.stringify({ id: "trace-last", type: "trace", action: "show", traceId: "LAST" }))).toMatchObject({ success: true, request: { traceId: "LAST" } });
@@ -389,6 +445,48 @@ describe("interactive request protocol", () => {
         action: { kind: "type", ref: "R13", text: "hello", clear: true, delayMs: 12 },
       },
     });
+  });
+
+  it("parses compound action shortcuts and rejects conflicting type inputs", () => {
+    for (const action of [
+      { kind: "type", ref: "R13", text: "hello", press: "Enter" },
+      { kind: "type", fills: [{ ref: "R1", text: "Ada" }, { ref: "R2", text: "Lovelace" }] },
+      { kind: "navigate", url: "https://example.com", observe: "main" },
+      { kind: "click", ref: "R1", thenText: "main" },
+    ])
+      expect(parseRequest(JSON.stringify({
+        id: `shortcut-${action.kind}`,
+        type: "interactive",
+        protocolVersion: 2,
+        action,
+      }))).toMatchObject({ success: true });
+
+    for (const action of [
+      { kind: "type", ref: "R1" },
+      { kind: "type", ref: "R1", text: "one", fills: [{ ref: "R2", text: "two" }] },
+      { kind: "type", role: "textbox", fills: [{ ref: "R2", text: "two" }] },
+      { kind: "type", fills: [] },
+      { kind: "type", fills: Array.from({ length: 21 }, (_, index) => ({ ref: `R${index + 1}`, text: "x" })) },
+    ])
+      expect(parseRequest(JSON.stringify({
+        id: "bad-type-shortcut",
+        type: "interactive",
+        protocolVersion: 2,
+        action,
+      }))).toMatchObject({ success: false });
+  });
+
+  it("keeps confirmation guards available on semantic targets", () => {
+    for (const action of [
+      { kind: "click", role: "button", name: "Send", confirmToken: "x".repeat(32) },
+      { kind: "type", role: "textbox", name: "Message", text: "draft", confirmToken: "x".repeat(32) },
+    ])
+      expect(parseRequest(JSON.stringify({
+        id: "semantic-confirmation",
+        type: "interactive",
+        protocolVersion: 2,
+        action: { ...action, fromState: "doc-1:2" },
+      }))).toMatchObject({ success: true });
   });
 
   it("parses structured find filters and rejects empty or invalid combinations", () => {

@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const DISCOVERY_SCHEMA_VERSION: u64 = 2;
+pub const DISCOVERY_SCHEMA_VERSION: u64 = 3;
 
 pub fn agent_schema() -> Value {
     json!({
@@ -11,7 +11,7 @@ pub fn agent_schema() -> Value {
             "find", "text", "assert", "click", "focus", "press", "paste", "scroll", "select",
             "check", "uncheck", "hover", "drag", "type", "confirm", "shot", "upload",
             "session", "browsers", "install", "status", "stop", "doctor", "schema",
-            "capabilities", "examples", "trace", "video", "install-skill"
+            "capabilities", "examples", "trace", "video", "batch", "install-skill"
         ],
         "interactiveActions": [
             "pages", "navigate", "back", "forward", "reload", "read", "observe", "find",
@@ -45,13 +45,24 @@ pub fn agent_schema() -> Value {
             "shotTimeoutMsRange": "250..120000, defaults to min(timeoutMs, 8000)",
             "consoleJsonMaxBytes": 65536
         },
+        "semanticTarget": {
+            "atLeastOne": ["role", "name", "within", "near", "frame", "states[]"],
+            "optional": ["nameMode:exact|contains"],
+            "supportedActions": ["click", "type", "focus", "press", "scroll", "select", "check", "uncheck", "hover"]
+        },
+        "batchRequest": {
+            "required": ["steps:1..20"],
+            "optional": ["page", "stopOnError:boolean (default true)", "observeAfter:delta|tree|none (default delta)"],
+            "source": "stdin or --file",
+            "stepGrammar": "interactiveRequest.actionGrammar plus wait"
+        },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
             "optional": { "shot": "temp image name", "annotate": "boolean", "annotateMode": "dom|raster (default dom)", "fullPage": "boolean", "shotFormat": "png|jpeg (action shots default jpeg; explicit shot defaults png)", "shotScale": "css|device (default css)", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean", "elements": "boolean; compact element metadata", "verbose": "boolean; full historical response payload" },
             "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
-                "navigate": { "required": ["url"], "optional": ["wait"] },
+                "navigate": { "required": ["url"], "optional": ["wait", "observe:scope"] },
                 "back": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
                 "forward": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
                 "reload": { "required": [], "optional": ["fromState:doc-#:revision", "strictState:boolean", "wait"] },
@@ -60,17 +71,17 @@ pub fn agent_schema() -> Value {
                 "find": { "atLeastOne": ["query", "role", "name", "within", "near", "frame", "states[]"], "optional": ["nameMode:exact|contains (requires name)", "scope:visible|viewport|document", "index:0..999", "limit:1..50", "root:ref (scope collection to a subtree from observe; mutually exclusive with scrollContainer)", "scrollContainer:ref (requires maxSteps; bounded auto-scroll over a virtualized/overflow container)", "maxSteps:1..50 (requires scrollContainer)"] },
                 "text": { "oneOf": [["ref"], ["within"]], "optional": ["maxChars:1..200000 (default 20000)"] },
                 "assert": { "oneOf": [["ref"], ["within"]], "required": ["text"], "optional": ["match:exact|contains (default contains)"] },
-                "click": { "oneOf": [["ref"], ["x>=0", "y>=0"]], "optional": ["method:mouse|locator (coordinates require mouse)", "retry:never|safe|once", "fromState", "strictState", "expectText", "requireAncestorText:1..2000 chars (ref form only; refuse to click unless the target's nearest self-contained card ancestor contains this text — fails closed with ASSERTION_FAILED)", "waitForText", "confirmToken", "wait"] },
-                "focus": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "press": { "required": ["ref", "key:1..64 safe key chars"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "click": { "oneOf": [["ref"], ["semanticTarget"], ["x>=0", "y>=0"]], "optional": ["method:mouse|locator (coordinates require mouse)", "retry:never|safe|once", "fromState", "strictState", "expectText", "thenText:scope", "requireAncestorText:1..2000 chars (ref form only; refuse to click unless the target's nearest self-contained card ancestor contains this text — fails closed with ASSERTION_FAILED)", "waitForText", "confirmToken", "wait"] },
+                "focus": { "oneOf": [["ref"], ["semanticTarget"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "press": { "oneOf": [["ref", "key:1..64 safe key chars"], ["semanticTarget", "key:1..64 safe key chars"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "paste": { "required": ["ref", "text"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "scroll": { "oneOf": [["ref"], ["deltaX|deltaY:-100000..100000"], ["direction:up|down|left|right", "pages:1..50"], ["until:text:...|role:...", "maxSteps:1..50"], ["ref", "until:text:...|role:...", "maxSteps:1..50 (container-relative: scans ref as a scrollable container instead of scrolling it into view)"]], "optional": ["fromState", "strictState", "confirmToken (ref form only; requires fromState)", "wait"] },
-                "select": { "required": ["ref"], "oneOf": [["value"], ["label"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "check": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "uncheck": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "hover": { "required": ["ref"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "select": { "oneOf": [["ref", "value|label"], ["semanticTarget", "value|label"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "check": { "oneOf": [["ref"], ["semanticTarget"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "uncheck": { "oneOf": [["ref"], ["semanticTarget"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
+                "hover": { "oneOf": [["ref"], ["semanticTarget"]], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "drag": { "required": ["from", "to"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
-                "type": { "required": ["text"], "optional": ["ref", "clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
+                "type": { "oneOf": [["text", "ref|semanticTarget optional"], ["fills:1..20 {ref,text}"]], "optional": ["press:key", "clear:boolean", "delayMs:0..1000", "fromState", "strictState", "confirmToken", "wait"] },
                 "upload": { "required": ["ref", "file"], "optional": ["fromState", "strictState", "confirmToken", "wait"] },
                 "confirm": { "required": [], "optional": ["ref", "expectText", "fromState", "strictState"] },
                 "shot": { "required": [], "optional": ["ref", "padding:0..1000", "fromState", "strictState"] }
@@ -98,7 +109,7 @@ pub fn agent_schema() -> Value {
                 "elements": "--elements includes compact actionable element metadata; omitted by default",
                 "verbose": "--verbose restores the full historical element payload and wins over --elements"
             },
-            "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "search", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "ancestorGuard", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "inputStrategy", "verifiedValue", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
+            "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "search", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "ancestorGuard", "change", "attempts", "attemptJournal", "waitResult", "popup", "download", "textContent"], "type": ["typed", "fills", "pressed", "inputStrategy", "verifiedValue", "attemptJournal"], "navigation": ["navigation", "waitResult", "scope"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
             "failureRequired": ["protocolVersion:2", "ok:false", "requestId", "error.code", "error.message", "error.recoverable"],
             "failureOptional": ["browser", "page", "action", "error.details", "error.nextCommands"]
         },
@@ -120,7 +131,7 @@ pub fn compact_capabilities() -> Value {
         "protocol": 2,
         "perception": ["observe", "delta", "refs", "annotated-screenshot", "frames", "open-shadow-dom", "bounded-capture", "scoped-content"],
         "safety": ["state-guards", "target-fingerprints", "leases", "typed-waits", "safe-retry", "confirmation-tokens", "redaction"],
-        "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download"],
+        "actions": ["click", "focus", "press", "paste", "scroll", "select", "check", "uncheck", "hover", "drag", "type", "navigation", "upload", "download", "semantic-targets", "batch", "compound-actions"],
         "discovery": ["doctor", "schema", "capabilities", "examples", "trace"],
         "video": ["start", "chapter", "stop"],
         "runtimeHandshake": true,
@@ -135,8 +146,9 @@ pub fn focused_example(command: &str) -> Option<&'static str> {
         "find" => Some("dev-browser find --page TARGET --role button --name \"Save\" --within main --scope visible\n# Returns up to three compact matches; add --verbose for the full tree and records"),
         "text" => Some("dev-browser text --page TARGET --within main"),
         "assert" => Some("dev-browser assert --page TARGET --within main --text \"Jane Doe\" --match contains"),
-        "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled\n# Compact JSON is the default; add --verbose or global --pretty only when needed"),
-        "type" => Some("dev-browser type --page TARGET --ref F0:R9 --from-state doc-7:184 --text \"hello\" --clear"),
+        "click" => Some("dev-browser click --page TARGET --role button --name \"Save\" --within main --then-text main\n# Use a ref plus --from-state for irreversible actions"),
+        "type" => Some("dev-browser type --page TARGET --role textbox --name \"Search\" --text \"hello\" --clear --press Enter"),
+        "batch" => Some("'{\"page\":\"TARGET\",\"steps\":[{\"kind\":\"find\",\"role\":\"button\",\"name\":\"Save\"},{\"kind\":\"click\",\"role\":\"button\",\"name\":\"Save\"}]}' | dev-browser batch"),
         "confirm" => Some("dev-browser confirm --page TARGET --ref F0:R14 --expect \"Recipient\""),
         "upload" => Some("dev-browser upload --page TARGET --ref F0:R5 --file upload.bin"),
         "doctor" => Some("dev-browser doctor --connect --json"),
@@ -164,7 +176,7 @@ mod tests {
         assert!(serialized.len() < 20_000);
         assert_eq!(schema["protocolVersions"], json!([1, 2]));
         assert_eq!(schema["errors"]["confirmation"]["exitStatus"], 8);
-        assert_eq!(schema["schemaVersion"], 2);
+        assert_eq!(schema["schemaVersion"], 3);
         assert!(schema["limits"]["shadowDom"]
             .as_str()
             .unwrap()
@@ -199,14 +211,9 @@ mod tests {
                 .unwrap()
                 .contains(&json!(code)));
         }
-        assert_eq!(
-            schema["interactiveRequest"]["actionGrammar"]["press"]["required"],
-            json!(["ref", "key:1..64 safe key chars"])
-        );
-        assert_eq!(
-            schema["interactiveRequest"]["actionGrammar"]["type"]["required"],
-            json!(["text"])
-        );
+        assert!(schema["interactiveRequest"]["actionGrammar"]["press"]["oneOf"].is_array());
+        assert!(schema["interactiveRequest"]["actionGrammar"]["type"]["oneOf"].is_array());
+        assert_eq!(schema["batchRequest"]["required"], json!(["steps:1..20"]));
         assert_eq!(
             schema["interactiveRequest"]["actionGrammar"]["find"]["atLeastOne"],
             json!(["query", "role", "name", "within", "near", "frame", "states[]"])
