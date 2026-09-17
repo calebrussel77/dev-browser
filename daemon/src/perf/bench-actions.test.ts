@@ -1,23 +1,21 @@
-// PowerShell:
-//   $env:BENCH=1; $env:BENCH_OUT="../docs/perf/local.md"; pnpm bench
-// CDP pass and deterministic merge:
-//   $env:DEBUG="pw:protocol"; pnpm bench 2> ../cdp.log
-//   node ../scripts/count-cdp.mjs ../cdp.log ../docs/perf/local.md
+// Reference-safe PowerShell workflow:
+//   1. $env:BENCH="1"; $env:BENCH_OUT="../docs/perf/local.md"; Remove-Item Env:DEBUG -ErrorAction SilentlyContinue; pnpm bench
+//   2. $env:DEBUG="pw:protocol"; $env:BENCH_CDP_OUT="../docs/perf/local.cdp.md"; pnpm bench 2> ../cdp.log
+//   3. node ../scripts/count-cdp.mjs ../cdp.log ../docs/perf/local.md
+// A protocol-debug run never writes BENCH_OUT. BENCH_CDP_OUT is optional and
+// must differ from BENCH_OUT, so the latency reference survives the second run.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { chromium } from "playwright";
 import { it } from "vitest";
 
-import { resolveActionTarget } from "../actionability.js";
-import { BrowserManager } from "../browser-manager.js";
-import { executeInteractiveAction } from "../interactive-actions.js";
-import { collectLiveSnapshot } from "../live-snapshot.js";
-import { collectPageState } from "../perception/collector.js";
-import { startAgentReliabilityFixture } from "../test-fixtures/agent-reliability-fixture.js";
 import { heavyPage } from "./heavy-page.js";
+
+type ExecuteInteractiveAction = typeof import("../interactive-actions.js").executeInteractiveAction;
+type InteractiveResult = Awaited<ReturnType<ExecuteInteractiveAction>>;
+type InteractiveRequest = Parameters<ExecuteInteractiveAction>[1];
 
 const browserName = "bench";
 const pageName = "fixture";
@@ -42,6 +40,8 @@ interface BenchmarkRow {
   estimatedTokens: number;
 }
 
+type StepResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
 const rows: BenchmarkRow[] = [];
 const failures: string[] = [];
 
@@ -49,10 +49,29 @@ function markdownCell(value: string): string {
   return value.replace(/[\r\n]+/g, " ").replaceAll("|", "/");
 }
 
-function writeBenchmark(): void {
-  if (!process.env.BENCH_OUT) return;
+function benchmarkOutputPath(): string | undefined {
+  const protocolDebug = /(?:^|[,\s])pw:protocol(?:$|[,\s])/.test(process.env.DEBUG ?? "");
+  if (!protocolDebug) return process.env.BENCH_OUT;
+  if (!process.env.BENCH_CDP_OUT) return undefined;
 
-  const outputPath = path.resolve(process.env.BENCH_OUT);
+  const instrumented = path.resolve(process.env.BENCH_CDP_OUT);
+  const reference = process.env.BENCH_OUT ? path.resolve(process.env.BENCH_OUT) : undefined;
+  const sameOutput =
+    reference !== undefined &&
+    (process.platform === "win32"
+      ? instrumented.toLowerCase() === reference.toLowerCase()
+      : instrumented === reference);
+  if (sameOutput) {
+    throw new Error("BENCH_CDP_OUT must differ from BENCH_OUT to preserve the latency baseline");
+  }
+  return process.env.BENCH_CDP_OUT;
+}
+
+function writeBenchmark(): void {
+  const configuredOutput = benchmarkOutputPath();
+  if (!configuredOutput) return;
+
+  const outputPath = path.resolve(configuredOutput);
   mkdirSync(path.dirname(outputPath), { recursive: true });
   const lines = [
     "| step | status | latency ms | pretty bytes | compact bytes | ~tokens | CDP messages | top CDP methods |",
@@ -75,14 +94,20 @@ function errorSummary(error: unknown): string {
   return code ? `${code}: ${error.message}` : error.message;
 }
 
-async function timed<T>(step: string, operation: () => Promise<T>): Promise<T | undefined> {
+async function timed<TOutput, TValue = TOutput>(
+  step: string,
+  operation: () => Promise<TOutput>,
+  select: (output: TOutput) => TValue = (output) => output as unknown as TValue
+): Promise<StepResult<TValue>> {
   mark(step, "START");
   const startedAt = performance.now();
-  let output: T | undefined;
+  let output: TOutput | undefined;
+  let value: TValue | undefined;
   let status = "ok";
 
   try {
     output = await operation();
+    value = select(output);
   } catch (error) {
     status = `failed: ${errorSummary(error)}`;
     failures.push(`${step}: ${errorSummary(error)}`);
@@ -102,14 +127,41 @@ async function timed<T>(step: string, operation: () => Promise<T>): Promise<T | 
     writeBenchmark();
   }
 
-  return output;
+  return status === "ok"
+    ? { ok: true, value: value as TValue }
+    : { ok: false, error: status.slice("failed: ".length) };
+}
+
+function skipped<T>(step: string, reason: string): StepResult<T> {
+  mark(step, "START");
+  mark(step, "END");
+  const error = `skipped: ${reason}`;
+  rows.push({
+    step,
+    status: error,
+    latencyMs: 0,
+    prettyBytes: 0,
+    compactBytes: 0,
+    estimatedTokens: 0,
+  });
+  writeBenchmark();
+  return { ok: false, error };
+}
+
+async function dependentTimed<TDependency, T>(
+  step: string,
+  prerequisite: StepResult<TDependency>,
+  operation: (value: TDependency) => Promise<T>
+): Promise<StepResult<T>> {
+  if (!prerequisite.ok) return skipped(step, `prerequisite failed (${prerequisite.error})`);
+  return timed(step, () => operation(prerequisite.value));
 }
 
 function request(
   id: string,
-  action: Parameters<typeof executeInteractiveAction>[1]["action"],
-  extra: Partial<Parameters<typeof executeInteractiveAction>[1]> = {}
-): Parameters<typeof executeInteractiveAction>[1] {
+  action: InteractiveRequest["action"],
+  extra: Partial<InteractiveRequest> = {}
+): InteractiveRequest {
   return {
     id,
     type: "interactive",
@@ -122,16 +174,13 @@ function request(
   };
 }
 
-function firstMatch(
-  result: Awaited<ReturnType<typeof executeInteractiveAction>> | undefined,
-  step: string
-): { ref: string; stateId?: string } {
-  const match = result?.matches?.[0];
+function firstMatch(result: InteractiveResult, step: string): { ref: string; stateId?: string } {
+  const match = result.matches?.[0];
   if (!match) throw new Error(`${step} did not return a match`);
   return { ref: match.ref, stateId: result.stateId };
 }
 
-it.skipIf(!process.env.BENCH)(
+it.skipIf(process.env.BENCH !== "1")(
   "bench interactive actions",
   async () => {
     rows.length = 0;
@@ -139,7 +188,30 @@ it.skipIf(!process.env.BENCH)(
     writeBenchmark();
 
     const benchmarkStartedAt = performance.now();
+    const [
+      { chromium },
+      { resolveActionTarget },
+      { BrowserManager },
+      { executeInteractiveAction },
+      { collectLiveSnapshot },
+      { collectPageState },
+      { runScript },
+      { startAgentReliabilityFixture },
+      { resolveDevBrowserTempPath },
+    ] = await Promise.all([
+      import("playwright"),
+      import("../actionability.js"),
+      import("../browser-manager.js"),
+      import("../interactive-actions.js"),
+      import("../live-snapshot.js"),
+      import("../perception/collector.js"),
+      import("../sandbox/script-runner-quickjs.js"),
+      import("../test-fixtures/agent-reliability-fixture.js"),
+      import("../temp-files.js"),
+    ]);
     const root = await mkdtemp(path.join(os.tmpdir(), "dev-browser-bench-"));
+    const artifactPrefix = path.posix.join("bench", path.basename(root));
+    const artifactDirectory = await resolveDevBrowserTempPath(artifactPrefix);
     const executablePath = process.env.CHROME_EXE;
     const manager = new BrowserManager(
       path.join(root, "browsers"),
@@ -154,6 +226,7 @@ it.skipIf(!process.env.BENCH)(
         : {}
     );
     let fixture: Awaited<ReturnType<typeof startAgentReliabilityFixture>> | undefined;
+    let primaryError: unknown;
 
     try {
       await manager.ensureBrowser(browserName, { headless: true });
@@ -161,56 +234,60 @@ it.skipIf(!process.env.BENCH)(
       const page = await manager.getPage(browserName, pageName);
       await page.goto(fixture.mainUrl, { waitUntil: "domcontentloaded" });
 
-      const fixtureObserve = await timed("fixture: observe", () =>
+      await timed("fixture: observe", () =>
         executeInteractiveAction(manager, request("fixture-observe", defaultObserveAction))
       );
-      void fixtureObserve;
 
-      const fixtureFind = await timed("fixture: find button Connect within main", () =>
-        executeInteractiveAction(
-          manager,
-          request("fixture-find-connect", {
-            kind: "find",
-            role: "button",
-            name: "Connect",
-            nameMode: "exact",
-            within: "main",
-            scope: "document",
-            states: [],
-            limit: 5,
-          })
-        )
+      const fixtureConnect = await timed(
+        "fixture: find button Connect within main",
+        () =>
+          executeInteractiveAction(
+            manager,
+            request("fixture-find-connect", {
+              kind: "find",
+              role: "button",
+              name: "Connect",
+              nameMode: "exact",
+              within: "main",
+              scope: "document",
+              states: [],
+              limit: 5,
+            })
+          ),
+        (result) => firstMatch(result, "fixture find")
       );
-      const fixtureConnect = firstMatch(fixtureFind, "fixture find");
 
-      await timed("fixture: click --ref", () =>
+      await dependentTimed("fixture: click --ref", fixtureConnect, (target) =>
         executeInteractiveAction(
           manager,
           request("fixture-click", {
             kind: "click",
-            ref: fixtureConnect.ref,
-            fromState: fixtureConnect.stateId,
+            ref: target.ref,
+            fromState: target.stateId,
             method: "mouse",
             retry: "never",
           })
         )
       );
-      await timed("fixture: click --ref --shot", () =>
+      await dependentTimed("fixture: click --ref --shot", fixtureConnect, (target) =>
         executeInteractiveAction(
           manager,
           request(
             "fixture-click-shot",
-            { kind: "click", ref: fixtureConnect.ref, method: "mouse", retry: "never" },
-            { shot: "bench-click.png", shotTimeoutMs: 8_000 }
+            { kind: "click", ref: target.ref, method: "mouse", retry: "never" },
+            {
+              shot: path.posix.join(artifactPrefix, "bench-click.png"),
+              shotTimeoutMs: 8_000,
+            }
           )
         )
       );
-      await timed("fixture: click --ref --wait-text", () =>
+      await dependentTimed("fixture: click --ref --wait-text", fixtureConnect, (target) =>
         executeInteractiveAction(
           manager,
           request("fixture-click-wait-text", {
             kind: "click",
-            ref: fixtureConnect.ref,
+            ref: target.ref,
             method: "mouse",
             retry: "never",
             waitForText: "Agent reliability fixture",
@@ -218,23 +295,27 @@ it.skipIf(!process.env.BENCH)(
         )
       );
 
-      const fixtureTextboxResult = await executeInteractiveAction(
-        manager,
-        request("fixture-find-textbox", {
-          kind: "find",
-          role: "textbox",
-          scope: "document",
-          states: [],
-          limit: 5,
-        })
+      const fixtureTextbox = await timed(
+        "setup: find fixture textbox",
+        () =>
+          executeInteractiveAction(
+            manager,
+            request("fixture-find-textbox", {
+              kind: "find",
+              role: "textbox",
+              scope: "document",
+              states: [],
+              limit: 5,
+            })
+          ),
+        (result) => firstMatch(result, "fixture textbox find")
       );
-      const fixtureTextbox = firstMatch(fixtureTextboxResult, "fixture textbox find");
-      await timed("fixture: type --ref", () =>
+      await dependentTimed("fixture: type --ref", fixtureTextbox, (target) =>
         executeInteractiveAction(
           manager,
           request("fixture-type", {
             kind: "type",
-            ref: fixtureTextbox.ref,
+            ref: target.ref,
             text: "hello world!",
             clear: true,
             delayMs: 0,
@@ -247,7 +328,10 @@ it.skipIf(!process.env.BENCH)(
           request(
             "fixture-shot",
             { kind: "shot" },
-            { shot: "bench-shot.png", shotTimeoutMs: 8_000 }
+            {
+              shot: path.posix.join(artifactPrefix, "bench-shot.png"),
+              shotTimeoutMs: 8_000,
+            }
           )
         )
       );
@@ -263,22 +347,26 @@ it.skipIf(!process.env.BENCH)(
       await timed("raw: collectPageState", () => collectPageState(page, {}));
       await timed("raw: collectLiveSnapshot", () => collectLiveSnapshot(page));
 
-      const resolveFind = await executeInteractiveAction(
-        manager,
-        request("fixture-find-connect-resolve", {
-          kind: "find",
-          role: "button",
-          name: "Connect",
-          nameMode: "exact",
-          within: "main",
-          scope: "document",
-          states: [],
-          limit: 5,
-        })
+      const resolveTarget = await timed(
+        "setup: find resolveActionTarget target",
+        () =>
+          executeInteractiveAction(
+            manager,
+            request("fixture-find-connect-resolve", {
+              kind: "find",
+              role: "button",
+              name: "Connect",
+              nameMode: "exact",
+              within: "main",
+              scope: "document",
+              states: [],
+              limit: 5,
+            })
+          ),
+        (result) => firstMatch(result, "fixture resolve find")
       );
-      const resolveTarget = firstMatch(resolveFind, "fixture resolve find");
-      await timed("raw: resolveActionTarget", async () => {
-        const resolved = await resolveActionTarget(page, resolveTarget.ref, {
+      await dependentTimed("raw: resolveActionTarget", resolveTarget, async (target) => {
+        const resolved = await resolveActionTarget(page, target.ref, {
           timeoutMs: 10_000,
           scroll: true,
           hitTest: true,
@@ -294,7 +382,6 @@ it.skipIf(!process.env.BENCH)(
         };
       });
 
-      const { runScript } = await import("../sandbox/script-runner-quickjs.js");
       const script = `const page = await browser.getPage("${pageName}"); console.log(await page.title());`;
       await timed("script: trivial (cold)", () =>
         runScript(
@@ -336,53 +423,59 @@ it.skipIf(!process.env.BENCH)(
         )
       );
 
-      const heavyFind = await timed("heavy: find More actions 77", () =>
-        executeInteractiveAction(
-          manager,
-          request("heavy-find-actions", {
-            kind: "find",
-            role: "button",
-            name: "More actions 77",
-            nameMode: "exact",
-            within: "main",
-            scope: "document",
-            states: [],
-            limit: 5,
-          })
-        )
+      const heavyButton = await timed(
+        "heavy: find More actions 77",
+        () =>
+          executeInteractiveAction(
+            manager,
+            request("heavy-find-actions", {
+              kind: "find",
+              role: "button",
+              name: "More actions 77",
+              nameMode: "exact",
+              within: "main",
+              scope: "document",
+              states: [],
+              limit: 5,
+            })
+          ),
+        (result) => firstMatch(result, "heavy find")
       );
-      const heavyButton = firstMatch(heavyFind, "heavy find");
-      await timed("heavy: click --ref", () =>
+      await dependentTimed("heavy: click --ref", heavyButton, (target) =>
         executeInteractiveAction(
           manager,
           request("heavy-click", {
             kind: "click",
-            ref: heavyButton.ref,
-            fromState: heavyButton.stateId,
+            ref: target.ref,
+            fromState: target.stateId,
             method: "mouse",
             retry: "never",
           })
         )
       );
-      const noteFind = await executeInteractiveAction(
-        manager,
-        request("heavy-find-note", {
-          kind: "find",
-          role: "textbox",
-          name: "Note",
-          nameMode: "contains",
-          scope: "document",
-          states: [],
-          limit: 5,
-        })
+      const note = await timed(
+        "setup: find heavy note",
+        () =>
+          executeInteractiveAction(
+            manager,
+            request("heavy-find-note", {
+              kind: "find",
+              role: "textbox",
+              name: "Note",
+              nameMode: "contains",
+              scope: "document",
+              states: [],
+              limit: 5,
+            })
+          ),
+        (result) => firstMatch(result, "heavy note find")
       );
-      const note = firstMatch(noteFind, "heavy note find");
-      await timed("heavy: type --ref 40 chars", () =>
+      await dependentTimed("heavy: type --ref 40 chars", note, (target) =>
         executeInteractiveAction(
           manager,
           request("heavy-type", {
             kind: "type",
-            ref: note.ref,
+            ref: target.ref,
             text: "Bonjour, ravi de vous rencontrer hier !",
             clear: true,
             delayMs: 0,
@@ -414,12 +507,14 @@ it.skipIf(!process.env.BENCH)(
           request("heavy-scroll", { kind: "scroll", direction: "down", pages: 1 })
         )
       );
-      await timed("heavy: press Tab", () =>
+      await dependentTimed("heavy: press Tab", heavyButton, (target) =>
         executeInteractiveAction(
           manager,
-          request("heavy-press", { kind: "press", ref: heavyButton.ref, key: "Tab" })
+          request("heavy-press", { kind: "press", ref: target.ref, key: "Tab" })
         )
       );
+    } catch (error) {
+      primaryError = error;
     } finally {
       const cleanup = await Promise.allSettled([
         fixture?.close() ?? Promise.resolve(),
@@ -431,12 +526,39 @@ it.skipIf(!process.env.BENCH)(
           failures.push(`${target} cleanup: ${errorSummary(result.reason)}`);
         }
       }
-      await rm(root, { recursive: true, force: true });
+      const removals = await Promise.allSettled(
+        [artifactDirectory, root].map((directory) =>
+          rm(directory, {
+            recursive: true,
+            force: true,
+            maxRetries: 6,
+            retryDelay: 100,
+          })
+        )
+      );
+      for (const [index, result] of removals.entries()) {
+        if (result.status === "rejected") {
+          const target = index === 0 ? "screenshot directory" : "browser temp directory";
+          failures.push(`${target} cleanup: ${errorSummary(result.reason)}`);
+        }
+      }
     }
 
     const elapsedMs = Math.round(performance.now() - benchmarkStartedAt);
     if (elapsedMs >= 60_000) failures.push(`benchmark exceeded 60 seconds (${elapsedMs} ms)`);
-    if (failures.length > 0) throw new Error(`Benchmark failures:\n${failures.join("\n")}`);
+    if (primaryError || failures.length > 0) {
+      const causes = [
+        ...(primaryError ? [primaryError] : []),
+        ...failures.map((failure) => new Error(failure)),
+      ];
+      throw new AggregateError(
+        causes,
+        `Benchmark failures:\n${[
+          ...(primaryError ? [`primary: ${errorSummary(primaryError)}`] : []),
+          ...failures,
+        ].join("\n")}`
+      );
+    }
   },
   60_000
 );
