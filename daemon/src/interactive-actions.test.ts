@@ -561,6 +561,11 @@ describe.sequential("interactive Playwright actions", () => {
       passed: [{ kind: "dialog", state: "opened" }],
     });
     expect(result.snapshot).toContain("Dynamic modal opened");
+    const openedDialog = result.elements?.find(
+      (element) => element.name === "Dynamic modal opened"
+    );
+    expect(result.delta?.added).toContain(openedDialog?.ref);
+    expect(result.delta?.summary).toContain("dialog opened");
     expect(result.elements).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "Dynamic modal opened" })])
     );
@@ -570,6 +575,55 @@ describe.sequential("interactive Playwright actions", () => {
         .find((element) => element.textContent?.includes("Dynamic modal opened"))
         ?.remove();
     });
+  });
+
+  it("returns default-track deltas after type and navigation without explicit waits", async () => {
+    const pageName = "systematic-delta";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><label>Draft <input aria-label="Draft"></label></main>`);
+    const found = await executeInteractiveAction(manager, {
+      id: "delta-find",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: {
+        kind: "find",
+        role: "textbox",
+        scope: "document",
+        states: [],
+        limit: 3,
+      },
+    });
+    const typed = await executeInteractiveAction(manager, {
+      id: "delta-type",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: {
+        kind: "type",
+        ref: found.matches![0]!.ref,
+        text: "draft",
+        clear: true,
+        delayMs: 0,
+      },
+    });
+
+    expect(typed.delta).not.toBeNull();
+    expect(typed.delta?.summary).toEqual(expect.any(String));
+
+    const navigated = await executeInteractiveAction(manager, {
+      id: "delta-navigate",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "navigate", url: "data:text/html,<main>after navigation</main>" },
+    });
+    expect(navigated.delta?.url?.before).toBe("about:blank");
+    expect(navigated.delta?.url?.after).toContain("data:text/html");
+    expect(navigated.delta?.summary).toContain("url changed");
   });
 
   it("waits for expected UI and retries one unchanged click", async () => {

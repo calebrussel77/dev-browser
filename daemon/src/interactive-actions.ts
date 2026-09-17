@@ -879,7 +879,11 @@ export async function executeInteractiveAction(
           timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
           waitUntil: "domcontentloaded",
         });
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), request);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       }
       break;
 
@@ -1549,7 +1553,11 @@ export async function executeInteractiveAction(
       result.waitForText = action.waitForText ?? null;
       result.waitSatisfied = action.waitForText ? true : null;
       if (!result.stateId)
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), request);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       if (startedDownloads[0])
         result.download = await saveDownload(startedDownloads[0], "click", request.page, journal);
       if (openedPopups[0])
@@ -1706,7 +1714,11 @@ export async function executeInteractiveAction(
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), request);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       break;
     }
 
