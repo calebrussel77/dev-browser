@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const DISCOVERY_SCHEMA_VERSION: u64 = 1;
+pub const DISCOVERY_SCHEMA_VERSION: u64 = 2;
 
 pub fn agent_schema() -> Value {
     json!({
@@ -46,7 +46,7 @@ pub fn agent_schema() -> Value {
         },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
-            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
+            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean", "elements": "boolean; compact element metadata", "verbose": "boolean; full historical response payload" },
             "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
@@ -92,7 +92,11 @@ pub fn agent_schema() -> Value {
         },
         "responseGrammar": {
             "successRequired": ["protocolVersion:2", "ok:true", "requestId", "browser", "page", "action"],
-            "commonOptional": ["documentId", "stateId", "url", "title", "tree", "elements", "coordinateSpace", "warnings", "trace"],
+            "commonOptional": ["documentId", "stateId", "url", "title", "tree", "coordinateSpace", "warnings", "trace"],
+            "responseControls": {
+                "elements": "--elements includes compact actionable element metadata; omitted by default",
+                "verbose": "--verbose restores the full historical element payload and wins over --elements"
+            },
             "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "search", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "ancestorGuard", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "inputStrategy", "verifiedValue", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
             "failureRequired": ["protocolVersion:2", "ok:false", "requestId", "error.code", "error.message", "error.recoverable"],
             "failureOptional": ["browser", "page", "action", "error.details", "error.nextCommands"]
@@ -159,6 +163,23 @@ mod tests {
         assert!(serialized.len() < 20_000);
         assert_eq!(schema["protocolVersions"], json!([1, 2]));
         assert_eq!(schema["errors"]["confirmation"]["exitStatus"], 8);
+        assert_eq!(schema["schemaVersion"], 2);
+        assert!(!schema["responseGrammar"]["commonOptional"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("elements")));
+        assert!(schema["responseGrammar"]["responseControls"]["elements"]
+            .as_str()
+            .unwrap()
+            .contains("--elements"));
+        assert!(schema["responseGrammar"]["responseControls"]["verbose"]
+            .as_str()
+            .unwrap()
+            .contains("historical"));
+        assert_eq!(
+            schema["interactiveRequest"]["optional"]["elements"],
+            "boolean; compact element metadata"
+        );
         assert!(schema["commands"]
             .as_array()
             .unwrap()

@@ -54,6 +54,8 @@ pub struct InteractiveRequestOptions<'a> {
     pub timeout_ms: u64,
     pub session: Option<&'a str>,
     pub trace: bool,
+    pub elements: bool,
+    pub verbose: bool,
 }
 
 pub struct ObserveActionOptions<'a> {
@@ -160,6 +162,12 @@ pub fn build_interactive_request(options: InteractiveRequestOptions<'_>, action:
     if options.trace {
         request["trace"] = Value::Bool(true);
     }
+    if options.elements {
+        request["elements"] = Value::Bool(true);
+    }
+    if options.verbose {
+        request["verbose"] = Value::Bool(true);
+    }
 
     request
 }
@@ -201,6 +209,8 @@ mod tests {
                 timeout_ms: 15_000,
                 session: Some("opaque-session"),
                 trace: true,
+                elements: true,
+                verbose: true,
             },
             json!({ "kind": "read", "limit": 100, "depth": 12 }),
         );
@@ -217,6 +227,8 @@ mod tests {
         assert_eq!(request["action"]["kind"], "read");
         assert_eq!(request["session"], "opaque-session");
         assert_eq!(request["trace"], true);
+        assert_eq!(request["elements"], true);
+        assert_eq!(request["verbose"], true);
     }
 
     #[test]
@@ -298,12 +310,16 @@ mod tests {
                 timeout_ms: 10_000,
                 session: None,
                 trace: false,
+                elements: false,
+                verbose: false,
             },
             json!({ "kind": "read", "limit": 100, "depth": 12 }),
         );
 
         assert_eq!(request["protocolVersion"], 2);
         assert_eq!(request["action"]["kind"], "read");
+        assert!(request.get("elements").is_none());
+        assert!(request.get("verbose").is_none());
     }
 
     #[test]
