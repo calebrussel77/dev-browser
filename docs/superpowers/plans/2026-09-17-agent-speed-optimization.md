@@ -212,10 +212,12 @@ Mesure 1.4 : `find` lourd = 790 octets compacts ; fixture = 721 octets compacts.
 
 ### Tâche 1.5 — Warnings de bruit
 
-- [ ] Supprimer le warning permanent `"Closed shadow roots cannot be inspected..."` de `collectPageState` (le déplacer dans `schema --json` sous `limits`).
-- [ ] Le warning `"Unversioned decision: ..."` de `daemon/src/ref-state.ts` n'est émis que sous `--verbose` ou quand `--strict-state` est demandé sans `--from-state` (cas contradictoire).
+- [x] Supprimer le warning permanent `"Closed shadow roots cannot be inspected..."` de `collectPageState` (le déplacer dans `schema --json` sous `limits`).
+- [x] Le warning `"Unversioned decision: ..."` de `daemon/src/ref-state.ts` n'est émis que sous `--verbose` ou quand `--strict-state` est demandé sans `--from-state` (cas contradictoire).
 
 **Tests :** mettre à jour les assertions existantes qui attendent ces warnings ; ajouter un cas `verbose: true` qui les retrouve.
+
+Mesure 1.5 : `click` lourd = 4 578 octets compacts après retrait des warnings permanents ; le seuil final de 4 KB reste bloquant et nécessite le dernier resserrement de la sortie compacte 1.3.
 
 ### Tâche 1.6 — Documentation de la phase 1
 
