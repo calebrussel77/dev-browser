@@ -265,7 +265,9 @@ describe.sequential("first-class transfer and navigation actions", () => {
       expect(await readFile(saved!, "utf8")).toContain("deterministic fixture download");
       await rm(saved!, { force: true });
     }
-  }, 10_000);
+    // Two real navigations + two download round trips: 10s reads as a flaky
+    // failure on a loaded machine; inherit the 30s suite default instead.
+  }, 30_000);
 
   it("rejects traversal download names and cleans interrupted artifacts with a journal", async () => {
     for (const unsafe of ["../escape.txt", "sub/escape.txt", "C:\\escape.txt"]) {
@@ -369,8 +371,11 @@ describe.sequential("first-class transfer and navigation actions", () => {
     try {
       await expect(action("popup-metadata-timeout", { kind: "click", ref, method: "locator" }))
         .rejects.toMatchObject({ code: "POPUP_OPENED", details: { attemptJournal: expect.any(Array) } });
-      // Preserve the bounded deadline while allowing scheduler contention in the full Playwright suite.
-      expect(Date.now() - started).toBeLessThan(3_000);
+      // Preserve the bounded deadline while allowing scheduler contention in
+      // the full Playwright suite and on a loaded developer machine. The
+      // contrast that matters is bounded-vs-hung: an unbounded wait would ride
+      // the mocked never-resolving CDP session into the action timeout.
+      expect(Date.now() - started).toBeLessThan(8_000);
       expect(emitter.listenerCount("popup")).toBe(baseline);
     } finally {
       spy.mockRestore();

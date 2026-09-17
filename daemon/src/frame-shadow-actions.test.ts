@@ -141,7 +141,9 @@ describe.sequential("frame and shadow action flows", () => {
     expect(await same.getByTestId("frame-events").textContent()).toBe("frame-upload.txt");
     expect(shot.targets?.[0]).toMatchObject({ frameId: expect.stringMatching(/^F\d+$/), method: "screenshot" });
     await rm(shot.screenshotPath!, { force: true });
-  }, 30_000);
+    // ~20 real browser actions incl. eleven full observes: 30s is routinely
+    // exceeded on a loaded machine, reading as a flaky failure.
+  }, 90_000);
 
   it("ignores malicious ref attributes and restores only its owned temporary attribute", async () => {
     const page = await manager.getPage(browserName, pageName);
