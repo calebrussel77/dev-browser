@@ -17,6 +17,16 @@ Three moving parts, and understanding them prevents almost every mistake:
 
 Because the daemon persists state, think in **small, focused commands** that each do one thing and end by reporting the state you need for the next decision — not one giant script. Short commands fail fast, are easy to retry, and keep the browser exactly where it stopped when something goes wrong.
 
+## If results suddenly go empty, frozen, or silent — restart the daemon first
+
+Before forming *any* hypothesis about the site, the account, rate limiting, or the network: run `dev-browser stop` and retry once. A long-lived daemon (or one whose CLI invocation was killed from outside mid-script) can degrade in ways that return plausible-looking wrong data instead of errors. The failure signature to recognize:
+
+- a script prints nothing and exits 0 (newer builds exit 6 with `RUNTIME_CHANNEL_LOST` instead);
+- DOM reads come back identical across scroll steps — `scrollHeight` never changes, `scrollY` pins, a lazy-loading feed never grows;
+- meanwhile `doctor` says ok, `status` says connected, and the CDP endpoint answers.
+
+`dev-browser stop` costs seconds and rules this out; hours have been lost to theorizing before it. Two rules prevent the state in the first place: **always pass `--timeout` and keep it comfortably below any supervisor or harness limit governing your process**, so the CLI exits on its own terms instead of being killed mid-run; and if a covered connected-Chrome window is involved, know that its renderer freezes (reads keep answering while the page's own JS stops — see `references/diagnostics-and-recovery.md`).
+
 ## The three decisions, in order
 
 **1. Which browser to drive.** Pick from the *task*, not by habit.

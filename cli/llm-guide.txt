@@ -83,6 +83,7 @@ LLM USAGE GUIDE:
     mean): the click fails closed instead of hitting a lookalike.
 
     Machine discovery and diagnostics:
+      dev-browser --version
       dev-browser schema --json
       dev-browser capabilities --compact
       dev-browser examples click
@@ -93,6 +94,30 @@ LLM USAGE GUIDE:
     traces are redacted, size-bounded, retained under ~/.dev-browser/tmp/traces,
     and available with `dev-browser trace show LAST`. External CDP tracing is
     best-effort and reports a warning when full context tracing is unavailable.
+    `doctor` proves a real script round trip through the QuickJS runtime and
+    stdout channel (RUNTIME_SELFTEST_FAILED when it breaks), and a completed
+    script whose output did not all arrive exits 6 with RUNTIME_CHANNEL_LOST
+    instead of impersonating an empty success.
+
+  HARD RULE — own your timeout, never be killed from outside:
+    Always pass `--timeout SECONDS` and keep it comfortably below whatever
+    supervisor or harness limit governs your process, so every dev-browser
+    invocation exits on its own terms. An externally killed invocation used to
+    leave its script running blind in the daemon (holding the browser lock and
+    driving pages with nobody listening); the daemon now aborts the script the
+    moment its client disconnects, but the prevention still stands. If results
+    ever go empty, frozen, or silent with green health checks, run
+    `dev-browser stop` and retry once BEFORE forming any hypothesis about the
+    site, the account, or the network.
+
+  Driving lazy-loading feeds from a script:
+    Plain window.scrollBy inside page.evaluate is fine and fast — the feed
+    loads as long as the page's own JS is running. If a feed freezes
+    (scrollHeight constant across steps, items never appended) on a connected
+    Chrome, the window is likely occlusion-frozen: the daemon wakes it
+    automatically before scripts and trusted input (stderr warning says so),
+    and `--disable-backgrounding-occluded-windows` on the connected Chrome
+    makes it immune permanently.
 
   Screenshots have a hard deadline:
     `--shot-timeout MILLISECONDS` (250..120000, default min(--timeout, 8000))

@@ -26,6 +26,18 @@ If a script fails, the page usually stays where it stopped — reconnect to the 
 
 If `--connect` reports `<ws connected>` then times out, Chrome/CDP is reachable but Playwright didn't finish attaching: retry with a short `--timeout 10`, then run `dev-browser doctor --connect --json` and follow its recovery command. `--timeout SECONDS` governs *both* the CDP attach step and script execution, so short timeouts fail fast instead of hanging.
 
+## The degraded-daemon signature
+
+A daemon can degrade silently — most often after a CLI invocation was killed from the outside mid-script (a harness timeout, a `kill`), or after very long uptime. Recognize the signature instead of theorizing about the site:
+
+- **Silent output**: a script exits 0 with no stdout. Current builds detect this (`doctor` runs a script round trip and reports `RUNTIME_SELFTEST_FAILED`; a lost output channel exits 6 with `RUNTIME_CHANNEL_LOST`), but treat *any* unexplained empty success as suspect.
+- **Frozen reads**: DOM reads that stay byte-identical across scroll steps — `scrollHeight` constant, `scrollY` pinned, one or two feed items forever — while the same URL scrolls fine in a human-driven window. On a covered connected-Chrome window this is the occlusion renderer freeze (reads answer, the page's own JS — timers, rAF, IntersectionObserver, lazy loading — is frozen; `document.visibilityState` still lies "visible"). Scripts now get an automatic wake attempt with a stderr warning; interactive actions already had it.
+- **Green health checks**: `status` says connected and the CDP endpoint answers — neither proves a working script pipeline. `doctor` now does (its `ok` includes a real script round trip).
+
+Recovery is always the same and costs seconds: `dev-browser stop`, then retry once. Prevention: pass `--timeout` and keep it comfortably below any supervisor limit governing your process, so an invocation always exits on its own terms; the daemon also aborts a script the moment its submitting CLI dies, so a killed invocation no longer leaves a blind script driving the browser.
+
+Two notes that save detours: plain `window.scrollBy` inside a script's `page.evaluate` is a fine way to drive lazy-loading feeds (one CLI `scroll` call per step is not required — that verb exists for trusted-input scrolling and container scans); and `page.bringToFront()` waking a frozen page once is the occlusion remediation working, not a fix you should build a workflow on.
+
 ## Pitfalls checklist
 
 - Prefer `dev-browser --connect` (no URL) for the user's real Chrome; a 404 from `/json/version` is not a failure signal.
