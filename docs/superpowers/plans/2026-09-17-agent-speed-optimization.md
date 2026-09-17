@@ -397,11 +397,11 @@ Conception :
 
 ## 9. Phase 4 — Guidance de l'agent (PR 6)
 
-- [ ] `skills/dev-browser/SKILL.md` : ajouter en tête de la section boucle une sous-section **Fast path** : (1) `find`/`click` sémantique sans screenshot pour tout ce qui n'est pas irréversible ; (2) `--shot` seulement avant une action irréversible ou quand la mise en page compte ; (3) `text --within` pour lire, `observe` pour choisir une cible, jamais `observe` pour lire ; (4) `batch` pour toute séquence prévisible ; (5) scripts pour l'extraction de masse. Garder le flux long pour les actions irréversibles.
-- [ ] `cli/llm-guide.txt` : réduire à ≤ 8 KB ; déplacer le détail dans `examples COMMAND`. `--help` doit tenir en ≤ 10 KB.
-- [ ] `dev-browser capabilities --compact` cité en premier partout, avec la ligne « lisez `schema --json` seulement si une commande échoue pour raison de grammaire ».
-- [ ] `README.md` section Benchmarks : ajouter le tableau avant/après produit par les evals (section 10), avec la commande pour le reproduire.
-- [ ] `CHANGELOG.md`.
+- [x] `skills/dev-browser/SKILL.md` : ajouter en tête de la section boucle une sous-section **Fast path** : (1) `find`/`click` sémantique sans screenshot pour tout ce qui n'est pas irréversible ; (2) `--shot` seulement avant une action irréversible ou quand la mise en page compte ; (3) `text --within` pour lire, `observe` pour choisir une cible, jamais `observe` pour lire ; (4) `batch` pour toute séquence prévisible ; (5) scripts pour l'extraction de masse. Garder le flux long pour les actions irréversibles.
+- [x] `cli/llm-guide.txt` : réduire à ≤ 8 KB ; déplacer le détail dans `examples COMMAND`. `--help` doit tenir en ≤ 10 KB.
+- [x] `dev-browser capabilities --compact` cité en premier partout, avec la ligne « lisez `schema --json` seulement si une commande échoue pour raison de grammaire ».
+- [x] `README.md` section Benchmarks : ajouter le tableau avant/après produit par les evals (section 10), avec la commande pour le reproduire.
+- [x] `CHANGELOG.md`.
 
 ---
 
@@ -434,7 +434,7 @@ Rapport : `docs/field-reports/<date>-speed-<phase>.md` avec le tableau et les an
 
 Objectif : mesurer ce que voit l'utilisateur, avec un vrai agent.
 
-- [ ] Préparer 4 tâches en langage naturel, chacune non destructive : (T1) « Ouvre ma messagerie LinkedIn et dis-moi le nom des 5 dernières conversations » ; (T2) « Ouvre la conversation avec <contact autorisé> et résume ses 3 derniers messages » ; (T3) « Cherche "dev-browser" dans LinkedIn et liste les 3 premiers résultats » ; (T4) « Sur <autre application>, va sur la page X et extrais Y ».
+- [x] Préparer 4 tâches en langage naturel, chacune non destructive : (T1) « Ouvre ma messagerie LinkedIn et dis-moi le nom des 5 dernières conversations » ; (T2) « Ouvre la conversation avec <contact autorisé> et résume ses 3 derniers messages » ; (T3) « Cherche "dev-browser" dans LinkedIn et liste les 3 premiers résultats » ; (T4) « Sur <autre application>, va sur la page X et extrais Y ».
 - [ ] Exécuter chaque tâche avec un agent Claude Code équipé du skill `skills/dev-browser` (via `dev-browser install-skill`), sur la version de base puis sur la version finale, 3 fois chacune. Instrumenter avec le hook `PostToolUse` de Claude Code (ou en lisant le transcript JSONL de la session dans `~/.claude/projects/`) pour compter : nombre d'appels `dev-browser`, octets de sortie totaux, temps mur de la tâche, succès (réponse correcte vérifiée à la main).
 - [ ] Critères : médiane des appels ÷ 1,8 ou mieux ; octets de sortie ÷ 8 ou mieux ; temps mur ÷ 2 ou mieux ; succès ≥ égal à la base ; aucune action interdite dans les transcripts (grep des noms de boutons interdits dans les commandes `click`).
 - [ ] Consigner dans `docs/perf/agent-eval.md` : tâches, modèle, tableaux, écarts.
