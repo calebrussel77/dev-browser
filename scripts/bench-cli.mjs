@@ -174,8 +174,12 @@ export function selectPageByUrl(payload, urlFilter) {
 }
 
 function runProcess(bin, connect, args) {
+  const cliArgs = ["--connect", connect, ...args];
+  const isNodeScript = [".js", ".mjs", ".cjs"].includes(path.extname(bin).toLowerCase());
+  const executable = isNodeScript ? process.execPath : bin;
+  const executableArgs = isNodeScript ? [bin, ...cliArgs] : cliArgs;
   const started = performance.now();
-  const result = spawnSync(bin, ["--connect", connect, ...args], {
+  const result = spawnSync(executable, executableArgs, {
     encoding: "utf8",
     maxBuffer: MAX_BUFFER_BYTES,
     shell: false,
@@ -237,29 +241,18 @@ function measure(command, runs, bin, connect) {
 function extractFoundRef(samples) {
   const successful = samples.filter(({ code }) => code === 0);
   if (successful.length === 0) return undefined;
-
-  let validJson = false;
-  let lastError;
-  for (const sample of successful) {
-    try {
-      const payload = parseCliJson(sample.stdout);
-      validJson = true;
-      const ref = payload?.matches?.find((match) => typeof match?.ref === "string")?.ref;
-      if (ref) return ref;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  if (!validJson) throw lastError ?? new Error("find returned no usable JSON");
-  return undefined;
+  const payload = parseCliJson(successful.at(-1).stdout);
+  return payload?.matches?.find((match) => typeof match?.ref === "string")?.ref;
 }
 
 function measureClickAndEscape(click, press, runs, bin, connect) {
   const clickSamples = [];
   const pressSamples = [];
+  let aborted = false;
 
   for (let index = 0; index < runs; index += 1) {
     let clickError;
+    let escapeFailed = false;
     try {
       clickSamples.push(runProcess(bin, connect, click.args));
     } catch (error) {
@@ -267,19 +260,32 @@ function measureClickAndEscape(click, press, runs, bin, connect) {
     }
 
     try {
-      pressSamples.push(runProcess(bin, connect, press.args));
+      const sample = runProcess(bin, connect, press.args);
+      pressSamples.push(sample);
+      escapeFailed = sample.code !== 0;
     } catch (pressError) {
       if (!clickError) throw pressError;
     }
     if (clickError) throw clickError;
+    if (escapeFailed) {
+      aborted = true;
+      break;
+    }
   }
 
   reportFailures(click, clickSamples, runs);
   reportFailures(press, pressSamples, runs);
-  return [
-    { command: click, samples: clickSamples, stats: summarize(clickSamples) },
-    { command: press, samples: pressSamples, stats: summarize(pressSamples) },
-  ];
+  return {
+    aborted,
+    measurements: [
+      { command: click, samples: clickSamples, stats: summarize(clickSamples) },
+      { command: press, samples: pressSamples, stats: summarize(pressSamples) },
+    ],
+  };
+}
+
+function invalidMeasurements(rows) {
+  return rows.filter(({ samples }) => !samples.some(({ code }) => code === 0));
 }
 
 function renderTable(rows, runs) {
@@ -331,7 +337,15 @@ export function main(argv = process.argv.slice(2), env = process.env) {
       const commands = buildCommands({ page, findName, ref });
       const click = commands.find(({ key }) => key === "click");
       const press = commands.find(({ key }) => key === "press-escape");
-      rows.push(...measureClickAndEscape(click, press, runs, bin, connect));
+      const paired = measureClickAndEscape(click, press, runs, bin, connect);
+      rows.push(...paired.measurements);
+      if (paired.aborted) {
+        renderTable(rows, runs);
+        console.error(
+          "[bench-cli] press Escape failed; benchmark aborted before another click"
+        );
+        return 1;
+      }
     } else {
       console.error("[bench-cli] find returned no ref; click and press Escape were skipped");
     }
@@ -339,12 +353,22 @@ export function main(argv = process.argv.slice(2), env = process.env) {
 
   rows.push(measure(scroll, runs, bin, connect));
   renderTable(rows, runs);
+  const invalid = invalidMeasurements(rows);
+  if (invalid.length > 0) {
+    console.error(
+      `[bench-cli] invalid benchmark: no successful samples for ${invalid
+        .map(({ command }) => command.key)
+        .join(", ")}`
+    );
+    return 1;
+  }
+  return 0;
 }
 
 const entryPoint = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";
 if (entryPoint === import.meta.url) {
   try {
-    main();
+    process.exitCode = main();
   } catch (error) {
     console.error(`[bench-cli] ${bounded(error instanceof Error ? error.message : String(error))}`);
     process.exitCode = 1;

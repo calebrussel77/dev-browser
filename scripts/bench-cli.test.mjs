@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildCommands,
@@ -8,6 +13,70 @@ import {
   selectPageByUrl,
   summarize,
 } from "./bench-cli.mjs";
+
+const benchScript = fileURLToPath(new URL("./bench-cli.mjs", import.meta.url));
+
+const fakeBinarySource = `
+import { appendFileSync, readFileSync } from "node:fs";
+
+const args = process.argv.slice(2);
+const command = args[2];
+const logFile = process.env.FAKE_LOG;
+let previous = [];
+try {
+  previous = readFileSync(logFile, "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse);
+} catch {}
+appendFileSync(logFile, JSON.stringify(args) + "\\n");
+const invocation = previous.filter((entry) => entry[2] === command).length + 1;
+const fail = (message) => { console.error(message); process.exitCode = 3; };
+
+if (process.env.FAKE_MODE === "escape-fail" && command === "press") {
+  fail("Escape restoration failed");
+} else if (process.env.FAKE_MODE === "target-missing" && command !== "pages") {
+  fail("TARGET_MISSING: requested page does not exist");
+} else if (
+  process.env.FAKE_MODE === "isolated-failure" &&
+  command === "observe" &&
+  !args.includes("--within") &&
+  invocation === 1
+) {
+  fail("transient observe failure");
+} else if (command === "pages") {
+  console.log(JSON.stringify({ protocolVersion: 2, ok: true, pages: [{ id: "TARGET", url: "https://example.test/inbox" }] }));
+} else if (command === "find") {
+  console.log(JSON.stringify({ protocolVersion: 2, ok: true, matches: [{ ref: "R" + invocation }] }));
+} else {
+  console.log(JSON.stringify({ protocolVersion: 2, ok: true, action: command }));
+}
+`;
+
+function runWithFakeBinary(t, { mode, findName = "" }) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "dev-browser-bench-cli-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const fakeBinary = path.join(directory, "fake dev-browser.mjs");
+  const logFile = path.join(directory, "calls.jsonl");
+  writeFileSync(fakeBinary, fakeBinarySource);
+  writeFileSync(logFile, "");
+
+  const result = spawnSync(process.execPath, [benchScript, "--runs", "2"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CONNECT: "http://127.0.0.1:9223",
+      DEV_BROWSER_BIN: fakeBinary,
+      FAKE_LOG: logFile,
+      FAKE_MODE: mode,
+      FIND_NAME: findName,
+      PAGE: "TARGET",
+    },
+  });
+  const calls = readFileSync(logFile, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map(JSON.parse);
+  return { ...result, calls };
+}
 
 test("parseRuns defaults to five and accepts one bounded positive integer", () => {
   assert.equal(parseRuns([]), 5);
@@ -128,4 +197,35 @@ test("selectPageByUrl resolves a unique target by URL and never by list position
     () => selectPageByUrl({ pages: [...pages, { id: "C", url: "https://other.test/inbox" }] }, "/inbox"),
     /Multiple page URLs match/
   );
+});
+
+test("a failed Escape aborts before a second click and uses the last successful find ref", (t) => {
+  const result = runWithFakeBinary(t, { mode: "escape-fail", findName: "Inbox row" });
+  const clicks = result.calls.filter((args) => args[2] === "click");
+  const presses = result.calls.filter((args) => args[2] === "press");
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(clicks.length, 1);
+  assert.equal(presses.length, 1);
+  assert.equal(clicks[0][clicks[0].indexOf("--ref") + 1], "R2");
+  assert.equal(result.calls.some((args) => args[2] === "scroll"), false);
+  assert.match(result.stdout, /press --page TARGET --ref R2 --key Escape/);
+  assert.match(result.stderr, /press-escape: 1\/2 failed/);
+});
+
+test("an isolated failed sample is reported but keeps a valid benchmark successful", (t) => {
+  const result = runWithFakeBinary(t, { mode: "isolated-failure" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /failures\/2/);
+  assert.match(result.stderr, /observe: 1\/2 failed/);
+});
+
+test("a targeted command with no successful samples makes the benchmark fail", (t) => {
+  const result = runWithFakeBinary(t, { mode: "target-missing" });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /\| observe --page TARGET \|/);
+  assert.match(result.stderr, /TARGET_MISSING/);
+  assert.match(result.stderr, /no successful samples/);
 });
