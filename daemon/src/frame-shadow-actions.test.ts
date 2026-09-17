@@ -20,7 +20,15 @@ describe.sequential("frame and shadow action flows", () => {
   let fixture: AgentReliabilityFixture;
 
   const action = (action: any, hooks: any = {}) =>
-    executeInteractiveAction(manager, { id: `frame-${action.kind}`, type: "interactive", protocolVersion: 2, browser: browserName, page: pageName, action }, hooks);
+    executeInteractiveAction(manager, {
+      id: `frame-${action.kind}`,
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      verbose: action.kind === "read" || action.kind === "observe",
+      action,
+    }, hooks);
 
   beforeAll(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "dev-browser-frame-shadow-"));

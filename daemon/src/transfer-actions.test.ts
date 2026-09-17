@@ -37,6 +37,7 @@ describe.sequential("first-class transfer and navigation actions", () => {
       browser,
       page,
       timeoutMs: 5_000,
+      verbose: value.kind === "read" || value.kind === "observe",
       action: value as never,
     });
   }

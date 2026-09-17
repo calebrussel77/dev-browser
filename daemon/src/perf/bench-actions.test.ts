@@ -406,6 +406,18 @@ it.skipIf(process.env.BENCH !== "1")(
       await timed("heavy: observe", () =>
         executeInteractiveAction(manager, request("heavy-observe", defaultObserveAction))
       );
+      await timed("heavy: observe --elements", () =>
+        executeInteractiveAction(
+          manager,
+          request("heavy-observe-elements", defaultObserveAction, { elements: true })
+        )
+      );
+      await timed("heavy: observe --verbose", () =>
+        executeInteractiveAction(
+          manager,
+          request("heavy-observe-verbose", defaultObserveAction, { verbose: true })
+        )
+      );
       await timed("heavy: observe --within main --max-nodes 300", () =>
         executeInteractiveAction(
           manager,

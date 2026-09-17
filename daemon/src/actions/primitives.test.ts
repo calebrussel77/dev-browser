@@ -24,7 +24,15 @@ describe.sequential("trusted interaction primitives", () => {
   afterAll(async () => { await manager?.stopAll(); await rm(root, { recursive: true, force: true }); }, 120_000);
 
   const run = (action: Parameters<typeof executeInteractiveAction>[1]["action"], hooks = {}) =>
-    executeInteractiveAction(manager, { id: `primitive-${action.kind}`, type: "interactive", protocolVersion: 2, browser, page: "main", action }, hooks);
+    executeInteractiveAction(manager, {
+      id: `primitive-${action.kind}`,
+      type: "interactive",
+      protocolVersion: 2,
+      browser,
+      page: "main",
+      verbose: action.kind === "read" || action.kind === "observe",
+      action,
+    }, hooks);
   async function ref(name: string) {
     const state = await run({ kind: "read", limit: 100, depth: 12 });
     const element = state.elements!.find((item) => item.name === name);
@@ -395,6 +403,7 @@ describe.sequential("find --scroll-container bounded auto-scroll over a virtuali
       protocolVersion: 2,
       browser,
       page: "main",
+      verbose: action.kind === "read" || action.kind === "observe",
       action,
     });
 

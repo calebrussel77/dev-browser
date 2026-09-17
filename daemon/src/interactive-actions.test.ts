@@ -19,7 +19,14 @@ const browserName = "interactive-actions";
 
 function request(
   action: Parameters<typeof executeInteractiveAction>[1]["action"],
-  options: { shot?: string; timeoutMs?: number; annotate?: boolean; fullPage?: boolean } = {}
+  options: {
+    shot?: string;
+    timeoutMs?: number;
+    annotate?: boolean;
+    fullPage?: boolean;
+    elements?: boolean;
+    verbose?: boolean;
+  } = {}
 ): Parameters<typeof executeInteractiveAction>[1] {
   return {
     id: `test-${action.kind}`,
@@ -149,7 +156,7 @@ describe.sequential("interactive Playwright actions", () => {
     expect("snapshot" in first ? first.snapshot : "").toContain("Naminsita Bakayoko");
   });
 
-  it("uses one v2 state shape for observe and legacy read", async () => {
+  it("omits the v2 element payload by default", async () => {
     const observe = await executeInteractiveAction(manager, {
       ...request({
         kind: "observe",
@@ -171,7 +178,56 @@ describe.sequential("interactive Playwright actions", () => {
     expect(observe.documentId).toBe(read.documentId);
     expect(observe.tree).toBe(read.tree);
     expect(observe.coordinateSpace).toEqual(read.coordinateSpace);
-    expect(observe.elements).toEqual(read.elements);
+    expect(observe).not.toHaveProperty("elements");
+    expect(read).not.toHaveProperty("elements");
+  });
+
+  it("returns compact elements on request and preserves the historical verbose shape", async () => {
+    const action = {
+      kind: "observe" as const,
+      full: false,
+      delta: false,
+      track: "response-shape",
+      maxNodes: 100,
+      maxChars: 12_000,
+      depth: 12,
+      breadth: 50,
+    };
+    const compact = await executeInteractiveAction(manager, {
+      ...request(action, { elements: true }),
+      protocolVersion: 2,
+    });
+    const verbose = await executeInteractiveAction(manager, {
+      ...request(action, { verbose: true }),
+      protocolVersion: 2,
+    });
+
+    expect(compact.elements?.length).toBeGreaterThan(0);
+    const compactPayloads = (compact.elements ?? []).map((element) => JSON.stringify(element));
+    expect(Math.max(...compactPayloads.map((payload) => payload.length)), compactPayloads.sort((a, b) => b.length - a.length)[0])
+      .toBeLessThan(200);
+    expect(compact.elements?.[0]).not.toHaveProperty("visible");
+    expect(compact.elements?.[0]).not.toHaveProperty("semanticAncestors");
+    expect(Object.keys(verbose.elements?.[0] ?? {}).sort()).toEqual([
+      "actionable", "box", "checked", "current", "depth", "description", "disabled",
+      "expanded", "focused", "frameDocumentId", "frameId", "frameName", "framePath", "frameUrl",
+      "inViewport", "inputType", "landmark", "name", "nearby", "obscured", "placeholder",
+      "pressed", "quad", "readonly", "ref", "required", "role", "scrollable", "selected",
+      "semanticAncestors", "shadowContext", "stableAttributes", "visible",
+    ]);
+  });
+
+  it("lets verbose win when both response controls are enabled", async () => {
+    const result = await executeInteractiveAction(manager, {
+      ...request(
+        { kind: "observe", full: false, delta: false, track: "verbose-wins", maxNodes: 100,
+          maxChars: 12_000, depth: 12, breadth: 50 },
+        { elements: true, verbose: true }
+      ),
+      protocolVersion: 2,
+    });
+
+    expect(result.elements?.[0]).toHaveProperty("semanticAncestors");
   });
 
   it("keeps text/assert responses scope bounded instead of re-collecting the full unscoped tree", async () => {
@@ -315,6 +371,7 @@ describe.sequential("interactive Playwright actions", () => {
       id: "test-root-read",
       type: "interactive",
       protocolVersion: 2,
+      elements: true,
       browser: browserName,
       page: "root-page",
       action: { kind: "read", limit: 100, depth: 12 },
@@ -433,6 +490,7 @@ describe.sequential("interactive Playwright actions", () => {
         breadth: 50,
       }),
       protocolVersion: 2,
+      elements: true,
     });
     const ref = observed.elements?.find((element) => element.name === "Changed action")?.ref;
     const page = await manager.getPage(browserName, "profile");
@@ -440,6 +498,7 @@ describe.sequential("interactive Playwright actions", () => {
       const clicked = await executeInteractiveAction(manager, {
         ...request({ kind: "click", ref: ref!, method: "mouse" }),
         protocolVersion: 2,
+        elements: true,
       });
 
       expect(clicked.documentId).toBe(observed.documentId);
@@ -570,6 +629,7 @@ describe.sequential("interactive Playwright actions", () => {
         const observed = await executeInteractiveAction(manager, {
           ...request({ kind: "read", limit: 100, depth: 12 }),
           protocolVersion: 2,
+          elements: true,
         });
         const ref = elements(observed).find((element) => element.name === "Action")!.ref;
         return ref;
@@ -709,6 +769,7 @@ describe.sequential("interactive Playwright actions", () => {
         const observed = await executeInteractiveAction(manager, {
           ...request({ kind: "read", limit: 100, depth: 12 }),
           protocolVersion: 2,
+          elements: true,
         });
         const transientRef = elements(observed).find((element) => element.name === "Action")!.ref;
         await page.locator("#action").focus();
@@ -1121,6 +1182,7 @@ describe.sequential("interactive Playwright actions", () => {
     const observed = await executeInteractiveAction(manager, {
       ...request({ kind: "observe", full: true, delta: false, track: "confirmation", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }),
       protocolVersion: 2,
+      elements: true,
     });
     const ref = elements(observed).find((element) => element.name === "Send")!.ref;
     const confirmation = await executeInteractiveAction(manager, {
@@ -1176,6 +1238,7 @@ describe.sequential("interactive Playwright actions", () => {
           breadth: 50,
         }),
         protocolVersion: 2,
+        elements: true,
       });
     const observed = await observe();
     const ref = elements(observed).find((element) => element.name === "Save")!.ref;
@@ -1239,6 +1302,7 @@ describe.sequential("interactive Playwright actions", () => {
           breadth: 50,
         }),
         protocolVersion: 2,
+        elements: true,
       });
     await page.setContent(
       `<button id="target" aria-expanded="false">Act</button><script>window.inputs=0;document.querySelector('#target').onclick=e=>{window.inputs++;e.currentTarget.setAttribute('aria-expanded','true')}</script>`
@@ -1496,6 +1560,7 @@ describe.sequential("interactive Playwright actions", () => {
     const read = await executeInteractiveAction(manager, {
       ...request({ kind: "read", limit: 100, depth: 12 }),
       protocolVersion: 2,
+      elements: true,
       page: targetPage,
     });
     const field = elements(read).find((element) => element.name === "Replaceable field")!;

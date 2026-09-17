@@ -441,7 +441,16 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   timeoutMs: z.number().int().positive().optional(),
   session: z.string().min(1).max(500).optional(),
   trace: z.boolean().default(false),
+  elements: z.boolean().optional(),
+  verbose: z.boolean().optional(),
 }).superRefine((value, context) => {
+  if (value.protocolVersion === 1 && (value.elements === true || value.verbose === true)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [value.verbose === true ? "verbose" : "elements"],
+      message: "elements and verbose require protocolVersion 2 when enabled",
+    });
+  }
   if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,

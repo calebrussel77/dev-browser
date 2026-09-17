@@ -24,6 +24,7 @@ function request(
     browser: browserName,
     page: pageName,
     protocolVersion: 2,
+    verbose: action.kind === "read" || action.kind === "observe",
     action,
   };
 }
