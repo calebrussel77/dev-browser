@@ -221,8 +221,8 @@ Mesure 1.5 : `click` lourd = 4 578 octets compacts après retrait des warnings p
 
 ### Tâche 1.6 — Documentation de la phase 1
 
-- [ ] `README.md`, `cli/llm-guide.txt`, `skills/dev-browser/references/interactive-loop.md`, `cli/src/discovery.rs` (`focused_example` de `observe`, `find`, `click`) : montrer la sortie compacte, `--elements`, `--verbose`, `--pretty`.
-- [ ] `CHANGELOG.md` `[Unreleased]` : entrée "Compact responses by default".
+- [x] `README.md`, `cli/llm-guide.txt`, `skills/dev-browser/references/interactive-loop.md`, `cli/src/discovery.rs` (`focused_example` de `observe`, `find`, `click`) : montrer la sortie compacte, `--elements`, `--verbose`, `--pretty`.
+- [x] `CHANGELOG.md` `[Unreleased]` : entrée "Compact responses by default".
 
 ---
 

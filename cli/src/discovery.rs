@@ -131,11 +131,11 @@ pub fn compact_capabilities() -> Value {
 
 pub fn focused_example(command: &str) -> Option<&'static str> {
     match command {
-        "observe" | "read" => Some("dev-browser observe --page TARGET --delta --annotate --shot state.png"),
-        "find" => Some("dev-browser find --page TARGET --role button --name \"Save\" --within main --scope visible"),
+        "observe" | "read" => Some("dev-browser observe --page TARGET --within main\n# Add --elements for compact boxes, --verbose for full diagnostics, or global --pretty for indented JSON"),
+        "find" => Some("dev-browser find --page TARGET --role button --name \"Save\" --within main --scope visible\n# Returns up to three compact matches; add --verbose for the full tree and records"),
         "text" => Some("dev-browser text --page TARGET --within main"),
         "assert" => Some("dev-browser assert --page TARGET --within main --text \"Jane Doe\" --match contains"),
-        "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled"),
+        "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled\n# Compact JSON is the default; add --verbose or global --pretty only when needed"),
         "type" => Some("dev-browser type --page TARGET --ref F0:R9 --from-state doc-7:184 --text \"hello\" --clear"),
         "confirm" => Some("dev-browser confirm --page TARGET --ref F0:R14 --expect \"Recipient\""),
         "upload" => Some("dev-browser upload --page TARGET --ref F0:R5 --file upload.bin"),

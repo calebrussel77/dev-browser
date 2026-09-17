@@ -50,8 +50,11 @@ For consequential UI work, prefer the persistent interactive commands over a mon
 # Discover existing tabs without attaching every renderer
 dev-browser --connect pages
 
-# Perceive: compact protocol-v2 state, refs, frames, open shadow roots, and coordinates
-dev-browser --connect observe --page TARGET_ID --annotate --shot before.png
+# Perceive: compact protocol-v2 tree with stable refs (one JSON line by default)
+dev-browser --connect observe --page TARGET_ID --within main
+
+# Opt into compact element boxes only when coordinates are needed
+dev-browser --connect observe --page TARGET_ID --within main --elements
 
 # Find the correct duplicate label deterministically; natural queries remain supported
 dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
@@ -78,11 +81,13 @@ dev-browser capabilities --compact
 dev-browser doctor --connect --json
 ```
 
+Interactive JSON is compact and single-line by default. Add global `--pretty` for indented JSON, `--elements` for compact actionable element metadata and boxes, or `--verbose` for the full historical response including diagnostics and complete element records. `find` returns at most three compact matches by default and omits its tree unless `--verbose` is set.
+
 Protocol v2 confirmation tokens are daemon-scoped, expire after 30 seconds, bind to the observed page/document/target/URL, and are burned on the first consumption attempt. Results, typed errors, waits, journals, popup/download/network metadata, and diagnostics use the same bounded secret redactor. `--expect-text` remains available for protocol v1 compatibility.
 
 An invalid, expired, reused, or out-of-scope confirmation token returns the stable `CONFIRMATION_INVALID` error and process exit status `8`.
 
-Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `observe` is the canonical compact perception command; `read` remains compatible. `find` always takes a fresh snapshot and accepts either the compatible natural query or combinable `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--scope`, repeated `--state`, and explicit last-resort `--index` filters. Results include exact match reasons, confidence, score gap, ambiguity, landmark, nearby context, frame, box, and actionability state. Actions return a refreshed state and reject stale refs/states, ambiguity, obstruction, disabled targets, and page-lease conflicts with stable errors and exit statuses. Typed waits cover text, URL, refs, dialogs, toasts, popups, downloads, file choosers, navigation, responses, failed requests, and specialized network idle. Safe retries require evidence that the prior attempt produced no side effect; guarded or irreversible actions are never duplicated. Screenshot pixels, ref boxes, frame offsets, and direct `--xy X,Y` all use CSS pixels, including non-zero scroll and DPR greater than one.
+Open each returned screenshot path with your agent's image-viewing capability before the next consequential action. `observe` is the canonical compact perception command; `read` remains compatible. Its default tree contains stable refs, roles, names, states, and landmarks without duplicating the full `elements` array. `find` always takes a fresh snapshot and accepts either the compatible natural query or combinable `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--scope`, repeated `--state`, and explicit last-resort `--index` filters. Results include compact match reasons, confidence, score gap, ambiguity, landmark, and contextual metadata. Actions return a refreshed compact tree plus a bounded delta and reject stale refs/states, ambiguity, obstruction, disabled targets, and page-lease conflicts with stable errors and exit statuses. Typed waits cover text, URL, refs, dialogs, toasts, popups, downloads, file choosers, navigation, responses, failed requests, and specialized network idle. Safe retries require evidence that the prior attempt produced no side effect; guarded or irreversible actions are never duplicated. Screenshot pixels, opt-in ref boxes, frame offsets, and direct `--xy X,Y` all use CSS pixels, including non-zero scroll and DPR greater than one.
 
 The CLI and daemon negotiate version, bundle, protocol, Playwright, and QuickJS provenance before each request. An idle mismatched daemon is restarted automatically; in-flight work is never killed silently. `doctor --json` distinguishes daemon, browser/CDP, and renderer failures and provides recovery codes. `--trace` stores a redacted, size-bounded journal under `~/.dev-browser/tmp/traces` with timing, before/after state, target/input method, requested screenshots, errors, network/lifecycle events, waits, retries, and recovery hints. Twenty recent traces are retained. External CDP traces are best-effort and report that limitation.
 
