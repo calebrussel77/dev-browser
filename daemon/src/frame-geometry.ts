@@ -5,7 +5,46 @@ export interface AffineMatrix { a: number; b: number; c: number; d: number; e: n
 
 export const IDENTITY_MATRIX: AffineMatrix = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
 
+export interface CachedFrameGeometry {
+  parent: Frame;
+  parentMutationEpoch: number;
+  dependencies?: Array<{ parent: Frame; mutationEpoch: number }>;
+  contentMatrix: AffineMatrix;
+  matrixToTop: AffineMatrix;
+  ancestorsVisible: boolean;
+}
+
+const geometryCache = new WeakMap<Frame, CachedFrameGeometry>();
+
+export function cacheFrameGeometry(frame: Frame, geometry: CachedFrameGeometry): void {
+  geometryCache.set(frame, geometry);
+}
+
+export function invalidateFrameGeometry(frame: Frame): void {
+  geometryCache.delete(frame);
+}
+
+async function validCachedGeometry(frame: Frame): Promise<CachedFrameGeometry | undefined> {
+  const cached = geometryCache.get(frame);
+  if (!cached || cached.parentMutationEpoch < 0 || cached.parent.isDetached()) return undefined;
+  const dependencies = cached.dependencies ?? [{ parent: cached.parent, mutationEpoch: cached.parentMutationEpoch }];
+  const epochs = await Promise.all(dependencies.map(async ({ parent }) =>
+    parent.isDetached()
+      ? -1
+      : parent.evaluate(() =>
+          (window as Window & {
+            __devBrowserPerceptionState?: { mutationEpoch: number };
+          }).__devBrowserPerceptionState?.mutationEpoch ?? -1
+        ).catch(() => -1)
+  ));
+  if (epochs.every((epoch, index) => epoch === dependencies[index]!.mutationEpoch)) return cached;
+  geometryCache.delete(frame);
+  return undefined;
+}
+
 export async function frameAncestorsVisible(frame: Frame): Promise<boolean> {
+  const cached = await validCachedGeometry(frame);
+  if (cached) return cached.ancestorsVisible;
   let child = frame;
   while (child.parentFrame()) {
     const handle = await child.frameElement();
@@ -58,6 +97,8 @@ export function composeAffine(outer: AffineMatrix, inner: AffineMatrix): AffineM
 
 export async function frameContentMatrix(frame: Frame): Promise<AffineMatrix> {
   if (!frame.parentFrame()) return IDENTITY_MATRIX;
+  const cached = await validCachedGeometry(frame);
+  if (cached) return cached.contentMatrix;
   const handle = await frame.frameElement();
   try {
     return await handle.evaluate((node) => {
@@ -78,6 +119,9 @@ export async function frameContentMatrix(frame: Frame): Promise<AffineMatrix> {
 }
 
 export async function frameToTopMatrix(frame: Frame): Promise<AffineMatrix> {
+  if (!frame.parentFrame()) return IDENTITY_MATRIX;
+  const cached = await validCachedGeometry(frame);
+  if (cached) return cached.matrixToTop;
   let matrix = IDENTITY_MATRIX, child: Frame = frame;
   while (child.parentFrame()) {
     matrix = composeAffine(await frameContentMatrix(child), matrix);
