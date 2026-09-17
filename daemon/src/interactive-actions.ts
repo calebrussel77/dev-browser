@@ -986,7 +986,8 @@ export async function executeInteractiveAction(
             action,
             ref,
             latest,
-            previousLatestStateId
+            previousLatestStateId,
+            request.verbose === true
           ),
         ];
       }

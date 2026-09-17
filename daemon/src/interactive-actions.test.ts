@@ -259,7 +259,7 @@ describe.sequential("interactive Playwright actions", () => {
 
     for (const key of [
       "attemptJournal", "attempts", "targets", "change", "waitForText", "waitSatisfied",
-      "coordinateSpace", "truncation",
+      "coordinateSpace", "truncation", "warnings",
     ]) expect(result).not.toHaveProperty(key);
     expect(Object.keys(result.waitResult ?? {}).sort()).toEqual(["elapsedMs", "passed", "timedOut"]);
     expect(result.waitResult).toEqual(expect.objectContaining({ passed: ["dialog"], timedOut: [] }));
@@ -291,6 +291,7 @@ describe.sequential("interactive Playwright actions", () => {
     expect(clicked).toHaveProperty("change");
     expect(clicked).toHaveProperty("coordinateSpace");
     expect(Object.values(clicked.clicked!.point).every(Number.isInteger)).toBe(true);
+    expect(clicked.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
   });
 
   it("keeps text/assert responses scope bounded instead of re-collecting the full unscoped tree", async () => {
@@ -1443,7 +1444,12 @@ describe.sequential("interactive Playwright actions", () => {
       ...request({ kind: "click", ref: deleteRef, method: "mouse" }),
       protocolVersion: 2,
     });
-    expect(unversioned.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
+    expect(unversioned.warnings ?? []).not.toContainEqual(expect.stringContaining("Unversioned decision"));
+    const verboseUnversioned = await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: deleteRef, method: "mouse" }, { verbose: true }),
+      protocolVersion: 2,
+    });
+    expect(verboseUnversioned.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
   });
 
   it("rejects removal, remount, navigation, and interleaved agent decisions", async () => {

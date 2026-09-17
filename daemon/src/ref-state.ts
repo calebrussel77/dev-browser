@@ -22,7 +22,8 @@ export function validateObservedDecision(
   guard: StateGuard,
   ref: string | undefined,
   latest: PagePerception,
-  previousLatestStateId: string | null
+  previousLatestStateId: string | null,
+  includeUnversionedWarning = false
 ): string[] {
   const warnings: string[] = [];
   const fromState = guard.fromState;
@@ -37,7 +38,7 @@ export function validateObservedDecision(
     ) {
       stale(pageName, "STALE_STATE", `State ${fromState} is no longer current`, latest);
     }
-  } else {
+  } else if (includeUnversionedWarning || guard.strictState) {
     warnings.push("Unversioned decision: document and target identity were validated without --from-state");
   }
 

@@ -52,6 +52,13 @@ describe.sequential("unified page perception", () => {
     await browser?.close();
   }, 30_000);
 
+  it("does not emit a permanent closed-shadow warning", async () => {
+    await page.setContent(`<main><button>Visible action</button></main>`);
+    const state = await collectPageState(page);
+
+    expect(state.warnings).not.toContainEqual(expect.stringContaining("Closed shadow roots"));
+  });
+
   it("pre-bounds a thousand frame candidates before expensive description", () => {
     let reads = 0;
     const children = new Proxy({ length: 1_001 } as ArrayLike<number>, {

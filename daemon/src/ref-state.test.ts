@@ -45,6 +45,17 @@ function staleFor(pageName: string): AgentProtocolError {
 }
 
 describe("state/ref recovery guidance", () => {
+  it("emits the unversioned warning only when verbose or strict", () => {
+    const page = {} as Page;
+    expect(validateObservedDecision(page, "main", {}, undefined, latest, null)).toEqual([]);
+    expect(validateObservedDecision(page, "main", {}, undefined, latest, null, true)).toContainEqual(
+      expect.stringContaining("Unversioned decision")
+    );
+    expect(validateObservedDecision(page, "main", { strictState: true }, undefined, latest, null)).toContainEqual(
+      expect.stringContaining("Unversioned decision")
+    );
+  });
+
   it("quotes and escapes the requested page for PowerShell", () => {
     const error = staleFor("x'; Remove-Item C:\\important\nnext");
     expect(error.code).toBe("STALE_STATE");

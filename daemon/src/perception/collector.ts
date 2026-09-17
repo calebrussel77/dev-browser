@@ -703,7 +703,7 @@ export async function collectPageState(
     ? { entries: [{ frame: page.mainFrame(), id: "F0", path: ["F0"] }], truncated: false }
     : await deterministicFrames(page);
   const frames = selectedFrames.entries;
-  const warnings: string[] = ["Closed shadow roots cannot be inspected; observation covers light DOM and open shadow roots only"];
+  const warnings: string[] = [];
   const registered: RegisteredFrame[] = [];
   const records: PerceptionElement[] = [];
   let top: Awaited<ReturnType<typeof collectRealm>> | undefined;
