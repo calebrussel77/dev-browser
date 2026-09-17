@@ -185,26 +185,30 @@ Mesure intermédiaire 1.1 : `observe` 4,2 KB, `observe --elements` 22,6 KB, `obs
 
 **Fichiers :** `cli/src/main.rs` (`render_result`, nouveau flag global `--pretty`), `daemon/src/interactive-actions.ts`, `daemon/src/agent-protocol.ts` (`buildInteractiveSuccess`).
 
-- [ ] `render_result` imprime `serde_json::to_string` (compact) par défaut ; `--pretty` restaure l'indentation. Une seule ligne JSON par résultat facilite aussi le parsing.
-- [ ] Le daemon arrondit toutes les coordonnées et dimensions à l'entier (`box`, `point`, `scroll`, `coordinateSpace.viewport`) ; `devicePixelRatio` à 2 décimales.
-- [ ] Hors `--verbose`, ne pas renvoyer : `attemptJournal`, `attempts`, `targets`, `change` (remplacé par `delta.summary`), `waitForText`, `waitSatisfied`, `coordinateSpace` (renvoyé seulement avec `--shot`, `--elements` ou `--verbose`, puisqu'il ne sert qu'aux coordonnées), `truncation` quand `truncated: false`, `warnings` vide, `focusedRef` null, `delta` null.
-- [ ] Le `waitResult` reste renvoyé quand un `--wait-*` explicite a été passé, mais réduit à `{ passed: [...kinds], timedOut: [...], elapsedMs }` hors `--verbose` (la version complète avec `observations` et `events` sous `--verbose`).
-- [ ] Sous `--verbose`, tout est renvoyé comme aujourd'hui.
+- [x] `render_result` imprime `serde_json::to_string` (compact) par défaut ; `--pretty` restaure l'indentation. Une seule ligne JSON par résultat facilite aussi le parsing.
+- [x] Le daemon arrondit toutes les coordonnées et dimensions à l'entier (`box`, `point`, `scroll`, `coordinateSpace.viewport`) ; `devicePixelRatio` à 2 décimales.
+- [x] Hors `--verbose`, ne pas renvoyer : `attemptJournal`, `attempts`, `targets`, `change` (remplacé par `delta.summary`), `waitForText`, `waitSatisfied`, `coordinateSpace` (renvoyé seulement avec `--shot`, `--elements` ou `--verbose`, puisqu'il ne sert qu'aux coordonnées), `truncation` quand `truncated: false`, `warnings` vide, `focusedRef` null, `delta` null.
+- [x] Le `waitResult` reste renvoyé quand un `--wait-*` explicite a été passé, mais réduit à `{ passed: [...kinds], timedOut: [...], elapsedMs }` hors `--verbose` (la version complète avec `observations` et `events` sous `--verbose`).
+- [x] Sous `--verbose`, tout est renvoyé comme aujourd'hui.
 
 **Tests :** `cli/src/main.rs` : `render_result` compact par défaut, pretty avec le flag ; `daemon/src/interactive-actions.test.ts` : clés absentes par défaut, présentes sous `verbose` ; `agent-protocol.test.ts` : `buildInteractiveSuccess` garde les champs requis (`protocolVersion`, `ok`, `requestId`, `browser`, `page`, `action`).
 
 **Critères d'acceptation :** bench 0.1 : taille compact d'un `click` ≤ 4 KB ; `--verbose` ≥ taille d'avant.
 
+Mesure intermédiaire 1.3 : `click` lourd = 4 677 octets compacts et `observe --verbose` = 102 262 octets pretty. Les champs diagnostics prévus ont été retirés ; le seuil `click` reste bloquant pour la fin de phase et sera remesuré après la suppression des warnings permanents de 1.5.
+
 ### Tâche 1.4 — `find` compact
 
 **Fichiers :** `daemon/src/interactive-actions.ts` (cas `find`), `daemon/src/targeting.ts`, `cli/src/main.rs` (défaut `--limit`).
 
-- [ ] Par défaut `find` renvoie `matches` sous forme compacte (mêmes règles que `compactElement`, plus `score`, `confidence`, `matchedBecause` réduit à 3 raisons), `--limit` par défaut à 3 (aujourd'hui 10), `ambiguity` et `search` inchangés, pas d'arbre (`tree`) sauf `--verbose`.
-- [ ] Quand `ambiguity.ambiguous` est vrai, renvoyer jusqu'à 5 candidats compacts avec `nearby.context` et `landmark` pour permettre de choisir sans nouvel appel.
+- [x] Par défaut `find` renvoie `matches` sous forme compacte (mêmes règles que `compactElement`, plus `score`, `confidence`, `matchedBecause` réduit à 3 raisons), `--limit` par défaut à 3 (aujourd'hui 10), `ambiguity` et `search` inchangés, pas d'arbre (`tree`) sauf `--verbose`.
+- [x] Quand `ambiguity.ambiguous` est vrai, renvoyer jusqu'à 5 candidats compacts avec `nearby.context` et `landmark` pour permettre de choisir sans nouvel appel.
 
 **Tests :** `interactive-actions.test.ts` : `find` par défaut ≤ 3 matches, chaque match compact ; cas ambigu renvoie ≤ 5 candidats avec `landmark`.
 
 **Critères d'acceptation :** bench : `find` ≤ 2 KB.
+
+Mesure 1.4 : `find` lourd = 790 octets compacts ; fixture = 721 octets compacts.
 
 ### Tâche 1.5 — Warnings de bruit
 
