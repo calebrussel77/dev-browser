@@ -78,8 +78,11 @@ describe.sequential("maintained agent reliability benchmark", () => {
     expect(completed / workflows).toBeGreaterThanOrEqual(0.95);
     expect(counters.decoy).toBe(0);
     expect(counters.main).toBe(completed);
-    expect(JSON.stringify(observed).length).toBeLessThan(100_000);
-    expect(Math.max(...latencies)).toBeLessThan(10_000);
+    expect(JSON.stringify(observed).length).toBeLessThan(12_000);
+    expect(Math.max(...latencies)).toBeLessThan(2_000);
+    const sortedLatencies = [...latencies].sort((left, right) => left - right);
+    const medianLatency = sortedLatencies[Math.floor(sortedLatencies.length / 2)]!;
+    expect(medianLatency).toBeLessThan(600);
   }, 180_000);
 
   it("measures large-page perception, delta size, memory growth, action latency, and registry cleanup", async () => {
@@ -126,7 +129,7 @@ describe.sequential("maintained agent reliability benchmark", () => {
     for (let index = 0; index < 105; index += 1) await observe(false, "cleanup");
 
     expect(observeLatencyMs).toBeLessThan(10_000);
-    expect(actionLatencyMs).toBeLessThan(10_000);
+    expect(actionLatencyMs).toBeLessThan(1_000);
     expect(fullSize).toBeLessThan(500_000);
     expect(deltaSize).toBeLessThan(fullSize);
     expect(delta.delta?.changed.length).toBeGreaterThan(0);
