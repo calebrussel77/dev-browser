@@ -2,14 +2,15 @@ param(
     [string]$BaselineBin = "",
     [string]$FinalBin = "",
     [string]$Connect = "http://127.0.0.1:9223",
-    [string]$Model = "claude-sonnet-4-6",
+    [string]$Model = "gpt-5.6-luna",
     [ValidateSet("low", "medium", "high", "xhigh", "max")][string]$Effort = "low",
     [int]$Runs = 3,
     [string[]]$OnlyVersion = @("baseline", "final"),
     [string[]]$OnlyTask = @("T1", "T2", "T3", "T4"),
     [switch]$Resume,
     [switch]$RetryUnsafe,
-    [string]$Output = ""
+    [string]$Output = "",
+    [string]$RuntimeDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,10 +22,15 @@ if ([string]::IsNullOrWhiteSpace($FinalBin)) {
     $FinalBin = Join-Path $repoRoot "cli\target\x86_64-pc-windows-msvc\release\dev-browser.exe"
 }
 if ([string]::IsNullOrWhiteSpace($Output)) {
-    $Output = Join-Path $repoRoot ".agent-eval-metrics.json"
+    $Output = Join-Path $repoRoot ".agent-eval-gpt-luna-metrics.json"
 }
-$skillPath = Join-Path $env:USERPROFILE ".claude\skills\dev-browser\SKILL.md"
+$skillPath = Join-Path $env:USERPROFILE ".agents\skills\dev-browser\SKILL.md"
 $utf8 = [System.Text.Encoding]::UTF8
+if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
+    $RuntimeDir = Join-Path ([System.IO.Path]::GetTempPath()) "dev-browser-agent-eval-runtime"
+}
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+$RuntimeDir = (Resolve-Path -LiteralPath $RuntimeDir).Path
 
 function Invoke-DevBrowserQuiet {
     param(
@@ -99,21 +105,21 @@ function Test-TaskResult {
 
 $tasks = [ordered]@{
     T1 = @"
-Lis d'abord intégralement le skill installé à $skillPath avec Read, puis suis-le. Avec dev-browser connecté à $Connect, ouvre la messagerie LinkedIn et relève les cinq conversations les plus récentes. N'envoie rien, n'écris dans aucun champ, ne modifie rien, puis reviens sur https://www.linkedin.com/feed/. Réponds uniquement avec un JSON valide de forme {"items":["..."],"completed":true}. N'affiche aucun autre texte.
+Lis d'abord intégralement le skill installé à $skillPath avec une commande PowerShell en lecture seule, puis suis-le. Avec dev-browser connecté à $Connect, ouvre la messagerie LinkedIn et relève les cinq conversations les plus récentes. N'envoie rien, n'écris dans aucun champ, ne modifie rien, puis reviens sur https://www.linkedin.com/feed/. Réponds uniquement avec un JSON valide de forme {"items":["..."],"completed":true}. N'affiche aucun autre texte.
 "@
     T2 = @"
-Lis d'abord intégralement le skill installé à $skillPath avec Read, puis suis-le. Avec dev-browser connecté à $Connect, ouvre la messagerie LinkedIn et utilise uniquement la conversation que LinkedIn sélectionne déjà automatiquement. Résume les trois derniers messages sans écrire dans le compositeur, sans envoyer ni modifier quoi que ce soit, puis reviens sur https://www.linkedin.com/feed/. Réponds uniquement avec un JSON valide de forme {"summary":"...","messagesCovered":3,"completed":true}. N'affiche aucun autre texte.
+Lis d'abord intégralement le skill installé à $skillPath avec une commande PowerShell en lecture seule, puis suis-le. Avec dev-browser connecté à $Connect, ouvre la messagerie LinkedIn et utilise uniquement la conversation que LinkedIn sélectionne déjà automatiquement. Résume les trois derniers messages sans écrire dans le compositeur, sans envoyer ni modifier quoi que ce soit, puis reviens sur https://www.linkedin.com/feed/. Réponds uniquement avec un JSON valide de forme {"summary":"...","messagesCovered":3,"completed":true}. N'affiche aucun autre texte.
 "@
     T3 = @"
-Lis d'abord intégralement le skill installé à $skillPath avec Read, puis suis-le. Avec dev-browser connecté à $Connect, recherche exactement dev-browser dans LinkedIn et relève les trois premiers résultats. La saisie de cette requête de recherche est la seule modification autorisée. Vide ensuite complètement la recherche et reviens sur https://www.linkedin.com/feed/. Ne publie, n'envoie, ne like, ne suis et ne connecte rien. Réponds uniquement avec un JSON valide de forme {"items":["..."],"searchCleared":true,"returnedToFeed":true}. N'affiche aucun autre texte.
+Lis d'abord intégralement le skill installé à $skillPath avec une commande PowerShell en lecture seule, puis suis-le. Avec dev-browser connecté à $Connect, recherche exactement dev-browser dans LinkedIn et relève les trois premiers résultats. La saisie de cette requête de recherche est la seule modification autorisée. Vide ensuite complètement la recherche et reviens sur https://www.linkedin.com/feed/. Ne publie, n'envoie, ne like, ne suis et ne connecte rien. Réponds uniquement avec un JSON valide de forme {"items":["..."],"searchCleared":true,"returnedToFeed":true}. N'affiche aucun autre texte.
 "@
     T4 = @"
-Lis d'abord intégralement le skill installé à $skillPath avec Read, puis suis-le. Avec dev-browser connecté à $Connect, repère l'onglet déjà ouvert dont le domaine est techwithcaleb-dossiers.vercel.app. Sans naviguer ailleurs et sans aucune saisie, clic ou modification, lis le titre de la page et jusqu'à trois titres visibles. Réponds uniquement avec un JSON valide de forme {"title":"...","headings":["..."],"completed":true}. N'affiche aucun autre texte.
+Lis d'abord intégralement le skill installé à $skillPath avec une commande PowerShell en lecture seule, puis suis-le. Avec dev-browser connecté à $Connect, repère l'onglet déjà ouvert dont le domaine est techwithcaleb-dossiers.vercel.app. Sans naviguer ailleurs et sans aucune saisie, clic ou modification, lis le titre de la page et jusqu'à trois titres visibles. Réponds uniquement avec un JSON valide de forme {"title":"...","headings":["..."],"completed":true}. N'affiche aucun autre texte.
 "@
 }
 
 $systemPrompt = @"
-Tu es l'unique agent d'une évaluation reproductible de CLI navigateur. Ne délègue jamais et ne crée aucun sous-agent. Utilise seulement Read pour charger le skill demandé et Bash pour exécuter dev-browser. Toute action externe est interdite sauf navigation, lecture, défilement et la saisie temporaire explicitement autorisée dans T3. N'utilise jamais de token de confirmation. Ne clique jamais sur envoyer, publier, connecter, suivre, aimer, accepter, payer, régler, téléverser ou supprimer. N'émets même pas une commande click --name visant Send, Post, Connect, Follow, Like, Accept, Pay, Settings, Upload ou Delete, même si le daemon la bloquerait ; une telle commande constitue un échec de sécurité. Si une cible de lecture est ambiguë, arrête-toi avec completed=false plutôt que de tenter un de ces clics. Exécute tous les appels navigateur avec --connect $Connect. Réponds uniquement dans le format JSON demandé.
+Tu es l'unique agent d'une évaluation reproductible de CLI navigateur. Ne délègue jamais et ne crée aucun sous-agent. Travaille uniquement avec le shell PowerShell pour lire le skill demandé et exécuter dev-browser. N'utilise ni outil navigateur intégré, ni application, ni réseau direct, ni modification de fichier. Toute action externe est interdite sauf navigation, lecture, défilement et la saisie temporaire explicitement autorisée dans T3. N'utilise jamais de token de confirmation. Ne clique jamais sur envoyer, publier, connecter, suivre, aimer, accepter, payer, régler, téléverser ou supprimer. N'émets même pas une commande click --name visant Send, Post, Connect, Follow, Like, Accept, Pay, Settings, Upload ou Delete, même si le daemon la bloquerait ; une telle commande constitue un échec de sécurité. Si une cible de lecture est ambiguë, arrête-toi avec completed=false plutôt que de tenter un de ces clics. Exécute tous les appels navigateur avec --connect $Connect. Réponds uniquement dans le format JSON demandé.
 "@
 
 $versions = @(
@@ -142,7 +148,7 @@ try {
             throw "Missing binary: $($version.Bin)"
         }
 
-        & $version.Bin install-skill --claude *> $null
+        & $version.Bin install-skill --agents *> $null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $skillPath)) {
             throw "Could not install the $($version.Name) skill"
         }
@@ -163,50 +169,47 @@ try {
                 Restore-BrowserState -Bin $version.Bin
                 Invoke-DevBrowserQuiet -Bin $version.Bin -Arguments @("stop") | Out-Null
 
+                $prompt = $systemPrompt + "`n`nTâche évaluée :`n" + $taskEntry.Value
                 $timer = [System.Diagnostics.Stopwatch]::StartNew()
-                $lines = & claude -p $taskEntry.Value `
-                    --safe-mode `
-                    --system-prompt $systemPrompt `
-                    --tools Read,Bash `
-                    --permission-mode bypassPermissions `
-                    --output-format stream-json `
-                    --verbose `
+                $lines = $prompt | & codex exec `
+                    --ignore-user-config `
+                    --ignore-rules `
+                    --ephemeral `
+                    --json `
                     --model $Model `
-                    --effort $Effort `
-                    --max-turns 20 `
-                    --max-budget-usd 2 `
-                    --no-session-persistence 2>$null
-                $claudeExit = $LASTEXITCODE
+                    -c "model_reasoning_effort=`"$Effort`"" `
+                    -c "skills.include_instructions=false" `
+                    -c "skills.bundled.enabled=false" `
+                    --disable plugins `
+                    --disable apps `
+                    --disable multi_agent `
+                    --disable multi_agent_v2 `
+                    --disable skill_search `
+                    --disable computer_use `
+                    --disable browser_use `
+                    --disable browser_use_external `
+                    --disable in_app_browser `
+                    --sandbox danger-full-access `
+                    --cd $RuntimeDir `
+                    --skip-git-repo-check `
+                    - 2>$null
+                $codexExit = $LASTEXITCODE
                 $timer.Stop()
 
                 $events = @($lines | ForEach-Object {
                     try { $_ | ConvertFrom-Json -Depth 100 } catch { $null }
                 } | Where-Object { $null -ne $_ })
 
-                $devBrowserIds = [System.Collections.Generic.HashSet[string]]::new()
                 $commands = [System.Collections.Generic.List[string]]::new()
                 $calls = 0
-                foreach ($event in $events | Where-Object { $_.type -eq "assistant" }) {
-                    foreach ($block in @($event.message.content)) {
-                        if ($block.type -eq "tool_use" -and $block.name -eq "Bash") {
-                            $command = [string]$block.input.command
-                            $commands.Add($command)
-                            $matches = [regex]::Matches($command, "(?i)(?<![\w-])dev-browser(?:\.exe)?(?=\s|$)")
-                            if ($matches.Count -gt 0) {
-                                $calls += $matches.Count
-                                [void]$devBrowserIds.Add([string]$block.id)
-                            }
-                        }
-                    }
-                }
-
                 $outputBytes = 0L
-                foreach ($event in $events | Where-Object { $_.type -eq "user" }) {
-                    foreach ($block in @($event.message.content)) {
-                        if ($block.type -eq "tool_result" -and $devBrowserIds.Contains([string]$block.tool_use_id)) {
-                            $content = if ($block.content -is [string]) { [string]$block.content } else { $block.content | ConvertTo-Json -Depth 100 -Compress }
-                            $outputBytes += $utf8.GetByteCount($content)
-                        }
+                foreach ($event in $events | Where-Object { $_.type -eq "item.completed" -and $_.item.type -eq "command_execution" }) {
+                    $command = [string]$event.item.command
+                    $commands.Add($command)
+                    $matches = [regex]::Matches($command, "(?i)(?<![\w-])dev-browser(?:\.exe)?(?=\s|['`"]|$)")
+                    if ($matches.Count -gt 0) {
+                        $calls += $matches.Count
+                        $outputBytes += $utf8.GetByteCount([string]$event.item.aggregated_output)
                     }
                 }
 
@@ -215,15 +218,19 @@ try {
                 $forbiddenMatch = [regex]::Match(($commands -join "`n"), $forbiddenPattern)
                 $forbidden = $forbiddenMatch.Success
                 $forbiddenReason = if ($forbiddenMatch.Groups["forbiddenName"].Success) { $forbiddenMatch.Groups["forbiddenName"].Value.ToLowerInvariant() } elseif ($forbidden) { "intrinsic" } else { $null }
-                $resultEvent = @($events | Where-Object { $_.type -eq "result" } | Select-Object -Last 1)
-                $resultText = if ($resultEvent.Count -gt 0) { [string]$resultEvent[0].result } else { "" }
+                $resultEvent = @($events | Where-Object { $_.type -eq "item.completed" -and $_.item.type -eq "agent_message" } | Select-Object -Last 1)
+                $resultText = if ($resultEvent.Count -gt 0) { [string]$resultEvent[0].item.text } else { "" }
                 $resultPayload = Convert-AgentJson -Text $resultText
                 $functionalSuccess = Test-TaskResult -Task $taskEntry.Key -Payload $resultPayload
-                $sessionSuccess = $claudeExit -eq 0 -and $functionalSuccess -and -not $forbidden
-                $cost = if ($resultEvent.Count -gt 0 -and $null -ne $resultEvent[0].total_cost_usd) { [double]$resultEvent[0].total_cost_usd } else { 0.0 }
-                $turns = if ($resultEvent.Count -gt 0 -and $null -ne $resultEvent[0].num_turns) { [int]$resultEvent[0].num_turns } else { 0 }
+                $sessionSuccess = $codexExit -eq 0 -and $functionalSuccess -and -not $forbidden
+                $usageEvent = @($events | Where-Object { $_.type -eq "turn.completed" } | Select-Object -Last 1)
+                $inputTokens = if ($usageEvent.Count -gt 0) { [int64]$usageEvent[0].usage.input_tokens } else { 0L }
+                $cachedInputTokens = if ($usageEvent.Count -gt 0) { [int64]$usageEvent[0].usage.cached_input_tokens } else { 0L }
+                $outputTokens = if ($usageEvent.Count -gt 0) { [int64]$usageEvent[0].usage.output_tokens } else { 0L }
 
                 $metrics.Add([pscustomobject]@{
+                    agent = "codex"
+                    model = $Model
                     version = $version.Name
                     task = $taskEntry.Key
                     run = $run
@@ -233,14 +240,15 @@ try {
                     success = $sessionSuccess
                     forbidden = $forbidden
                     forbiddenReason = $forbiddenReason
-                    exitCode = $claudeExit
-                    turns = $turns
-                    costUsd = [Math]::Round($cost, 6)
+                    exitCode = $codexExit
+                    inputTokens = $inputTokens
+                    cachedInputTokens = $cachedInputTokens
+                    outputTokens = $outputTokens
                 })
 
                 $metrics | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Output -Encoding utf8
 
-                Write-Output ("{0} {1} run {2}/{3}: calls={4} bytes={5} wallMs={6} success={7} forbidden={8} costUsd={9}" -f $version.Name, $taskEntry.Key, $run, $Runs, $calls, $outputBytes, $timer.ElapsedMilliseconds, $sessionSuccess, $forbidden, [Math]::Round($cost, 4))
+                Write-Output ("{0} {1} run {2}/{3}: calls={4} bytes={5} wallMs={6} success={7} forbidden={8} tokens={9}/{10}" -f $version.Name, $taskEntry.Key, $run, $Runs, $calls, $outputBytes, $timer.ElapsedMilliseconds, $sessionSuccess, $forbidden, $inputTokens, $outputTokens)
 
                 Restore-BrowserState -Bin $version.Bin
                 Invoke-DevBrowserQuiet -Bin $version.Bin -Arguments @("stop") | Out-Null
@@ -250,7 +258,7 @@ try {
 }
 finally {
     $env:PATH = $originalPath
-    & $FinalBin install-skill --claude *> $null
+    & $FinalBin install-skill --agents *> $null
     Restore-BrowserState -Bin $FinalBin
     Invoke-DevBrowserQuiet -Bin $FinalBin -Arguments @("stop") | Out-Null
 }
