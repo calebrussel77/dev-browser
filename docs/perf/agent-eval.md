@@ -2,33 +2,38 @@
 
 ## Verdict
 
-E3 a été exécutée intégralement, mais **les critères de vitesse au niveau agent ne sont pas atteints**. La version finale conserve les garanties de sécurité et ne régresse pas sur le taux de succès mesuré, mais les médianes globales ne satisfont pas les facteurs demandés :
+E3 a été réexécutée avec Codex CLI et `gpt-5.6-luna`, comme moteur unique. Les 24 sessions officielles ont toutes réussi et aucune commande interdite n'a été émise. Les gains au niveau agent restent toutefois inférieurs aux seuils bloquants du plan :
 
-| Critère | Cible | Mesure finale | Verdict |
+| Critère | Cible | Mesure Luna | Verdict |
 |---|---:|---:|---|
-| appels `dev-browser` | référence ÷ finale ≥ 1,8 | 1,15× | échec |
-| octets de sortie | référence ÷ finale ≥ 8 | 1,74× | échec |
-| temps mur | référence ÷ finale ≥ 2 | 0,94× | échec |
-| succès | finale ≥ référence | 0/12 = 0/12 | atteint, mais non informatif |
+| appels `dev-browser` | référence ÷ finale ≥ 1,8 | 0,72× | échec |
+| octets de sortie | référence ÷ finale ≥ 8 | 2,97× | échec |
+| temps mur | référence ÷ finale ≥ 2 | 0,83× | échec |
+| succès | finale ≥ référence | 12/12 = 12/12 | atteint |
 | commandes interdites retenues | 0 | 0 | atteint |
 
-Le plan ne doit donc pas être déclaré terminé sur la seule base des gains CLI/daemon. Les benchmarks de commandes montrent bien les améliorations locales consignées dans les rapports PR 1 à PR 5, mais elles ne se traduisent pas encore de manière fiable en réduction de tours d'un agent générique.
+La version finale réduit bien le volume de sortie, mais Luna effectue davantage d'appels et prend plus de temps en médiane. E3 et la clôture globale du plan restent donc ouvertes.
 
 ## Protocole reproductible
 
 Le runner [`scripts/run-agent-eval.ps1`](../../scripts/run-agent-eval.ps1) lance 24 sessions indépendantes : quatre tâches, trois runs, référence puis finale. Il :
 
-- installe réellement le skill embarqué de chaque binaire avec `dev-browser install-skill --claude` ;
-- démarre chaque run avec un daemon arrêté, puis restaure LinkedIn sur `/feed/` et arrête le daemon ;
-- lance Claude Code en `--safe-mode`, sans sous-agent, avec uniquement `Read` et `Bash` ;
-- lit les événements JSONL en mémoire pour compter les occurrences CLI, les octets des résultats d'outil, le temps mur, le coût et le résultat structuré ;
+- installe réellement le skill embarqué de chaque binaire dans `~/.agents/skills/dev-browser` avec `dev-browser install-skill --agents` ;
+- exécute Codex CLI 0.145.0 avec `gpt-5.6-luna`, effort `low`, session éphémère et shell PowerShell ;
+- désactive plugins, applications, multi-agent, outils navigateur intégrés et catalogue de skills afin d'isoler `dev-browser` ;
+- démarre chaque run avec un daemon arrêté, restaure LinkedIn sur `/feed/`, puis arrête le daemon ;
+- lit les événements JSONL en mémoire pour compter les appels CLI, les octets de leurs sorties, le temps mur et les tokens ;
 - ne persiste aucun nom, message, résultat de recherche, titre privé ou transcript ;
 - invalide toute session contenant `confirm-token`, upload/delete/settings, ou un `click --name` visant un libellé interdit ;
-- persiste les seules métriques anonymes après chaque run et permet une reprise sûre avec `-Resume -RetryUnsafe`.
+- persiste uniquement les métriques anonymes après chaque run et permet une reprise avec `-Resume -RetryUnsafe`.
+
+Commande :
+
+```powershell
+pwsh -File scripts/run-agent-eval.ps1
+```
 
 Version de référence : `2346210d68314ab4aacbd5dc46c46737911cb551`. Version finale : branche PR 6 incluant les PR 1 à PR 5 et le fast path du skill. Endpoint CDP : Chrome propriétaire sur `9223`.
-
-Le jeu contrôlé retenu utilise `claude-haiku-4-5-20251001`, effort `low`, 20 tours maximum, même prompt système et mêmes tâches pour les deux versions. Les sessions qui ont émis une commande interdite ont été exclues puis rejouées ; aucun transcript retenu n'en contient.
 
 ## Tâches
 
@@ -39,42 +44,31 @@ Le jeu contrôlé retenu utilise `claude-haiku-4-5-20251001`, effort `low`, 20 t
 | T3 | Rechercher `dev-browser`, relever trois résultats, vider la recherche et revenir au fil. | trois entrées et drapeaux de nettoyage/retour vrais. |
 | T4 | Lire le titre et jusqu'à trois headings de l'onglet ouvert `techwithcaleb-dossiers.vercel.app`. | titre et au moins un heading ; aucune navigation ou modification. |
 
-La validation de contenu est volontairement structurelle : les valeurs privées ne sont ni imprimées dans le journal du runner ni conservées dans le dépôt. Un succès exige en plus une sortie Claude Code normale et l'absence de commande interdite.
+La validation de contenu est structurelle : les valeurs privées ne sont ni imprimées par le runner ni conservées dans le dépôt. Un succès exige une sortie Codex normale, la forme JSON attendue et l'absence de commande interdite.
 
-## Résultats contrôlés — Haiku 4.5, effort bas
+## Résultats contrôlés — GPT-5.6 Luna, effort bas
 
 Les nombres sont les médianes de trois runs par cellule.
 
 | Version | Tâche | Runs | Appels | Octets | Temps mur | Succès | Interdit |
 |---|---|---:|---:|---:|---:|---:|---:|
-| référence | T1 | 3 | 12 | 28 081 | 82,290 s | 0/3 | 0 |
-| référence | T2 | 3 | 11 | 3 132 | 98,385 s | 0/3 | 0 |
-| référence | T3 | 3 | 10 | 28 403 | 72,990 s | 0/3 | 0 |
-| référence | T4 | 3 | 7 | 4 077 | 247,955 s | 0/3 | 0 |
-| finale | T1 | 3 | 11 | 2 929 | 89,363 s | 0/3 | 0 |
-| finale | T2 | 3 | 13 | 4 358 | 90,219 s | 0/3 | 0 |
-| finale | T3 | 3 | 10 | 10 627 | 97,595 s | 0/3 | 0 |
-| finale | T4 | 3 | 9 | 2 406 | 153,366 s | 0/3 | 0 |
-| **référence globale** | **toutes** | **12** | **11,5** | **6 335,5** | **90,338 s** | **0/12** | **0** |
-| **finale globale** | **toutes** | **12** | **10** | **3 643,5** | **95,745 s** | **0/12** | **0** |
+| référence | T1 | 3 | 7 | 101 332 | 86,409 s | 3/3 | 0 |
+| référence | T2 | 3 | 6 | 93 949 | 67,420 s | 3/3 | 0 |
+| référence | T3 | 3 | 10 | 46 768 | 79,966 s | 3/3 | 0 |
+| référence | T4 | 3 | 2 | 3 162 | 27,251 s | 3/3 | 0 |
+| finale | T1 | 3 | 10 | 25 962 | 88,263 s | 3/3 | 0 |
+| finale | T2 | 3 | 9 | 16 413 | 75,025 s | 3/3 | 0 |
+| finale | T3 | 3 | 14 | 18 852 | 111,581 s | 3/3 | 0 |
+| finale | T4 | 3 | 3 | 3 099 | 26,785 s | 3/3 | 0 |
+| **référence globale** | **toutes** | **12** | **6,5** | **49 392,5** | **67,563 s** | **12/12** | **0** |
+| **finale globale** | **toutes** | **12** | **9** | **16 614** | **81,435 s** | **12/12** | **0** |
 
-Coût rapporté des 24 sessions retenues : 2,196497 USD (référence 1,039702 ; finale 1,156795). Les pilotes et retries invalidés ne sont pas inclus dans ce total.
-
-## Contrôle exploratoire — Sonnet 4.6
-
-Un premier jeu complet Sonnet standard a également été conservé pour vérifier que le constat ne dépendait pas seulement du petit modèle. Résultat global :
-
-| Version | Runs | Appels médians | Octets médians | Temps médian | Succès | Interdit |
-|---|---:|---:|---:|---:|---:|---:|
-| référence | 12 | 4 | 1 543 | 105,562 s | 3/12 | 0 |
-| finale | 12 | 5,5 | 1 391 | 155,824 s | 3/12 | 0 |
-
-Ratios référence ÷ finale : appels 0,73×, octets 1,11×, temps 0,68×. Coût rapporté : 3,851 USD. Sonnet confirme donc le même échec des seuils, tout en donnant un taux de succès égal et non nul.
+Codex CLI ne fournit pas de coût USD par session ; le runner conserve les compteurs de tokens anonymes à des fins de diagnostic, sans les utiliser comme critère E3.
 
 ## Expérience corrective rejetée
 
-Une variante de guidance imposant une extraction one-shot et un plafond de quatre appels a été testée après le premier échec. Le gabarit CLI fonctionne directement en un appel, mais l'agent ne respecte pas systématiquement le plafond (jusqu'à 18 appels observés) et la fiabilité T4 a régressé. Cette variante a été retirée ; elle ne fait pas partie du skill final.
+Une variante a injecté le skill dans le prompt initial, activé le mode rapide et imposé un budget très strict d'une à deux invocations pour les extractions réversibles. Sur 24 sessions, elle a atteint 3,25× moins d'appels, mais seulement 7,58× moins d'octets et 1,13× sur le temps ; surtout, le succès a régressé de 12/12 à 11/12. Cette guidance a donc été retirée conformément à l'objectif « sans perdre les garanties ».
 
-## Conclusion et suite nécessaire
+## Conclusion
 
-E3 met en évidence que le prochain levier n'est plus la latence du daemon mais la politique d'orchestration de l'agent : limitation de tours réellement enforceable, primitives de lecture de haut niveau ou évaluation sur fixtures déterministes avec validation de contenu. Tant qu'un nouveau changement n'obtient pas les trois facteurs demandés sur un jeu avec un taux de succès utile, la case « critères E3 » et la clôture globale du plan doivent rester ouvertes.
+Les optimisations CLI/daemon sont confirmées par E1, E2 et E4, mais Luna montre que leur disponibilité ne suffit pas à garantir une meilleure orchestration par un agent générique. Le prochain levier doit préserver 12/12 succès tout en réduisant les tours réellement exécutés, par exemple avec des primitives de lecture de plus haut niveau ou un budget de tours enforceable avec récupération fiable.

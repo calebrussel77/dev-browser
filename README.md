@@ -391,7 +391,16 @@ Measured on Windows 11 with Playwright 1.61.1 and the repository's deterministic
 | heavy-page `click --ref` | 1,604 ms | 242 ms | 6.6× faster |
 | warm trivial script | 166 ms | 28 ms | 5.9× faster |
 
-The compact default, semantic actions, compound shortcuts, and `batch` reduce both payload and agent round trips. Full raw results and environment notes live under [`docs/perf/`](docs/perf/).
+The command-level gains are substantial, but the controlled agent-level E3 with `gpt-5.6-luna` remains below the plan's closing thresholds:
+
+| Agent-level median | Baseline | Final | Baseline ÷ final | Target |
+| --- | ---: | ---: | ---: | ---: |
+| `dev-browser` calls | 6.5 | 9 | 0.72× | ≥ 1.8× |
+| CLI output | 49.4 KB | 16.6 KB | 2.97× | ≥ 8× |
+| wall time | 67.6 s | 81.4 s | 0.83× | ≥ 2× |
+| successful tasks | 12/12 | 12/12 | equal | no regression |
+
+The compact default, semantic actions, compound shortcuts, and `batch` reduce command payload and latency, but a generic agent does not yet choose fewer round trips reliably. Reproduce E3 with `pwsh -File scripts/run-agent-eval.ps1`; full results and environment notes live in [`docs/perf/agent-eval.md`](docs/perf/agent-eval.md).
 
 ### Cross-tool evaluation
 

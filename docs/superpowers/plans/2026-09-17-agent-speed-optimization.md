@@ -435,11 +435,11 @@ Rapport : `docs/field-reports/<date>-speed-<phase>.md` avec le tableau et les an
 Objectif : mesurer ce que voit l'utilisateur, avec un vrai agent.
 
 - [x] Préparer 4 tâches en langage naturel, chacune non destructive : (T1) « Ouvre ma messagerie LinkedIn et dis-moi le nom des 5 dernières conversations » ; (T2) « Ouvre la conversation avec <contact autorisé> et résume ses 3 derniers messages » ; (T3) « Cherche "dev-browser" dans LinkedIn et liste les 3 premiers résultats » ; (T4) « Sur <autre application>, va sur la page X et extrais Y ».
-- [x] Exécuter chaque tâche avec un agent Claude Code équipé du skill `skills/dev-browser` (via `dev-browser install-skill`), sur la version de base puis sur la version finale, 3 fois chacune. Instrumenter avec le hook `PostToolUse` de Claude Code (ou en lisant le transcript JSONL de la session dans `~/.claude/projects/`) pour compter : nombre d'appels `dev-browser`, octets de sortie totaux, temps mur de la tâche, succès (réponse correcte vérifiée à la main).
+- [x] Exécuter chaque tâche avec Codex CLI et `gpt-5.6-luna`, équipé du skill `skills/dev-browser` via `dev-browser install-skill --agents`, sur la version de base puis sur la version finale, 3 fois chacune. Lire le flux JSONL éphémère en mémoire pour compter : nombre d'appels `dev-browser`, octets de sortie totaux, temps mur de la tâche et succès, sans persister de transcript privé.
 - [ ] Critères : médiane des appels ÷ 1,8 ou mieux ; octets de sortie ÷ 8 ou mieux ; temps mur ÷ 2 ou mieux ; succès ≥ égal à la base ; aucune action interdite dans les transcripts (grep des noms de boutons interdits dans les commandes `click`).
 - [x] Consigner dans `docs/perf/agent-eval.md` : tâches, modèle, tableaux, écarts.
 
-> Mesure E3 (2026-09-18) : 24 sessions contrôlées Haiku 4.5/effort bas et un contrôle complet Sonnet 4.6 ont été exécutés. La sécurité et le succès relatif sont préservés, mais les facteurs de vitesse échouent (Haiku : 1,15× appels, 1,74× octets, 0,94× temps ; Sonnet : 0,73×, 1,11×, 0,68×). Le plan reste ouvert. Voir `docs/perf/agent-eval.md`.
+> Mesure E3 (2026-09-18) : 24 sessions contrôlées `gpt-5.6-luna`/effort bas ont été exécutées avec 12/12 succès sur la référence et la finale, sans commande interdite. Les facteurs de vitesse échouent toutefois : 0,72× appels, 2,97× octets et 0,83× temps. Une guidance corrective a amélioré les appels mais régressé à 11/12 succès ; elle a été retirée. Le plan reste ouvert. Voir `docs/perf/agent-eval.md`.
 
 ### E4 — Non-régression (bloquant pour chaque PR)
 
