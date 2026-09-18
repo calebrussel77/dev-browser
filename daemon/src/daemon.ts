@@ -11,6 +11,7 @@ import {
 } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { executeInteractiveAction } from "./interactive-actions.js";
+import { executeBatchActions } from "./batch-actions.js";
 import { getLatestStateId } from "./page-state.js";
 import { authorizeExecuteRequest } from "./execute-policy.js";
 import { createBrowserPageLock, createMutex } from "./lock.js";
@@ -24,6 +25,7 @@ import {
 import {
   parseRequest,
   serialize,
+  type BatchRequest,
   type ExecuteRequest,
   type HandshakeRequest,
   type InteractiveRequest,
@@ -393,6 +395,55 @@ async function handleInteractive(socket: net.Socket, request: InteractiveRequest
   });
 }
 
+async function handleBatch(socket: net.Socket, request: BatchRequest): Promise<void> {
+  try {
+    await prepareBrowser(request);
+    await withPageLock(request.browser, request.page, async () => {
+      const { steps, final, firstError } = await executeBatchActions(manager, request);
+
+      const data = {
+        protocolVersion: 2,
+        ok: !firstError,
+        requestId: request.id,
+        browser: request.browser,
+        page: request.page,
+        action: "batch",
+        steps,
+        ...(final ? { final } : {}),
+      };
+      if (firstError) {
+        await writeMessage(socket, {
+          id: request.id,
+          type: "error",
+          message: firstError.message,
+          exitCode: agentErrorExitCode(firstError.code),
+          error: firstError,
+          data,
+        });
+        return;
+      }
+      await writeMessage(socket, { id: request.id, type: "result", data });
+      await writeMessage(socket, { id: request.id, type: "complete", success: true });
+    });
+  } catch (error) {
+    const failure = buildInteractiveFailure({
+      requestId: request.id,
+      browser: request.browser,
+      page: request.page,
+      action: "batch",
+      error,
+    });
+    await writeMessage(socket, {
+      id: request.id,
+      type: "error",
+      message: failure.error.message,
+      exitCode: agentErrorExitCode(failure.error.code),
+      error: failure.error,
+      data: failure,
+    });
+  }
+}
+
 async function handleSession(socket: net.Socket, request: SessionRequest): Promise<void> {
   try {
     let data;
@@ -629,6 +680,7 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
   const tracksOperation = [
     "execute",
     "interactive",
+    "batch",
     "session",
     "install",
     "browser-stop",
@@ -664,6 +716,10 @@ async function handleRequest(socket: net.Socket, line: string): Promise<void> {
 
       case "interactive":
         await handleInteractive(socket, request);
+        return;
+
+      case "batch":
+        await handleBatch(socket, request);
         return;
 
       case "session":

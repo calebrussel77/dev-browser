@@ -356,9 +356,9 @@ Conception :
 
 **Fichiers :** `daemon/src/protocol.ts`, `daemon/src/interactive-actions.ts`, `daemon/src/targeting.ts`, `cli/src/main.rs`, `cli/src/discovery.rs`.
 
-- [ ] `click`, `type`, `focus`, `press`, `hover`, `check`, `uncheck`, `select`, `scroll --ref` acceptent, à la place de `--ref`, le groupe `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--state` (même grammaire que `find`). Le daemon exécute `findTargets` avec `limit: 5` ; si `ambiguity.ambiguous` ou zéro match, il renvoie `AMBIGUOUS_TARGET` / `TARGET_MISSING` avec les candidats compacts (1.4) et n'agit pas ; sinon il agit sur le match unique et renvoie `resolvedBy: "find"` avec le ref utilisé.
-- [ ] `--from-state` reste supporté ; sans lui, la cible est résolue sur une perception fraîche (c'est l'intérêt : un seul appel).
-- [ ] `--require-ancestor-text`, `--confirm-token` et `--expect-text` restent utilisables avec la forme sémantique.
+- [x] `click`, `type`, `focus`, `press`, `hover`, `check`, `uncheck`, `select`, `scroll --ref` acceptent, à la place de `--ref`, le groupe `--role`, `--name`, `--name-mode`, `--within`, `--near`, `--frame`, `--state` (même grammaire que `find`). Le daemon exécute `findTargets` avec `limit: 5` ; si `ambiguity.ambiguous` ou zéro match, il renvoie `AMBIGUOUS_TARGET` / `TARGET_MISSING` avec les candidats compacts (1.4) et n'agit pas ; sinon il agit sur le match unique et renvoie `resolvedBy: "find"` avec le ref utilisé.
+- [x] `--from-state` reste supporté ; sans lui, la cible est résolue sur une perception fraîche (c'est l'intérêt : un seul appel).
+- [x] `--require-ancestor-text`, `--confirm-token` et `--expect-text` restent utilisables avec la forme sémantique.
 
 **Tests :** `interactive-actions.test.ts` : `click --role button --name Connect --within main` clique le bon bouton de la fixture et jamais le leurre de `aside` ; ambigu sans `--within` renvoie `AMBIGUOUS_TARGET` avec candidats et `decoy` non cliqué (compteurs de la fixture) ; `type --role textbox --name Note` fonctionne.
 
@@ -368,10 +368,10 @@ Conception :
 
 **Fichiers :** `daemon/src/protocol.ts` (`BatchRequest`), `daemon/src/daemon.ts` (`handleBatch`), `cli/src/main.rs` (`Batch` : lit un JSON sur stdin ou `--file`), `cli/src/discovery.rs`, `skills/dev-browser/references/interactive-loop.md`.
 
-- [ ] Entrée : `{ "page": "...", "steps": [ { "kind": "click", ... }, { "kind": "type", ... }, { "kind": "assert", ... } ], "stopOnError": true, "observeAfter": "delta" | "tree" | "none" }`. Chaque étape est une action du protocole v2 existant (même schéma zod, réutilisé via `z.array(ActionSchema)`), max 20 étapes.
-- [ ] Exécution séquentielle sous le verrou de page ; les leases, tokens de confirmation et guards s'appliquent étape par étape exactement comme en appels séparés (aucune étape ne peut contourner `--confirm-token`). Résultat : `steps: [{ index, kind, ok, ms, result | error }]` compact, puis l'état final selon `observeAfter`.
-- [ ] Une étape `wait` autonome (`{ "kind": "wait", "wait": {...} }`) est ajoutée pour attendre entre deux actions.
-- [ ] Code de sortie : celui de la première étape en erreur ; les étapes suivantes ne sont pas exécutées si `stopOnError`.
+- [x] Entrée : `{ "page": "...", "steps": [ { "kind": "click", ... }, { "kind": "type", ... }, { "kind": "assert", ... } ], "stopOnError": true, "observeAfter": "delta" | "tree" | "none" }`. Chaque étape est une action du protocole v2 existant (même schéma zod, réutilisé via `z.array(ActionSchema)`), max 20 étapes.
+- [x] Exécution séquentielle sous le verrou de page ; les leases, tokens de confirmation et guards s'appliquent étape par étape exactement comme en appels séparés (aucune étape ne peut contourner `--confirm-token`). Résultat : `steps: [{ index, kind, ok, ms, result | error }]` compact, puis l'état final selon `observeAfter`.
+- [x] Une étape `wait` autonome (`{ "kind": "wait", "wait": {...} }`) est ajoutée pour attendre entre deux actions.
+- [x] Code de sortie : celui de la première étape en erreur ; les étapes suivantes ne sont pas exécutées si `stopOnError`.
 
 **Tests :** `protocol.test.ts` : schéma batch, refus de > 20 étapes ; `daemon` tests : `batch` de find + click + assert sur la fixture ; une étape `click --confirm-token` invalide arrête le batch avec `CONFIRMATION_INVALID` et l'étape suivante n'a pas tourné (compteur fixture).
 
@@ -379,15 +379,17 @@ Conception :
 
 ### Tâche 3.3 — Raccourcis
 
-- [ ] `type --press KEY` (touche envoyée après la saisie, même dispatch journalisé) ; `type` multi-champs `--fill REF=TEXTE` répétable.
-- [ ] `navigate URL --observe [SCOPE]` renvoie l'arbre scopé après chargement.
-- [ ] `click ... --then-text SCOPE` renvoie `textContent` du scope après le settle (remplace un appel `text`).
+- [x] `type --press KEY` (touche envoyée après la saisie, même dispatch journalisé) ; `type` multi-champs `--fill REF=TEXTE` répétable.
+- [x] `navigate URL --observe [SCOPE]` renvoie l'arbre scopé après chargement.
+- [x] `click ... --then-text SCOPE` renvoie `textContent` du scope après le settle (remplace un appel `text`).
 
 **Tests :** parsing CLI ; daemon : `type --press Enter` soumet le formulaire de la fixture ; `--then-text main` présent dans la réponse.
 
 ### Tâche 3.4 — Erreurs qui évitent un tour
 
-- [ ] `STALE_REF`, `STALE_STATE`, `TARGET_MISSING`, `AMBIGUOUS_TARGET` renvoient dans `error.details` : `latest` (stateId, url, title), et `candidates` (≤ 5 éléments compacts les plus proches sémantiquement du ref/nom demandé, via `findTargets` sur le nom du ref d'origine quand il est connu). `nextCommands` propose la commande sémantique 3.1 correspondante.
+- [x] `STALE_REF`, `STALE_STATE`, `TARGET_MISSING`, `AMBIGUOUS_TARGET` renvoient dans `error.details` : `latest` (stateId, url, title), et `candidates` (≤ 5 éléments compacts les plus proches sémantiquement du ref/nom demandé, via `findTargets` sur le nom du ref d'origine quand il est connu). `nextCommands` propose la commande sémantique 3.1 correspondante.
+
+> Mesure PR 5 (2026-09-17) : un batch live de lecture messagerie (`find + text + observe final`) réussit en 324 ms et 9 695 octets. La recherche live exécute la saisie sémantique et `Enter` dans une seule action, puis vérifie l'effacement. Les détails et la condition de course observée sur le landmark après navigation sont consignés dans `docs/perf/2026-09-17-pr5.md` et `docs/field-reports/2026-09-17-speed-pr5.md`.
 
 **Tests :** `ref-state.test.ts` : un ref devenu obsolète après re-rendu renvoie un candidat avec le même nom et un nouveau ref.
 

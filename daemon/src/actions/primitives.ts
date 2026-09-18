@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 
+import { AgentProtocolError } from "../agent-protocol.js";
 import { attemptErrorReason, attemptFrameContext, emptyWaitEvents, recordAttempt, trustedInputError, unchangedAttempt, withAttemptJournal } from "../action-journal.js";
 import type { InteractiveRequest } from "../protocol.js";
 import type { AttemptJournalEntry } from "../retry-policy.js";
@@ -137,9 +138,10 @@ async function scrollUntil(
 
 export async function executePrimitive(context: PrimitiveContext): Promise<PrimitiveSummary> {
   const { page, action, resolve, authorize, timeoutMs } = context;
+  const actionRef = "ref" in action && typeof action.ref === "string" ? action.ref : undefined;
   const journal: AttemptJournalEntry[] = [];
   let journalContext = attemptFrameContext(
-    action.kind === "drag" ? action.from : action.kind === "scroll" ? action.ref ?? null : action.ref
+    action.kind === "drag" ? action.from : actionRef ?? null
   );
   const entry = (method: InputMethod, reason: string): AttemptJournalEntry => ({
     attempt: journal.length + 1, startedAt: new Date().toISOString(), inputMethod: method,
@@ -174,20 +176,20 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     let steps = 1;
     let matched: boolean | null = null;
     let targetMetadata: ActionTargetMetadata[] | undefined;
-    if (action.ref && action.until) {
+    if (actionRef && action.until) {
       // Container-relative scrolling: `ref` names the scrollable container,
       // not a scroll-into-view target. Scan for `until` one client height at
       // a time, positioning the mouse over the container's own center before
       // every trusted wheel step (never window.scrollTo/element.scrollTop).
-      const target = await resolve(action.ref);
-      journalContext = attemptFrameContext(action.ref, target);
+      const target = await resolve(actionRef);
+      journalContext = attemptFrameContext(actionRef, target);
       try {
         ({ steps, matched } = await scrollUntil(
           page,
           action.until,
           action.maxSteps!,
           (deltaY) =>
-            dispatch("wheel", [action.ref!], async () => {
+            dispatch("wheel", [actionRef], async () => {
               await page.mouse.move(target.box.x + target.box.width / 2, target.box.y + target.box.height / 2);
               await page.mouse.wheel(0, deltaY);
             }, [target]),
@@ -195,11 +197,11 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
         ));
         targetMetadata = [actionTargetMetadata(target, "mouse")];
       } finally { await target.cleanup(); }
-    } else if (action.ref) {
-      const target = await resolve(action.ref);
-      journalContext = attemptFrameContext(action.ref, target);
+    } else if (actionRef) {
+      const target = await resolve(actionRef);
+      journalContext = attemptFrameContext(actionRef, target);
       try {
-        await dispatch("locator", [action.ref], () => target.locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }), [target]);
+        await dispatch("locator", [actionRef], () => target.locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }), [target]);
         targetMetadata = [actionTargetMetadata(target, "locator")];
       } finally { await target.cleanup(); }
     } else if (action.until) {
@@ -219,7 +221,14 @@ export async function executePrimitive(context: PrimitiveContext): Promise<Primi
     return { ...complete({ scroll: { before, after, delta: { x: after.x - before.x, y: after.y - before.y }, steps, matched } }), targets: targetMetadata };
   }
 
-  const refs = action.kind === "drag" ? [action.from, action.to] : [action.ref];
+  if (action.kind !== "drag" && !actionRef) {
+    throw new AgentProtocolError(
+      "TARGET_MISSING",
+      "Semantic primitive target was not resolved",
+      true
+    );
+  }
+  const refs = action.kind === "drag" ? [action.from, action.to] : [actionRef!];
   const method: InputMethod = action.kind === "press" || action.kind === "paste" ? "keyboard" : action.kind === "focus" ? "focus" : action.kind;
   const targets: ResolvedActionTarget[] = [];
   try {

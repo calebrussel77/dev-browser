@@ -81,11 +81,17 @@ describe.sequential("interactive Playwright actions", () => {
       </div>
       <script>
         window.__trustedPointer = false;
+        window.__mainConnectClicks = 0;
+        window.__asideConnectClicks = 0;
         window.__retryClicks = 0;
         window.__changedClicks = 0;
         window.__wrappedTrusted = false;
         document.querySelector('#main-connect').addEventListener('click', event => {
           window.__trustedPointer = event.isTrusted;
+          window.__mainConnectClicks += 1;
+        });
+        document.querySelector('#aside-connect').addEventListener('click', () => {
+          window.__asideConnectClicks += 1;
         });
         document.querySelector('#open-dynamic').addEventListener('click', () => {
           const dialog = document.createElement('div');
@@ -348,6 +354,172 @@ describe.sequential("interactive Playwright actions", () => {
         ref: expect.stringMatching(/^R\d+$/),
       })
     );
+  });
+
+  it("click resolves a unique semantic target and never clicks the aside decoy", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.evaluate(() => {
+      (window as unknown as { __mainConnectClicks: number }).__mainConnectClicks = 0;
+      (window as unknown as { __asideConnectClicks: number }).__asideConnectClicks = 0;
+    });
+
+    const result = await executeInteractiveAction(
+      manager,
+      request({
+        kind: "click",
+        role: "button",
+        name: "Connect",
+        within: "main",
+        method: "mouse",
+      })
+    );
+    const counters = await page.evaluate(() => ({
+      main: (window as unknown as { __mainConnectClicks: number }).__mainConnectClicks,
+      aside: (window as unknown as { __asideConnectClicks: number }).__asideConnectClicks,
+    }));
+
+    expect(result).toEqual(expect.objectContaining({
+      resolvedBy: "find",
+      resolvedRef: expect.stringMatching(/^R\d+$/),
+    }));
+    expect(counters).toEqual({ main: 1, aside: 0 });
+  });
+
+  it("refuses an ambiguous semantic click before trusted input", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.evaluate(() => {
+      (window as unknown as { __mainConnectClicks: number }).__mainConnectClicks = 0;
+      (window as unknown as { __asideConnectClicks: number }).__asideConnectClicks = 0;
+    });
+
+    let thrown: unknown;
+    try {
+      await executeInteractiveAction(
+        manager,
+        request({ kind: "click", role: "button", name: "Connect", method: "mouse" })
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    const counters = await page.evaluate(() => ({
+      main: (window as unknown as { __mainConnectClicks: number }).__mainConnectClicks,
+      aside: (window as unknown as { __asideConnectClicks: number }).__asideConnectClicks,
+    }));
+
+    expect(thrown).toMatchObject({
+      code: "AMBIGUOUS_TARGET",
+      details: { candidates: expect.arrayContaining([expect.objectContaining({ name: "Connect" })]) },
+    });
+    expect(counters).toEqual({ main: 0, aside: 0 });
+  });
+
+  it("types into a semantic textbox target", async () => {
+    const page = await manager.getPage(browserName, "profile");
+    await page.locator("#note").fill("");
+
+    const result = await executeInteractiveAction(
+      manager,
+      request({
+        kind: "type",
+        role: "textbox",
+        name: "Invitation note",
+        text: "semantic note",
+        clear: true,
+        delayMs: 0,
+      })
+    );
+
+    expect(result).toEqual(expect.objectContaining({ resolvedBy: "find" }));
+    await expect(page.locator("#note").textContent()).resolves.toBe("semantic note");
+  });
+
+  it("types multiple fields and presses a key in one action", async () => {
+    const pageName = "type-shortcuts";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`
+      <main>
+        <input aria-label="First name">
+        <input aria-label="Last name">
+      </main>
+      <script>
+        window.__submitted = 0;
+        document.querySelectorAll('input')[1].addEventListener('keydown', event => {
+          if (event.key === 'Enter') window.__submitted += 1;
+        });
+      </script>
+    `);
+    const observed = await executeInteractiveAction(manager, {
+      ...request({ kind: "read", limit: 100, depth: 12 }),
+      page: pageName,
+      elements: true,
+      protocolVersion: 2,
+    });
+    const first = elements(observed).find((element) => element.name === "First name")!.ref;
+    const last = elements(observed).find((element) => element.name === "Last name")!.ref;
+
+    const result = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "type",
+        fills: [{ ref: first, text: "Ada" }, { ref: last, text: "Lovelace" }],
+        press: "Enter",
+        clear: true,
+        delayMs: 0,
+      }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+
+    expect(result.fills).toEqual([
+      { ref: first, characters: 3 },
+      { ref: last, characters: 8 },
+    ]);
+    expect(await page.locator("input").evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value)))
+      .toEqual(["Ada", "Lovelace"]);
+    expect(await page.evaluate(() => (window as unknown as { __submitted: number }).__submitted)).toBe(1);
+  });
+
+  it("returns scoped text after a click and a scoped observation after navigation", async () => {
+    const pageName = "compound-observe";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><button>Reveal</button><p>Before</p></main><aside>Decoy</aside>`);
+    await page.locator("button").evaluate((button) => button.addEventListener("click", () => {
+      document.querySelector("p")!.textContent = "After click";
+    }));
+    const observed = await executeInteractiveAction(manager, {
+      ...request({ kind: "read", limit: 100, depth: 12 }),
+      page: pageName,
+      elements: true,
+      protocolVersion: 2,
+    });
+    const reveal = elements(observed).find((element) => element.name === "Reveal")!.ref;
+    const clicked = await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: reveal, method: "mouse", thenText: "main" }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    expect(clicked.textContent).toContain("After click");
+    expect(clicked.textContent).not.toContain("Decoy");
+
+    const delayedDocument = encodeURIComponent(`
+      <div>Loading</div>
+      <script>
+        setTimeout(() => {
+          document.body.innerHTML = '<main><button>Primary</button></main><aside><button>Decoy</button></aside>';
+        }, 100);
+      </script>
+    `);
+    const navigated = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "navigate",
+        url: `data:text/html,${delayedDocument}`,
+        observe: "main",
+      }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    expect(navigated.scope).toEqual(expect.objectContaining({ kind: "within", value: "main" }));
+    expect(navigated.tree).toContain("Primary");
+    expect(navigated.tree).not.toContain("Decoy");
   });
 
   it("find takes a fresh snapshot on every call", async () => {

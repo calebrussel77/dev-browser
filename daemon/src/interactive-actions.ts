@@ -48,7 +48,13 @@ import {
   resolveContentScope,
   type ScopeMetadata,
 } from "./scoped-content.js";
-import { elementIdentity, findTargets, type TargetAmbiguity, type TargetMatch } from "./targeting.js";
+import {
+  elementIdentity,
+  findTargets,
+  type TargetAmbiguity,
+  type TargetFilters,
+  type TargetMatch,
+} from "./targeting.js";
 import { captureVisualArtifacts, type VisualArtifacts } from "./visual-artifacts.js";
 import {
   capturedWaitEvents,
@@ -87,6 +93,8 @@ export interface InteractiveResult {
   elements?: InteractiveElement[];
   matches?: InteractiveMatch[];
   ambiguity?: TargetAmbiguity;
+  resolvedBy?: "find";
+  resolvedRef?: string;
   /** find only: how many actionable candidates were searched, and whether the
    * collection hit a hard cap (in which case an empty match list is reported
    * as "budget-exhausted" rather than "no-match"). */
@@ -133,6 +141,7 @@ export interface InteractiveResult {
     ref: string | null;
     characters: number;
   } & Partial<ActionTargetMetadata>;
+  fills?: Array<{ ref: string; characters: number }>;
   inputStrategy?: InputStrategy;
   verifiedValue?: string;
   targets?: ActionTargetMetadata[];
@@ -170,7 +179,7 @@ export interface InteractiveResult {
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
   waitResult?: WaitResult | CompactWaitResult;
-  pressed?: PrimitiveSummary["pressed"];
+  pressed?: { ref: string | null; key: string };
   pasted?: PrimitiveSummary["pasted"];
   scroll?: PrimitiveSummary["scroll"];
   selected?: PrimitiveSummary["selected"];
@@ -912,7 +921,8 @@ async function hasIrreversibleClickIntent(
   page: Page,
   action: Extract<InteractiveRequest["action"], { kind: "click" }>
 ): Promise<boolean> {
-  const descriptor = "ref" in action ? await describeLiveRef(page, action.ref) : await page.evaluate((target) => {
+  const ref = "ref" in action && typeof action.ref === "string" ? action.ref : undefined;
+  const descriptor = ref ? await describeLiveRef(page, ref) : "x" in action ? await page.evaluate((target) => {
     const element = document.elementFromPoint(target.x, target.y);
     if (!element) return "";
     const input = element as HTMLInputElement;
@@ -926,18 +936,165 @@ async function hasIrreversibleClickIntent(
     ]
       .filter(Boolean)
       .join(" ");
-  }, action);
+  }, action) : "";
   return /\b(delete|remove|destroy|erase|submit|send|confirm|approve|pay|purchase|publish|post|supprimer|effacer|envoyer|confirmer|payer|publier)\b/i.test(
     descriptor
   );
 }
 
-export async function executeInteractiveAction(
+const SEMANTIC_TARGET_ACTIONS = new Set([
+  "click",
+  "type",
+  "focus",
+  "press",
+  "hover",
+  "check",
+  "uncheck",
+  "select",
+  "scroll",
+]);
+
+function semanticTargetFilters(
+  action: InteractiveRequest["action"]
+): TargetFilters | undefined {
+  if (!SEMANTIC_TARGET_ACTIONS.has(action.kind)) return undefined;
+  const value = action as unknown as Record<string, unknown>;
+  if (typeof value.ref === "string") return undefined;
+  const states = Array.isArray(value.states) ? value.states : [];
+  if (
+    !value.role &&
+    !value.name &&
+    !value.within &&
+    !value.near &&
+    !value.frame &&
+    states.length === 0
+  ) return undefined;
+  return {
+    role: typeof value.role === "string" ? value.role : undefined,
+    name: typeof value.name === "string" ? value.name : undefined,
+    nameMode: value.nameMode === "contains" ? "contains" : "exact",
+    within: typeof value.within === "string" ? value.within : undefined,
+    near: typeof value.near === "string" ? value.near : undefined,
+    frame: typeof value.frame === "string" ? value.frame : undefined,
+    scope: "visible",
+    states: states as TargetFilters["states"],
+  };
+}
+
+function semanticRecoveryCommand(
+  page: string,
+  kind: string,
+  filters: TargetFilters
+): string {
+  const args = ["dev-browser", kind, "--page", page];
+  if (filters.role) args.push("--role", JSON.stringify(filters.role));
+  if (filters.name) args.push("--name", JSON.stringify(filters.name));
+  if (filters.nameMode === "contains") args.push("--name-mode", "contains");
+  if (filters.within) args.push("--within", JSON.stringify(filters.within));
+  if (filters.near) args.push("--near", JSON.stringify(filters.near));
+  if (filters.frame) args.push("--frame", JSON.stringify(filters.frame));
+  for (const state of filters.states) args.push("--state", state);
+  return args.join(" ");
+}
+
+const ENRICHED_TARGET_ERROR_CODES = new Set([
+  "STALE_REF",
+  "STALE_STATE",
+  "TARGET_MISSING",
+  "AMBIGUOUS_TARGET",
+]);
+
+function requestedActionRef(action: InteractiveRequest["action"]): string | undefined {
+  const value = action as unknown as Record<string, unknown>;
+  if (typeof value.ref === "string") return value.ref;
+  if (typeof value.from === "string") return value.from;
+  return undefined;
+}
+
+function filtersFromFingerprint(fingerprint: string | undefined): TargetFilters | undefined {
+  if (!fingerprint) return undefined;
+  try {
+    const parsed = JSON.parse(fingerprint) as {
+      role?: string;
+      name?: string;
+      landmark?: string;
+    };
+    if (!parsed.name) return undefined;
+    return {
+      role: parsed.role || undefined,
+      name: parsed.name,
+      nameMode: "exact",
+      within: parsed.landmark || undefined,
+      scope: "visible",
+      states: [],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function enrichTargetError(
+  manager: BrowserManager,
+  request: InteractiveRequest,
+  originalAction: InteractiveRequest["action"],
+  previousStateId: string | null,
+  error: AgentProtocolError
+): Promise<AgentProtocolError> {
+  if (!ENRICHED_TARGET_ERROR_CODES.has(error.code)) return error;
+  try {
+    const page = await manager.getPage(request.browser, request.page);
+    const original = originalAction as unknown as Record<string, unknown>;
+    const sourceStateId = typeof original.fromState === "string"
+      ? original.fromState
+      : previousStateId;
+    const ref = requestedActionRef(originalAction);
+    const refFilters = filtersFromFingerprint(
+      ref && sourceStateId ? getRecordedState(page, sourceStateId)?.elements.get(ref) : undefined
+    );
+    const filters = semanticTargetFilters(originalAction) ?? refFilters;
+    const perception = await perceive(page, {}, (request.protocolVersion ?? 1) === 1);
+    const candidates = filters
+      ? findTargets(
+          perception.allElements.filter((element) => element.actionable),
+          filters,
+          5
+        ).matches.slice(0, 5).map((match) => compactFindMatch(match, true))
+      : [];
+    const currentDetails = error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? error.details as Record<string, unknown>
+      : {};
+    const recoveryKind = [
+      "click", "type", "focus", "press", "scroll", "select", "check", "uncheck", "hover",
+    ].includes(originalAction.kind)
+      ? originalAction.kind
+      : "find";
+    const nextCommands = filters
+      ? [semanticRecoveryCommand(request.page, recoveryKind, filters)]
+      : (error.nextCommands ?? [observeRecoveryCommand(request.page)]);
+    return new AgentProtocolError(error.code, error.message, error.recoverable, {
+      details: {
+        ...currentDetails,
+        latest: {
+          stateId: perception.stateId,
+          url: perception.url,
+          title: perception.title,
+        },
+        candidates,
+      },
+      nextCommands,
+      allowOutputPath: error.allowOutputPath,
+    });
+  } catch {
+    return error;
+  }
+}
+
+async function executeInteractiveActionCore(
   manager: BrowserManager,
   request: InteractiveRequest,
   hooks: ActionExecutionHooks = {}
 ): Promise<InteractiveResult> {
-  const { action } = request;
+  let action = request.action;
 
   if (action.kind === "paste" && (request.shot || request.annotate)) {
     throw new AgentProtocolError(
@@ -970,6 +1127,43 @@ export async function executeInteractiveAction(
     applyPerception(result, perception, request, includeElements);
   };
   const sensitiveValues: string[] = [];
+
+  const semanticFilters = semanticTargetFilters(action);
+  if (semanticFilters) {
+    const perception = await perceive(page, {}, protocolVersion === 1);
+    const candidates = perception.allElements.filter((element) => element.actionable);
+    const targeted = findTargets(candidates, semanticFilters, 5);
+    const compactCandidates = targeted.matches
+      .slice(0, 5)
+      .map((match) => compactFindMatch(match, true));
+    if (targeted.matches.length === 0) {
+      throw new AgentProtocolError(
+        "TARGET_MISSING",
+        "No actionable element matched the semantic target",
+        true,
+        {
+          details: { candidates: compactCandidates, ambiguity: targeted.ambiguity },
+          nextCommands: [semanticRecoveryCommand(request.page, action.kind, semanticFilters)],
+        }
+      );
+    }
+    if (targeted.ambiguity.ambiguous) {
+      throw new AgentProtocolError(
+        "AMBIGUOUS_TARGET",
+        "Semantic target matched multiple equally ranked elements",
+        true,
+        {
+          details: { candidates: compactCandidates, ambiguity: targeted.ambiguity },
+          nextCommands: [semanticRecoveryCommand(request.page, action.kind, semanticFilters)],
+        }
+      );
+    }
+    const resolvedRef = targeted.matches[0]!.ref;
+    action = { ...action, ref: resolvedRef } as InteractiveRequest["action"];
+    request.action = action;
+    result.resolvedBy = "find";
+    result.resolvedRef = resolvedRef;
+  }
 
   // Connected browsers run without Playwright's --disable-backgrounding-occluded-windows
   // launch flag, so a fully covered window freezes the renderer and drops trusted
@@ -1017,11 +1211,43 @@ export async function executeInteractiveAction(
   }
 
   switch (action.kind) {
-    case "navigate":
+    case "wait": {
+      const waited = await runWithWait(
+        page,
+        { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
+        action.wait,
+        async () => undefined
+      );
+      result.waitResult = waited.waitResult;
+      applyCurrentPerception(waited.state);
+      break;
+    }
+
+    case "navigate": {
+      const navigationPerceptionOptions: CollectPageStateOptions = {
+        delta: true,
+        ...(action.observe ? { scope: { within: action.observe } } : {}),
+      };
+      const perceiveNavigationResult = async (): Promise<PagePerception> => {
+        const deadline = Date.now() + Math.min(request.timeoutMs ?? 3_000, 3_000);
+        while (true) {
+          try {
+            return await perceive(page, navigationPerceptionOptions, protocolVersion === 1);
+          } catch (error) {
+            if (
+              !action.observe ||
+              !(error instanceof AgentProtocolError) ||
+              error.code !== "TARGET_MISSING" ||
+              Date.now() >= deadline
+            ) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+      };
       if (action.wait) {
         const waited = await runWithWait(
           page,
-          { collect: () => perceive(page, { delta: true }, protocolVersion === 1), protocolVersion },
+          { collect: perceiveNavigationResult, protocolVersion },
           action.wait,
           async () => {
             await authorizeTrustedMutation();
@@ -1040,10 +1266,11 @@ export async function executeInteractiveAction(
           waitUntil: "domcontentloaded",
         });
         applyCurrentPerception(
-          await perceive(page, { delta: true }, protocolVersion === 1)
+          await perceiveNavigationResult()
         );
       }
       break;
+    }
 
     case "back":
     case "forward":
@@ -1451,17 +1678,18 @@ export async function executeInteractiveAction(
     case "click": {
       const openedPopups: Page[] = [];
       const startedDownloads: Download[] = [];
-      if (action.confirmToken && !("ref" in action))
+      const clickRef = "ref" in action && typeof action.ref === "string" ? action.ref : undefined;
+      if (action.confirmToken && !clickRef)
         throw new AgentProtocolError("CONFIRMATION_INVALID", "Confirmation tokens require a ref target", true);
       if (action.expectText) {
         await requireExpectedText(page, action.expectText);
       }
-      const signalRefs = "ref" in action ? [action.ref] : [];
+      const signalRefs = clickRef ? [clickRef] : [];
       const decisionStateId = ("fromState" in action ? action.fromState : undefined) ?? getLatestStateId(page);
       const decisionState = decisionStateId ? getRecordedState(page, decisionStateId) : undefined;
       const decisionScope = decisionState?.scope;
-      const decisionFingerprint = "ref" in action
-        ? decisionState?.elements.get(action.ref)
+      const decisionFingerprint = clickRef
+        ? decisionState?.elements.get(clickRef)
         : undefined;
       const canReuseUnchangedPerception = (() => {
         if (!decisionFingerprint) return false;
@@ -1482,7 +1710,7 @@ export async function executeInteractiveAction(
       })();
       const before = await pageSignal(page, signalRefs);
       const revalidateClick = async () => {
-        await validateDecisionRefs(["ref" in action ? action.ref : undefined]);
+        await validateDecisionRefs([clickRef]);
       };
       let confirmationConsumed = false;
       const prepareClickInput = async (resolved?: ResolvedActionTarget) => {
@@ -1499,13 +1727,13 @@ export async function executeInteractiveAction(
           confirmationConsumed = true;
         }
       };
-      let clickFrameContext: AttemptJournalEntry["frameContext"] = attemptFrameContext("ref" in action ? action.ref : null);
+      let clickFrameContext: AttemptJournalEntry["frameContext"] = attemptFrameContext(clickRef ?? null);
       const clickOnce = async () => {
-        if ("ref" in action) {
+        if (clickRef) {
           // Reject semantic staleness before resolution can scroll the page;
           // authorize again immediately before trusted input to cover races.
           await revalidateClick();
-          const resolved = await resolveRef(page, action.ref, {
+          const resolved = await resolveRef(page, clickRef, {
             pageName: request.page,
             timeoutMs: request.timeoutMs,
             scroll: true,
@@ -1514,16 +1742,18 @@ export async function executeInteractiveAction(
             legacyRefs: protocolVersion === 1,
           });
           const { box, locator, resolvedBy, cleanup } = resolved;
-          clickFrameContext = attemptFrameContext(action.ref, resolved);
+          clickFrameContext = attemptFrameContext(clickRef, resolved);
           const point = {
             x: box.x + box.width / 2,
             y: box.y + box.height / 2,
           };
           try {
-            if (action.requireAncestorText) {
+            const requireAncestorText =
+              "requireAncestorText" in action ? action.requireAncestorText : undefined;
+            if (requireAncestorText) {
               result.ancestorGuard = await enforceAncestorGuard(
                 resolved,
-                action.requireAncestorText,
+                requireAncestorText,
                 request.page
               );
             }
@@ -1549,7 +1779,7 @@ export async function executeInteractiveAction(
             scroll: resolved.scroll,
           };
           result.targets = [actionTargetMetadata(resolved, action.method)];
-        } else {
+        } else if ("x" in action) {
           await prepareClickInput();
           await page.mouse.click(action.x, action.y);
           result.clicked = {
@@ -1559,6 +1789,12 @@ export async function executeInteractiveAction(
             point: { x: action.x, y: action.y },
             resolvedBy: "self",
           };
+        } else {
+          throw new AgentProtocolError(
+            "TARGET_MISSING",
+            "Semantic click target was not resolved",
+            true
+          );
         }
       };
 
@@ -1768,10 +2004,43 @@ export async function executeInteractiveAction(
           }, originatingAttemptFrameContext(journal));
           throw withAttemptJournal(typed, journal);
         }
+      if (action.thenText) {
+        const scoped = await resolveContentScope(page, {
+          within: action.thenText,
+          maxChars: 20_000,
+        });
+        result.scope = scoped.scope;
+        result.textContent = scoped.text;
+        result.textTruncation = scoped.truncation;
+      }
       break;
     }
 
     case "type": {
+      if (action.fills) {
+        const fills: Array<{ ref: string; characters: number }> = [];
+        let lastResult: InteractiveResult | undefined;
+        for (const [index, fill] of action.fills.entries()) {
+          lastResult = await executeInteractiveAction(manager, {
+            ...request,
+            id: `${request.id}:fill:${index + 1}`,
+            action: {
+              kind: "type",
+              ref: fill.ref,
+              text: fill.text,
+              clear: action.clear,
+              delayMs: action.delayMs,
+              ...(index === action.fills.length - 1 && action.press ? { press: action.press } : {}),
+            },
+          }, hooks);
+          fills.push({ ref: fill.ref, characters: Array.from(fill.text).length });
+        }
+        if (lastResult) Object.assign(result, lastResult);
+        result.action = "type";
+        result.fills = fills;
+        break;
+      }
+      const typeText = action.text!;
       const journal: AttemptJournalEntry[] = [];
       const typeStateId = action.fromState ?? getLatestStateId(page) ?? undefined;
       const typeState = typeStateId ? getRecordedState(page, typeStateId) : undefined;
@@ -1840,7 +2109,7 @@ export async function executeInteractiveAction(
           if (await resolved.locator.evaluate((element) =>
             element instanceof HTMLInputElement &&
             (element.type === "password" || /password|secret|token|credential/i.test(element.autocomplete || element.name || element.id))
-          ).catch(() => false)) sensitiveValues.push(action.text);
+          ).catch(() => false)) sensitiveValues.push(typeText);
           const { box, locator, cleanup } = resolved;
           try {
             await dispatchTypeInput("mouse", () =>
@@ -1857,7 +2126,7 @@ export async function executeInteractiveAction(
               const entry = await enterExactText({
                 page,
                 locator,
-                text: action.text,
+                text: typeText,
                 clear: action.clear,
                 delayMs: action.delayMs,
                 dispatch: (input) => dispatchTypeInput("keyboard", input),
@@ -1886,10 +2155,12 @@ export async function executeInteractiveAction(
             await dispatchTypeInput("keyboard", () => page.keyboard.press("Backspace"));
           }
           await dispatchTypeInput("keyboard", () =>
-            page.keyboard.type(action.text, { delay: action.delayMs })
+            page.keyboard.type(typeText, { delay: action.delayMs })
           );
           inputStrategy = "keyboard";
         }
+        if (action.press)
+          await dispatchTypeInput("keyboard", () => page.keyboard.press(action.press!));
       };
       if (action.wait) {
         const waited = await runWithWait(
@@ -1906,11 +2177,13 @@ export async function executeInteractiveAction(
         : undefined;
       result.typed = {
         ref: typeTarget?.actualRef ?? null,
-        characters: Array.from(action.text).length,
+        characters: Array.from(typeText).length,
         ...typeTarget,
       };
       result.inputStrategy = inputStrategy;
       result.verifiedValue = verifiedValue;
+      if (action.press)
+        result.pressed = { ref: typeTarget?.actualRef ?? null, key: action.press };
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)
@@ -1931,12 +2204,11 @@ export async function executeInteractiveAction(
     case "drag": {
       const openedPopups: Page[] = [];
       const startedDownloads: Download[] = [];
+      const primitiveRef = "ref" in action && typeof action.ref === "string" ? action.ref : undefined;
       const primitiveRefs =
         action.kind === "drag"
           ? [action.from, action.to]
-          : action.kind === "scroll"
-            ? [action.ref]
-            : [action.ref];
+          : [primitiveRef];
       const primitiveStateId = ("fromState" in action ? action.fromState : undefined) ?? getLatestStateId(page);
       const primitiveState = primitiveStateId ? getRecordedState(page, primitiveStateId) : undefined;
       const primitiveScope = primitiveState?.scope;
@@ -1988,7 +2260,7 @@ export async function executeInteractiveAction(
               // box is valid for a trusted mouse move + wheel; the plain
               // scrollIntoView ref mode performs its own explicit scroll and
               // must not be pre-scrolled here.
-              scroll: action.kind === "scroll" ? Boolean(action.ref && action.until) : true,
+              scroll: action.kind === "scroll" ? Boolean(primitiveRef && action.until) : true,
               hitTest: action.kind === "hover" || action.kind === "drag",
               applicability,
               legacyRefs: protocolVersion === 1,
@@ -2273,4 +2545,36 @@ export async function executeInteractiveAction(
     allowConfirmationToken: action.kind === "confirm" && protocolVersion === 2,
     secrets: requestSecrets,
   }) as InteractiveResult;
+}
+
+export async function executeInteractiveAction(
+  manager: BrowserManager,
+  request: InteractiveRequest,
+  hooks: ActionExecutionHooks = {}
+): Promise<InteractiveResult> {
+  const originalAction = { ...request.action } as InteractiveRequest["action"];
+  let previousStateId: string | null = null;
+  if (
+    request.action.kind !== "pages" &&
+    !(request.action.kind === "paste" && (request.shot || request.annotate))
+  ) {
+    try {
+      const page = await manager.getPage(request.browser, request.page);
+      previousStateId = getLatestStateId(page);
+    } catch {
+      // The core path will produce the authoritative page/browser error.
+    }
+  }
+  try {
+    return await executeInteractiveActionCore(manager, request, hooks);
+  } catch (error) {
+    if (!(error instanceof AgentProtocolError)) throw error;
+    throw await enrichTargetError(
+      manager,
+      request,
+      originalAction,
+      previousStateId,
+      error
+    );
+  }
 }
