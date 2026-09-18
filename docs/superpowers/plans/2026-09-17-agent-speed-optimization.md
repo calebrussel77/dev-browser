@@ -321,9 +321,9 @@ Conception :
 
 **Fichiers :** `daemon/src/daemon.ts`, `daemon/src/lock.ts`, `daemon/src/browser-manager.ts`.
 
-- [ ] `handleInteractive` et `handleVideo` prennent un verrou `browser:page` ; `prepareBrowser` (connexion/lancement) prend le verrou `browser` uniquement pendant la (re)connexion, puis le libère.
-- [ ] `handleExecute` (scripts) garde le verrou `browser` (un script peut toucher plusieurs pages) mais n'attend pas les commandes interactives d'autres pages si un flag `--page` est fourni au script... (hors périmètre ; garder le verrou browser pour les scripts).
-- [ ] `getPage` par target id ne doit pas faire de `listPageTargets` sous verrou global si la page est déjà enregistrée.
+- [x] `handleInteractive` et `handleVideo` prennent un verrou `browser:page` ; `prepareBrowser` (connexion/lancement) prend le verrou `browser` uniquement pendant la (re)connexion, puis le libère.
+- [x] `handleExecute` (scripts) garde le verrou `browser` (un script peut toucher plusieurs pages) mais n'attend pas les commandes interactives d'autres pages si un flag `--page` est fourni au script... (hors périmètre ; garder le verrou browser pour les scripts).
+- [x] `getPage` par target id ne doit pas faire de `listPageTargets` sous verrou global si la page est déjà enregistrée.
 
 **Tests :** `lock.test.ts` : deux `interactive` sur deux pages du même browser s'exécutent en parallèle (mesurer que la durée totale ≈ max, pas somme, avec une action qui attend 300 ms) ; deux actions sur la même page restent sérialisées ; une reconnexion bloque tout.
 
@@ -333,8 +333,8 @@ Conception :
 
 **Fichiers :** `daemon/src/sandbox/script-runner-quickjs.ts`, `daemon/src/sandbox/quickjs-sandbox.ts`.
 
-- [ ] Garder par browser une sandbox pré-initialisée (runtime + bundle client + `initializePlaywright`) prête à exécuter le prochain script ; après chaque script, la sandbox utilisée est détruite et une nouvelle est préparée en arrière-plan. Aucun état ne fuit d'un script à l'autre (le script s'exécute toujours dans une sandbox neuve, seulement préchauffée).
-- [ ] Invalidation du pool à la fermeture/reconnexion du browser.
+- [x] Garder par browser une sandbox pré-initialisée (runtime + bundle client + `initializePlaywright`) prête à exécuter le prochain script ; après chaque script, la sandbox utilisée est détruite et une nouvelle est préparée en arrière-plan. Aucun état ne fuit d'un script à l'autre (le script s'exécute toujours dans une sandbox neuve, seulement préchauffée).
+- [x] Invalidation du pool à la fermeture/reconnexion du browser.
 
 **Tests :** `sandbox-security.test.ts` vert (isolation) ; nouveau test : deux scripts consécutifs ne partagent aucune variable globale ; le second script démarre en < 40 ms hors exécution.
 
@@ -344,7 +344,9 @@ Conception :
 
 **Fichiers :** `daemon/src/reliability-benchmark.test.ts`.
 
-- [ ] `Math.max(...latencies) < 10_000` devient `< 2_000` et la médiane du couple find+click `< 600` ms ; `JSON.stringify(observed).length < 100_000` devient `< 12_000` ; `actionLatencyMs < 10_000` devient `< 1_000`.
+- [x] `Math.max(...latencies) < 10_000` devient `< 2_000` et la médiane du couple find+click `< 600` ms ; `JSON.stringify(observed).length < 100_000` devient `< 12_000` ; `actionLatencyMs < 10_000` devient `< 1_000`.
+
+> Mesure PR 4 (2026-09-17) : deux `observe` live sur deux onglets LinkedIn terminent en 1,26× la durée de la commande individuelle la plus lente. Le script trivial chaud prend 13 ms de bout en bout et les tests confirment l'isolation globale ainsi que l'invalidation après reconnexion. Le benchmark de fiabilité passe avec les nouveaux plafonds. Détails dans `docs/perf/2026-09-17-pr4.md` et `docs/field-reports/2026-09-17-speed-pr4.md`.
 
 ---
 
