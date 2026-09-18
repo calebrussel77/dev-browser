@@ -12,7 +12,7 @@ A browser automation tool that lets AI agents and developers control browsers wi
 - **Persistent pages** - Navigate once, interact across multiple scripts
 - **Auto-connect** - Connect to your running Chrome or launch a fresh Chromium
 - **Full Playwright API** - goto, click, fill, locators, evaluate, screenshots, and more
-- **Interactive agent loop** - Read refs and landmarks, inspect screenshots, then click and type with trusted input one action at a time
+- **Fast trusted agent loop** - Act on fresh semantic targets, batch predictable steps, and retain guarded refs/tokens for irreversible input
 
 ## Demo
 
@@ -59,6 +59,12 @@ dev-browser --connect observe --page TARGET_ID --within main --elements
 # Find the correct duplicate label deterministically; natural queries remain supported
 dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
 
+# Fast path: find and click one unambiguous reversible target in one call
+dev-browser --connect click --page TARGET_ID --role button --name "Open" --within main --then-text main
+
+# Compound input: type, press Enter, and wait for the resulting route
+dev-browser --connect type --page TARGET_ID --role textbox --name "Search" --text "dev-browser" --press Enter --wait-url "contains,/search/"
+
 # Act through a trusted Playwright mouse event and wait for the expected UI
 dev-browser --connect click --page TARGET_ID --ref R12 --from-state doc-7:184 --wait-text "visible,body,contains,Add a note" --shot modal.png
 
@@ -75,9 +81,9 @@ dev-browser --connect click --page TARGET_ID --ref F0:R14 --from-state doc-7:190
 dev-browser --connect click --page TARGET_ID --ref R12 --trace
 dev-browser trace show LAST
 
-# Discover the installed contract and diagnose runtime/CDP health
-dev-browser schema --json
+# Discover features first; read the full schema only after a grammar failure
 dev-browser capabilities --compact
+dev-browser schema --json
 dev-browser doctor --connect --json
 ```
 
@@ -270,7 +276,7 @@ Windows npm installs download the native `dev-browser-windows-x64.exe` release a
 
 ### Using with AI agents
 
-After installing, tell your agent to run `dev-browser --help` for the concise command map. The authoritative contract is `dev-browser schema --json`; use `capabilities --compact` for fast discovery and `examples COMMAND` for a focused recipe. No plugin or skill installation is required.
+After installing, tell your agent to start with `dev-browser capabilities --compact`, then use `examples COMMAND` for a focused recipe. Read the exhaustive `schema --json` only if a command fails for a grammar reason; `--help` remains the concise command map. No plugin or skill installation is required.
 
 <details>
 <summary>Allowing dev-browser in Claude Code without permission prompts</summary>
@@ -371,6 +377,32 @@ console.log/warn/error/info       // Routed to CLI stdout/stderr
 Pages are full [Playwright Page objects](https://playwright.dev/docs/api/class-page) — `goto`, `click`, `fill`, `locator`, `evaluate`, `screenshot`, and everything else, including `page.snapshotForAI({ track?, depth?, timeout? })`, which returns `{ full, incremental? }` for AI-friendly page snapshots.
 
 ## Benchmarks
+
+### Agent-speed optimization
+
+Measured on Windows 11 with Playwright 1.61.1 and the repository's deterministic fixture. Reproduce the final column with `$env:BENCH=1; $env:BENCH_OUT="../docs/perf/local.md"; pnpm bench` from `daemon/`.
+
+| Operation | Before | After | Improvement |
+| --- | ---: | ---: | ---: |
+| `observe` compact output | 54.8 KB | 4.2 KB | 13.0× smaller |
+| `click --ref` | 1,680 ms | 192 ms | 8.8× faster |
+| `type --ref` | 2,168 ms | 191 ms | 11.4× faster |
+| `click --ref --shot` | 2,972 ms | 204 ms | 14.6× faster |
+| heavy-page `click --ref` | 1,604 ms | 242 ms | 6.6× faster |
+| warm trivial script | 166 ms | 28 ms | 5.9× faster |
+
+The command-level gains are substantial, but the controlled agent-level E3 with `gpt-5.6-luna` remains below the plan's closing thresholds:
+
+| Agent-level median | Baseline | Final | Baseline ÷ final | Target |
+| --- | ---: | ---: | ---: | ---: |
+| `dev-browser` calls | 6.5 | 9 | 0.72× | ≥ 1.8× |
+| CLI output | 49.4 KB | 16.6 KB | 2.97× | ≥ 8× |
+| wall time | 67.6 s | 81.4 s | 0.83× | ≥ 2× |
+| successful tasks | 12/12 | 12/12 | equal | no regression |
+
+The compact default, semantic actions, compound shortcuts, and `batch` reduce command payload and latency, but a generic agent does not yet choose fewer round trips reliably. Reproduce E3 with `pwsh -File scripts/run-agent-eval.ps1`; full results and environment notes live in [`docs/perf/agent-eval.md`](docs/perf/agent-eval.md).
+
+### Cross-tool evaluation
 
 | Method                  | Time    | Cost  | Turns | Success |
 | ----------------------- | ------- | ----- | ----- | ------- |

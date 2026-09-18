@@ -2,13 +2,13 @@
 
 ## The authoritative contract
 
-The exhaustive, versioned, machine-readable contract lives in the CLI itself — consult it rather than guessing flags or memorizing grammar that may have changed:
+Start with the compact feature inventory and focused examples. Read the exhaustive, versioned schema only if a command fails for a grammar reason:
 
 ```bash
-dev-browser --help                 # concise command + flag map
-dev-browser schema --json          # AUTHORITATIVE: every command, action grammar, wait grammar, error codes, limits
 dev-browser capabilities --compact # fast one-line feature discovery
 dev-browser examples click         # a focused copy/paste recipe for one command
+dev-browser --help                 # concise command + flag map
+dev-browser schema --json          # exhaustive grammar, errors, and limits after a grammar failure
 dev-browser doctor --connect --json  # diagnose CLI/daemon/browser/CDP health with typed recovery codes
 ```
 

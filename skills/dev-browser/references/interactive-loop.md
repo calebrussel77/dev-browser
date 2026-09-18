@@ -14,6 +14,21 @@ Rule of thumb: **known page and selectors → script; unknown or high-stakes UI 
 
 ## The loop
 
+### Fast path for reversible work
+
+- Call `click`, `type`, `focus`, `press`, `hover`, `check`/`uncheck`, `select`, or ref-style `scroll` with the same semantic filters as `find`. One unique match is resolved from a fresh perception; zero or ambiguous matches fail before input.
+- Add `--then-text SCOPE` to click, `--press KEY` or repeatable `--fill REF=TEXT` to type, and `--observe [SCOPE]` to navigate when that removes the next read call.
+- Send predictable sequences as a `batch` JSON object on stdin or with `batch --file FILE`. A batch accepts 1–20 normal protocol-v2 actions plus standalone `{ "kind": "wait", "wait": ... }` steps, stops on the first error by default, and preserves leases, state guards, confirmation tokens, and typed exit codes.
+- Read prose with `text --within`; reserve `observe` for choosing targets and screenshots for spatial questions or irreversible actions. Use a script for bulk extraction.
+
+```bash
+dev-browser click --page TARGET --role button --name "Open" --within main --then-text main
+dev-browser type --page TARGET --role textbox --name "Search" --text "query" --press Enter
+'{"page":"TARGET","steps":[{"kind":"click","role":"button","name":"Open"},{"kind":"assert","within":"main","text":"Ready"}],"observeAfter":"delta"}' | dev-browser batch
+```
+
+Use the full loop below whenever an action is irreversible or a human-visible side effect matters.
+
 The loop is: **perceive → find → act → verify**, one step per command, opening any returned screenshot before the next consequential action. A canonical sequence (site-agnostic):
 
 ```bash
@@ -29,7 +44,7 @@ What each group of commands is for (run `dev-browser examples COMMAND` for a foc
 
 - **Perceive** — `observe` returns a compact actionable tree with refs and `main`/`aside`/`dialog` landmark paths. Add `--elements` only when compact element boxes are needed; add `--verbose` for full historical element records and diagnostics. `read` is the compatible accessibility snapshot command; `text` returns bounded normalized text of a ref or scope. Scope any of them with `--within main` / `--within role:button` / `--within name:"Exact Name"` (or `observe --root REF`) to spend the node budget on the relevant subtree instead of re-reading page chrome.
 - **Find** — `find` takes a *fresh* snapshot every call and ranks elements. It returns at most three compact matches and no tree by default; an ambiguous result may include up to five contextual candidates. Add `--verbose` for the full match records and tree. Combine `--role`, `--name`, `--name-mode exact|contains`, `--within`, `--near`, `--frame`, `--scope`, and repeated `--state` to disambiguate duplicate labels deterministically. Use `--index` only as a last resort. Matching runs over the **full collected snapshot**, not the display-budgeted tree `observe` prints, so `find` reaches mid-page elements on large documents that a default `observe` elides. The result's `search` field reports how many candidates were covered; `ambiguity.reason: "no-match"` means the traversal *completed* and the element genuinely is not there, while `"budget-exhausted"` (with `search.truncated: true` and a warning) means collection hit a hard cap and absence was **not** proven — narrow with `--root REF` (a subtree ref from `observe`), `--within`, or `--frame` and retry rather than falling back to something less safe. On SPAs so large that even max-budget `observe` stays truncated, `--continuation` paging or scoping is required, not optional.
-- **Act** — `click`, `type`, `focus`, `press`, `paste`, `scroll`, `select`, `check`/`uncheck`, `hover`, `drag`, `upload`, plus navigation (`navigate`, `back`, `forward`, `reload`). All take a `--ref` (or `--xy X,Y` for click) and refresh the compact tree plus bounded delta on return.
+- **Act** — `click`, `type`, `focus`, `press`, `scroll`, `select`, `check`/`uncheck`, and `hover` accept either a `--ref` or semantic `find` filters. `paste`, `drag`, and `upload` remain explicitly ref-addressed; click also accepts `--xy X,Y`. Navigation includes `navigate`, `back`, `forward`, and `reload`. Actions refresh the compact tree plus bounded delta on return.
 - **Verify** — `assert` (fail with a typed `ASSERTION_FAILED` and *no* input attempt if expected text is absent), `confirm` (check dialog/recipient text before the final click), `shot` (screenshot to an absolute PNG path).
 
 Refs are `R#` or `F#:R#` (framed); page state ids are `doc-#:revision`. **Refs and states go stale** when the DOM rerenders — re-`observe`/`find` and use the fresh values rather than reusing old ones. All coordinates (screenshot pixels, ref boxes, `--xy`) are **CSS pixels**, regardless of device pixel ratio or scroll.
