@@ -2,7 +2,7 @@ import type { Frame, Page } from "playwright";
 
 import { AgentProtocolError } from "../agent-protocol.js";
 import { beginFrameGeneration, parseScopedRef, registerFrames, stableFrameId, type RegisteredFrame } from "../frame-registry.js";
-import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "../frame-geometry.js";
+import { cacheFrameGeometry, composeAffine, projectPoint, projectRect } from "../frame-geometry.js";
 import { recordPageState, type PerceptionDelta } from "../page-state.js";
 import { collectRealm } from "./realm-collector.js";
 import { buildCompactTree } from "./tree.js";
@@ -20,6 +20,7 @@ export interface CollectPageStateOptions {
   scope?: { ref?: string; within?: string };
   textOnly?: boolean;
   reuseIfEpoch?: number;
+  verbose?: boolean;
 }
 
 export interface PerceptionElement {
@@ -504,12 +505,74 @@ export function boundedCandidatePrefix<T>(children: ArrayLike<T>, limit = MAX_FR
   return { items, truncated: children.length > count };
 }
 
-async function deterministicFrames(page: Page): Promise<{ entries: Array<{ frame: Frame; id: string; path: string[] }>; truncated: boolean }> {
-  const ordered: Array<{ frame: Frame; id: string; path: string[] }> = [];
+type FrameLineageEdge = {
+  parent: Frame;
+  domIndex: number;
+  matrix: import("../frame-geometry.js").AffineMatrix;
+  parentMutationEpoch: number;
+};
+type GeometryFrameEntry = {
+  frame: Frame;
+  id: string;
+  path: string[];
+  matrix: import("../frame-geometry.js").AffineMatrix;
+  inheritedVisible: boolean;
+  inheritedObscured: boolean;
+  lineage: FrameLineageEdge[];
+};
+type ChildFrameGeometry = {
+  frame: Frame;
+  domIndex: number;
+  matrix: import("../frame-geometry.js").AffineMatrix;
+  visible: boolean;
+  obscured: boolean;
+  parentMutationEpoch: number;
+  label: string;
+  skipReason: string;
+};
+const frameChildrenCache = new WeakMap<
+  Frame,
+  { mutationEpoch: number; children: ChildFrameGeometry[]; skipped: string[]; truncated: boolean }
+>();
+
+async function deterministicFrames(
+  page: Page,
+  topMutationEpoch: number
+): Promise<{ entries: GeometryFrameEntry[]; skipped: string[]; truncated: boolean }> {
+  const ordered: GeometryFrameEntry[] = [];
+  const skipped: string[] = [];
   let truncated = false;
-  const domChildren = async (frame: Frame): Promise<{ frames: Frame[]; truncated: boolean }> => {
+  const domChildren = async (
+    frame: Frame,
+    knownMutationEpoch?: number
+  ): Promise<{ children: ChildFrameGeometry[]; skipped: string[]; truncated: boolean }> => {
+    const mutationEpoch =
+      knownMutationEpoch ??
+      (await frame
+        .evaluate(() =>
+          (window as Window & {
+            __devBrowserPerceptionState?: { mutationEpoch: number };
+          }).__devBrowserPerceptionState?.mutationEpoch ?? -1
+        )
+        .catch(() => -1));
+    const cached = frameChildrenCache.get(frame);
+    if (
+      mutationEpoch >= 0 &&
+      cached?.mutationEpoch === mutationEpoch &&
+      cached.children.every((entry) => !entry.frame.isDetached())
+    )
+      return { children: cached.children, skipped: cached.skipped, truncated: cached.truncated };
     const result = await frame.evaluateHandle(({ maxFrames, maxWork }) => {
-      const elements: Element[] = [], stack: Element[] = [];
+      type Matrix = { a: number; b: number; c: number; d: number; e: number; f: number };
+      type Metadata = {
+        domIndex: number;
+        matrix: Matrix;
+        visible: boolean;
+        obscured: boolean;
+        label: string;
+        skipReason: string;
+      };
+      const elements: Element[] = [], metadata: Metadata[] = [], stack: Element[] = [];
       let work = 0, wasTruncated = false;
       const pushReverse = (children: HTMLCollection) => {
         const remaining = Math.max(0, maxWork - work - stack.length);
@@ -520,7 +583,106 @@ async function deterministicFrames(page: Page): Promise<{ entries: Array<{ frame
       pushReverse(document.documentElement?.children ?? document.children);
       while (stack.length > 0 && work < maxWork && elements.length < maxFrames) {
         const element = stack.pop()!; work += 1;
-        if (element.matches("iframe,frame")) elements.push(element);
+        if (element.matches("iframe,frame")) {
+          const html = element as HTMLElement;
+          const rect = element.getBoundingClientRect();
+          let current: Element | null = element;
+          let opacity = 1;
+          let visible = rect.width > 0 && rect.height > 0;
+          let clipLeft = rect.left, clipTop = rect.top, clipRight = rect.right, clipBottom = rect.bottom;
+          for (let depth = 0; visible && current && depth < 100; depth += 1) {
+            const currentStyle = getComputedStyle(current);
+            if (
+              currentStyle.display === "none" ||
+              currentStyle.visibility === "hidden" ||
+              currentStyle.visibility === "collapse" ||
+              currentStyle.contentVisibility === "hidden"
+            ) {
+              visible = false;
+              break;
+            }
+            const localOpacity = Number.parseFloat(currentStyle.opacity || "1");
+            opacity *= Number.isFinite(localOpacity) ? localOpacity : 1;
+            if (opacity <= 0.001) {
+              visible = false;
+              break;
+            }
+            const currentRect = current.getBoundingClientRect();
+            if (
+              currentStyle.display !== "contents" &&
+              [currentStyle.overflow, currentStyle.overflowX, currentStyle.overflowY].some((value) =>
+                /hidden|clip|scroll|auto/.test(value)
+              )
+            ) {
+              clipLeft = Math.max(clipLeft, currentRect.left);
+              clipTop = Math.max(clipTop, currentRect.top);
+              clipRight = Math.min(clipRight, currentRect.right);
+              clipBottom = Math.min(clipBottom, currentRect.bottom);
+              if (clipRight <= clipLeft || clipBottom <= clipTop) visible = false;
+            }
+            const root = current.getRootNode();
+            current = current.parentElement ?? (root instanceof ShadowRoot ? root.host : null);
+          }
+          const nearViewport =
+            rect.bottom >= -2 * innerHeight &&
+            rect.top <= 3 * innerHeight &&
+            rect.right >= -2 * innerWidth &&
+            rect.left <= 3 * innerWidth;
+          const skipReason = !visible
+            ? rect.width <= 0 || rect.height <= 0
+              ? "zero-size"
+              : "hidden"
+            : !nearViewport
+              ? "more than two viewports away"
+              : "";
+          visible &&= nearViewport;
+          const style = getComputedStyle(element);
+          const parsed = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+          const origin = style.transformOrigin.split(/\s+/).map((value) => Number.parseFloat(value));
+          const ox = origin[0] || 0, oy = origin[1] || 0;
+          const baseE = parsed.e + ox - parsed.a * ox - parsed.c * oy;
+          const baseF = parsed.f + oy - parsed.b * ox - parsed.d * oy;
+          const points = [
+            [0, 0],
+            [html.offsetWidth, 0],
+            [html.offsetWidth, html.offsetHeight],
+            [0, html.offsetHeight],
+          ].map(([x, y]) => ({
+            x: parsed.a * x! + parsed.c * y! + baseE,
+            y: parsed.b * x! + parsed.d * y! + baseF,
+          }));
+          const shiftX = rect.left - Math.min(...points.map((point) => point.x));
+          const shiftY = rect.top - Math.min(...points.map((point) => point.y));
+          const matrix = {
+            a: parsed.a,
+            b: parsed.b,
+            c: parsed.c,
+            d: parsed.d,
+            e: baseE + shiftX + parsed.a * html.clientLeft + parsed.c * html.clientTop,
+            f: baseF + shiftY + parsed.b * html.clientLeft + parsed.d * html.clientTop,
+          };
+          const hit = visible
+            ? document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+            : null;
+          const obscured = Boolean(
+            hit && hit !== element && !element.contains(hit) && !hit.contains(element)
+          );
+          const domIndex = elements.length;
+          elements.push(element);
+          metadata.push({
+            domIndex,
+            matrix,
+            visible,
+            obscured,
+            label: (
+              element.getAttribute("title") ||
+              element.getAttribute("name") ||
+              element.id ||
+              `frame-${domIndex + 1}`
+            ).replace(/\s+/g, " ").trim().slice(0, 100),
+            skipReason,
+          });
+        }
         const remaining = Math.max(0, maxWork - work - stack.length);
         const lightCount = Math.min(element.children.length, remaining);
         const shadow = element.shadowRoot?.children;
@@ -530,103 +692,155 @@ async function deterministicFrames(page: Page): Promise<{ entries: Array<{ frame
         for (let index = lightCount - 1; index >= 0; index -= 1) stack.push(element.children.item(index)!);
       }
       if (stack.length > 0 || elements.length >= maxFrames) wasTruncated = true;
-      return { elements, truncated: wasTruncated };
+      return { elements, metadata, truncated: wasTruncated };
     }, { maxFrames: MAX_FRAME_CANDIDATE_SCAN, maxWork: 1_000 });
     try {
       const truncatedHandle = await result.getProperty("truncated");
       const wasTruncated = await truncatedHandle.jsonValue() as boolean;
       await truncatedHandle.dispose();
+      const metadataHandle = await result.getProperty("metadata");
+      const metadata = await metadataHandle.jsonValue() as Array<Omit<ChildFrameGeometry, "frame">>;
+      await metadataHandle.dispose();
       const elementsHandle = await result.getProperty("elements");
       try {
         const properties = await elementsHandle.getProperties();
-        const frames: Frame[] = [];
+        const children: ChildFrameGeometry[] = [];
+        const skippedFrames: string[] = [];
         for (let index = 0; index < MAX_FRAME_CANDIDATE_SCAN; index += 1) {
           const handle = properties.get(String(index))?.asElement();
           if (!handle) break;
+          const geometry = metadata[index];
+          if (geometry && !geometry.visible) {
+            skippedFrames.push(`${geometry.label} (${geometry.skipReason})`);
+            await handle.dispose();
+            continue;
+          }
           const child = await handle.contentFrame();
-          if (child) frames.push(child);
+          if (child && geometry)
+            children.push({ frame: child, ...geometry, parentMutationEpoch: mutationEpoch });
           await handle.dispose();
         }
-        return { frames, truncated: wasTruncated };
+        if (mutationEpoch >= 0)
+          frameChildrenCache.set(frame, { mutationEpoch, children, skipped: skippedFrames, truncated: wasTruncated });
+        return { children, skipped: skippedFrames, truncated: wasTruncated };
       } finally { await elementsHandle.dispose(); }
     } finally { await result.dispose(); }
   };
-  const visit = async (frame: Frame, path: string[]) => {
+  const visit = async (entry: GeometryFrameEntry, knownMutationEpoch?: number) => {
     if (ordered.length >= MAX_FRAMES_PER_OBSERVATION) return;
-    const id = stableFrameId(page, frame);
-    ordered.push({ frame, id, path: [...path, id] });
-    const selected = await domChildren(frame);
+    ordered.push(entry);
+    const selected = await domChildren(entry.frame, knownMutationEpoch);
     truncated ||= selected.truncated;
-    const selectedSet = new Set(selected.frames);
-    const fallback = selected.truncated ? [] : frame.childFrames().filter((child) => !selectedSet.has(child))
-      .sort((left, right) => left.name().localeCompare(right.name()) || left.url().localeCompare(right.url()));
-    const remainingCandidates = Math.max(0, MAX_FRAME_CANDIDATE_SCAN - selected.frames.length);
-    if (fallback.length > remainingCandidates) truncated = true;
-    const candidates = [...selected.frames, ...fallback.slice(0, remainingCandidates)];
-    if (candidates.length > Math.max(0, MAX_FRAMES_PER_OBSERVATION - ordered.length)) truncated = true;
+    skipped.push(...selected.skipped);
+    const candidates = selected.children.filter((child) => child.visible && !child.frame.isDetached());
+    if (candidates.length > Math.max(0, MAX_FRAMES_PER_OBSERVATION - ordered.length))
+      truncated = true;
     for (const child of candidates) {
       if (ordered.length >= MAX_FRAMES_PER_OBSERVATION) break;
-      await visit(child, [...path, id]);
+      const id = stableFrameId(page, child.frame);
+      const matrixToTop = composeAffine(entry.matrix, child.matrix);
+      const ancestorsVisible = entry.inheritedVisible && child.visible;
+      cacheFrameGeometry(child.frame, {
+        parent: entry.frame,
+        parentMutationEpoch: child.parentMutationEpoch,
+        dependencies: [
+          ...entry.lineage.map((edge) => ({
+            parent: edge.parent,
+            mutationEpoch: edge.parentMutationEpoch,
+          })),
+          { parent: entry.frame, mutationEpoch: child.parentMutationEpoch },
+        ],
+        contentMatrix: child.matrix,
+        matrixToTop,
+        ancestorsVisible,
+      });
+      await visit({
+        frame: child.frame,
+        id,
+        path: [...entry.path, id],
+        matrix: matrixToTop,
+        inheritedVisible: ancestorsVisible,
+        inheritedObscured: entry.inheritedObscured || child.obscured,
+        lineage: [...entry.lineage, {
+          parent: entry.frame,
+          domIndex: child.domIndex,
+          matrix: child.matrix,
+          parentMutationEpoch: child.parentMutationEpoch,
+        }],
+      });
     }
   };
-  await visit(page.mainFrame(), []);
-  return { entries: ordered, truncated };
+  await visit({
+    frame: page.mainFrame(),
+    id: "F0",
+    path: ["F0"],
+    matrix: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+    inheritedVisible: true,
+    inheritedObscured: false,
+    lineage: [],
+  }, topMutationEpoch);
+  return { entries: ordered, skipped, truncated };
 }
 
-async function frameTransform(frame: Frame): Promise<{ x: number; y: number; scaleX: number; scaleY: number }> {
-  if (!frame.parentFrame()) return { x: 0, y: 0, scaleX: 1, scaleY: 1 };
-  const element = await frame.frameElement();
-  try {
-    const [box, metrics] = await Promise.all([
-      element.boundingBox(),
-      element.evaluate((node) => {
-        const html = node as HTMLElement;
-        return { clientLeft: html.clientLeft, clientTop: html.clientTop, offsetWidth: html.offsetWidth, offsetHeight: html.offsetHeight };
-      }),
-    ]);
-    if (!box || metrics.offsetWidth <= 0 || metrics.offsetHeight <= 0)
-      throw new Error("frame element has no stable box");
-    const scaleX = box.width / metrics.offsetWidth, scaleY = box.height / metrics.offsetHeight;
-    return { x: box.x + metrics.clientLeft * scaleX, y: box.y + metrics.clientTop * scaleY, scaleX, scaleY };
-  } finally {
-    await element.dispose();
-  }
-}
-
-async function frameChainObscured(frame: Frame): Promise<boolean> {
-  let child = frame;
-  while (child.parentFrame()) {
-    const element = await child.frameElement();
-    try {
-      const obscured = await element.evaluate((node) => {
-        const rect = (node as Element).getBoundingClientRect();
-        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-        return Boolean(hit && hit !== node && !node.contains(hit) && !hit.contains(node));
-      });
-      if (obscured) return true;
-    } finally {
-      await element.dispose();
+async function batchedTargetObstructions(
+  pending: Array<{
+    recordIndex: number;
+    lineage: FrameLineageEdge[];
+    localPoint: { x: number; y: number };
+  }>
+): Promise<Set<number>> {
+  const grouped = new Map<
+    Frame,
+    Array<{ recordIndex: number; domIndex: number; point: { x: number; y: number } }>
+  >();
+  for (const target of pending) {
+    let point = target.localPoint;
+    for (let index = target.lineage.length - 1; index >= 0; index -= 1) {
+      const edge = target.lineage[index]!;
+      point = projectPoint(edge.matrix, point);
+      const requests = grouped.get(edge.parent) ?? [];
+      requests.push({ recordIndex: target.recordIndex, domIndex: edge.domIndex, point });
+      grouped.set(edge.parent, requests);
     }
-    child = child.parentFrame()!;
   }
-  return false;
-}
-
-async function targetObscuredAcrossFrames(frame: Frame, localPoint: { x: number; y: number }): Promise<boolean> {
-  let child = frame, point = localPoint;
-  while (child.parentFrame()) {
-    point = projectPoint(await frameContentMatrix(child), point);
-    const element = await child.frameElement();
-    try {
-      const obscured = await element.evaluate((node, projected) => {
-        const hit = document.elementFromPoint(projected.x, projected.y);
-        return Boolean(hit && hit !== node && !node.contains(hit) && !hit.contains(node));
-      }, point);
-      if (obscured) return true;
-    } finally { await element.dispose(); }
-    child = child.parentFrame()!;
-  }
-  return false;
+  const obscured = new Set<number>();
+  await Promise.all(
+    [...grouped].map(async ([parent, requests]) => {
+      if (parent.isDetached()) return;
+      const results = await parent
+        .evaluate((checks) => {
+          const elements: Element[] = [], stack: Element[] = [];
+          const pushReverse = (children: HTMLCollection) => {
+            for (let index = children.length - 1; index >= 0; index -= 1)
+              stack.push(children.item(index)!);
+          };
+          pushReverse(document.documentElement?.children ?? document.children);
+          let work = 0;
+          while (stack.length > 0 && work < 1_000 && elements.length < 128) {
+            const element = stack.pop()!;
+            work += 1;
+            if (element.matches("iframe,frame")) elements.push(element);
+            const shadow = element.shadowRoot?.children;
+            if (shadow) pushReverse(shadow);
+            pushReverse(element.children);
+          }
+          return checks.map(({ recordIndex, domIndex, point }) => {
+            const element = elements[domIndex];
+            const hit = document.elementFromPoint(point.x, point.y);
+            return {
+              recordIndex,
+              obscured: Boolean(
+                !element ||
+                (hit && hit !== element && !element.contains(hit) && !hit.contains(element))
+              ),
+            };
+          });
+        }, requests)
+        .catch(() => requests.map(({ recordIndex }) => ({ recordIndex, obscured: true })));
+      for (const result of results) if (result.obscured) obscured.add(result.recordIndex);
+    })
+  );
+  return obscured;
 }
 
 export async function collectPageState(
@@ -656,6 +870,7 @@ export async function collectPageState(
     maxNodes: bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000),
     scope: scope ?? null,
     textOnly: options.textOnly ?? false,
+    verbose: options.verbose ?? false,
   });
   if (options.reuseIfEpoch !== undefined && !options.continuation) {
     const cached = perceptionCache.get(page)?.get(cacheKey);
@@ -790,57 +1005,107 @@ export async function collectPageState(
   // frame-scoped: restrict collection to the top frame so budgets are spent
   // only inside the selected subtree instead of also walking every iframe.
   const selectedFrames = scope
-    ? { entries: [{ frame: page.mainFrame(), id: "F0", path: ["F0"] }], truncated: false }
-    : await deterministicFrames(page);
+    ? {
+        entries: [{
+          frame: page.mainFrame(),
+          id: "F0",
+          path: ["F0"],
+          matrix: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+          inheritedVisible: true,
+          inheritedObscured: false,
+          lineage: [],
+        } satisfies GeometryFrameEntry],
+        skipped: [],
+        truncated: false,
+      }
+    : await deterministicFrames(page, initialTop.mutationEpoch);
   const frames = selectedFrames.entries;
   const warnings: string[] = [];
   const registered: RegisteredFrame[] = [];
   const records: PerceptionElement[] = [];
+  const pendingFrameHitTests: Array<{
+    recordIndex: number;
+    lineage: FrameLineageEdge[];
+    localPoint: { x: number; y: number };
+  }> = [];
   let top: Awaited<ReturnType<typeof collectRealm>> | undefined;
   let collectionTruncated = selectedFrames.truncated;
   for (const entry of frames) {
     try {
-      const [raw, matrix, inheritedVisible] = await Promise.all([
-        entry.id === "F0" ? Promise.resolve(initialTop) : entry.frame.evaluate(collectRealm, { full, legacyRefs: false, maxRecords: Math.max(0, MAX_RECORDS_PER_OBSERVATION - records.length), maxWork: MAX_WORK_PER_FRAME }),
-        frameToTopMatrix(entry.frame),
-        frameAncestorsVisible(entry.frame),
-      ]);
+      const raw = await (entry.id === "F0"
+        ? Promise.resolve(initialTop)
+        : entry.frame.evaluate(collectRealm, {
+            full,
+            legacyRefs: false,
+            maxRecords: Math.max(0, MAX_RECORDS_PER_OBSERVATION - records.length),
+            maxWork: MAX_WORK_PER_FRAME,
+          }));
       if (entry.id === "F0") top = raw;
       registered.push({ id: entry.id, frame: entry.frame, realmToken: raw.realmToken, path: entry.path, url: raw.url.slice(0, 500), name: entry.frame.name().slice(0, 100) });
       collectionTruncated ||= raw.truncated;
       for (const record of raw.records) {
         if (records.length >= MAX_RECORDS_PER_OBSERVATION) { collectionTruncated = true; break; }
         const ref = record.ref && entry.id !== "F0" ? `${entry.id}:${record.ref}` : record.ref;
-        const projected = projectRect(matrix, record.box);
-        const box = inheritedVisible ? projected.box : { x: 0, y: 0, width: 0, height: 0 };
-        const frameObscured = inheritedVisible && entry.id !== "F0" && record.actionable && record.visible
-          ? await targetObscuredAcrossFrames(entry.frame, { x: record.box.x + record.box.width / 2, y: record.box.y + record.box.height / 2 }) : false;
+        const projected = projectRect(entry.matrix, record.box);
+        const box = entry.inheritedVisible ? projected.box : { x: 0, y: 0, width: 0, height: 0 };
         const topViewport = top?.viewport ?? page.viewportSize() ?? raw.viewport;
+        const inViewport =
+          entry.inheritedVisible &&
+          record.visible &&
+          box.x + box.width >= 0 &&
+          box.y + box.height >= 0 &&
+          box.x <= topViewport.width &&
+          box.y <= topViewport.height;
+        const recordIndex = records.length;
         records.push({
           ...record,
           ref,
           box,
           quad: projected.quad,
-          visible: inheritedVisible && record.visible,
-          actionable: inheritedVisible && record.actionable,
-          scrollable: inheritedVisible && record.scrollable,
-          obscured: record.obscured || frameObscured,
-          inViewport: inheritedVisible && record.visible && box.x + box.width >= 0 && box.y + box.height >= 0 && box.x <= topViewport.width && box.y <= topViewport.height,
+          visible: entry.inheritedVisible && record.visible,
+          actionable: entry.inheritedVisible && record.actionable,
+          scrollable: entry.inheritedVisible && record.scrollable,
+          obscured: record.obscured || entry.inheritedObscured,
+          inViewport,
           frameId: entry.id,
           framePath: entry.path,
           frameUrl: raw.url.slice(0, 500),
           frameName: entry.frame.name().slice(0, 100),
           frameDocumentId: raw.realmToken.slice(0, 100),
         });
+        if (
+          entry.id !== "F0" &&
+          entry.lineage.length > 0 &&
+          record.actionable &&
+          record.visible &&
+          inViewport
+        )
+          pendingFrameHitTests.push({
+            recordIndex,
+            lineage: entry.lineage,
+            localPoint: {
+              x: record.box.x + record.box.width / 2,
+              y: record.box.y + record.box.height / 2,
+            },
+          });
       }
     } catch (error) {
       if (entry.id === "F0") throw error;
       warnings.push(`Frame ${entry.id} could not be inspected because it detached, navigated, or became inaccessible`);
     }
   }
+  const crossFrameObstructions = await batchedTargetObstructions(pendingFrameHitTests);
+  for (const recordIndex of crossFrameObstructions) {
+    const record = records[recordIndex];
+    if (record) record.obscured = true;
+  }
   if (!top) throw new AgentProtocolError("PAGE_CLOSED", "Top document could not be inspected", true);
   if (selectedFrames.truncated)
     warnings.push(`Frame candidate scan was truncated at ${MAX_FRAME_CANDIDATE_SCAN} direct children before inspection`);
+  if (options.verbose && selectedFrames.skipped.length > 0)
+    warnings.push(
+      `Skipped hidden, zero-size, or distant frames: ${selectedFrames.skipped.slice(0, 20).join(", ")}`
+    );
   registerFrames(page, top.realmToken, registered);
   const maxNodes = bounded(options.maxNodes, DEFAULTS.maxNodes, 1_000);
   const offset = decodeCursor(options.continuation);

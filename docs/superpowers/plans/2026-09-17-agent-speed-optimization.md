@@ -265,9 +265,9 @@ Conception :
 
 **Fichiers :** `daemon/src/actionability.ts`.
 
-- [ ] Remplacer la séquence de ~20 appels par au plus 3 évaluations in-page : (1) `resolveAndInspect` : trouve l'élément via `byRef`, calcule `explicitlyHidden`, `role/tag`, le descendant ou l'ancêtre interactif de repli, l'applicabilité (`validateApplicability` portée in-page), `actualRef`, `shadowContext`, la box, et pose l'attribut jeton ; (2) `scrollAndStabilize` : `scrollIntoView` si demandé, puis stabilité par deux `requestAnimationFrame` consécutifs avec la tolérance de jitter existante (1 px) et le plafond de dérive (5 px) mais un budget maximal de 120 ms au lieu de 200 à 500 ms ; (3) `hitTest` : `elementFromPoint` au centre, obstruction, box finale et sameElement (comparer l'identité in-page avec le jeton).
-- [ ] Conserver `locator`, `cleanup`, `box`, `quad`, `resolvedBy`, `actual`, `scroll`, `frameId`, `framePath`, `shadowContext` dans le résultat pour ne pas toucher aux appelants.
-- [ ] Les frames : `frameAncestorsVisible` est appelé une fois, pas deux.
+- [x] Remplacer la séquence de ~20 appels par au plus 3 évaluations in-page : (1) `resolveAndInspect` : trouve l'élément via `byRef`, calcule `explicitlyHidden`, `role/tag`, le descendant ou l'ancêtre interactif de repli, l'applicabilité (`validateApplicability` portée in-page), `actualRef`, `shadowContext`, la box, et pose l'attribut jeton ; (2) `scrollAndStabilize` : `scrollIntoView` si demandé, puis stabilité par deux `requestAnimationFrame` consécutifs avec la tolérance de jitter existante (1 px) et le plafond de dérive (5 px) mais un budget maximal de 120 ms au lieu de 200 à 500 ms ; (3) `hitTest` : `elementFromPoint` au centre, obstruction, box finale et sameElement (comparer l'identité in-page avec le jeton).
+- [x] Conserver `locator`, `cleanup`, `box`, `quad`, `resolvedBy`, `actual`, `scroll`, `frameId`, `framePath`, `shadowContext` dans le résultat pour ne pas toucher aux appelants.
+- [x] Les frames : `frameAncestorsVisible` est appelé une fois, pas deux.
 
 **Tests :** `actionability.test.ts` existant doit rester vert sans changement d'assertions (hidden, disabled, obscured, ancestor/descendant fallback, stability). Ajouter : nombre de messages CDP pour un `resolveActionTarget` ≤ 25 (compter via `page.context().newCDPSession` n'est pas possible ; utiliser un compteur sur `locator.evaluate`/`page.evaluate` espionnés) ; cible qui bouge réellement (animation de translation de 200 px) toujours refusée.
 
@@ -293,10 +293,10 @@ Conception :
 
 **Fichiers :** `daemon/src/perception/collector.ts` (`deterministicFrames`, boucle sur `frames`), `daemon/src/frame-geometry.ts`, `daemon/src/live-snapshot.ts` (`liveFrames`).
 
-- [ ] Dans le document parent, un seul `evaluate` liste les `iframe,frame` (ordre DOM, bornes existantes) et renvoie pour chacun : rect, `clientLeft/Top`, matrice de transform, visibilité héritée (même logique que `frameAncestorsVisible` mais calculée in-page pour tous), obstruction au centre. Associer à `frame.childFrames()` par `frameElement()` uniquement pour les frames retenus (visibles, non 0×0).
-- [ ] Ignorer par défaut les frames invisibles, 0×0, ou hors viewport de plus de 2 écrans (publicités, trackers) ; les lister dans `warnings` seulement sous `--verbose`.
-- [ ] `frameToTopMatrix` et `frameAncestorsVisible` deviennent des lectures du cache calculé par ce passage (invalidé par l'epoch du parent).
-- [ ] `targetObscuredAcrossFrames` n'est appelé que pour les éléments d'un frame qui sont `inViewport`, et par lot (une évaluation par frame avec la liste des points).
+- [x] Dans le document parent, un seul `evaluate` liste les `iframe,frame` (ordre DOM, bornes existantes) et renvoie pour chacun : rect, `clientLeft/Top`, matrice de transform, visibilité héritée (même logique que `frameAncestorsVisible` mais calculée in-page pour tous), obstruction au centre. Associer à `frame.childFrames()` par `frameElement()` uniquement pour les frames retenus (visibles, non 0×0).
+- [x] Ignorer par défaut les frames invisibles, 0×0, ou hors viewport de plus de 2 écrans (publicités, trackers) ; les lister dans `warnings` seulement sous `--verbose`.
+- [x] `frameToTopMatrix` et `frameAncestorsVisible` deviennent des lectures du cache calculé par ce passage (invalidé par l'epoch du parent).
+- [x] `targetObscuredAcrossFrames` n'est appelé que pour les éléments d'un frame qui sont `inViewport`, et par lot (une évaluation par frame avec la liste des points).
 
 **Tests :** `frame-shadow.test.ts`, `frame-wait.test.ts`, `frame-shadow-actions.test.ts` verts ; ajouter un test qui compte les `frameElement()` par collecte (espion) : ≤ 1 par frame retenu ; frames masqués non collectés.
 
@@ -306,10 +306,12 @@ Conception :
 
 **Fichiers :** `daemon/src/visual-artifacts.ts`, `daemon/src/interactive-actions.ts` (bloc `--shot`), `cli/src/main.rs` (`--shot-format`, `--shot-scale`).
 
-- [ ] Annotation via un overlay DOM injecté avant capture (un `<div>` par label avec `pointer-events:none`, retiré dans `finally`) au lieu de `decodePng` / réencodage. Conserver le chemin actuel derrière `--annotate-mode raster` pour compatibilité.
-- [ ] Format `jpeg` qualité 80 par défaut pour les captures d'action (`--shot` sur click/type/...), `png` conservé pour `shot` explicite et `--shot-format png`. Mettre à jour `mediaType` dans `ScreenshotArtifact`.
-- [ ] `--shot-scale css` (défaut) capture à `deviceScaleFactor: 1` via `Page.captureScreenshot` `clip.scale = 1 / DPR`, ce qui aligne les pixels de l'image sur les CSS px (supprime la confusion DPR 1,25 notée dans le field report) et réduit la taille du fichier.
-- [ ] Réutiliser la perception de l'action (2.2) pour les labels.
+- [x] Annotation via un overlay DOM injecté avant capture (un `<div>` par label avec `pointer-events:none`, retiré dans `finally`) au lieu de `decodePng` / réencodage. Conserver le chemin actuel derrière `--annotate-mode raster` pour compatibilité.
+- [x] Format `jpeg` qualité 80 par défaut pour les captures d'action (`--shot` sur click/type/...), `png` conservé pour `shot` explicite et `--shot-format png`. Mettre à jour `mediaType` dans `ScreenshotArtifact`.
+- [x] `--shot-scale css` (défaut) capture une image alignée sur les pixels CSS via `Page.captureScreenshot` et normalise les dimensions si Chromium applique un zoom ou un DPR inattendu. Chromium attend des coordonnées de clip en CSS px : `clip.scale = 1` produit la taille CSS exacte, alors que `1 / DPR` réduisait l'image deux fois sur DPR 2.
+- [x] Réutiliser la perception de l'action (2.2) pour les labels.
+
+> Mesure PR 3 (2026-09-17) : `raw: resolveActionTarget` atteint 35 ms et 12 messages CDP ; le clic lourd complet 168 ms et 32 messages. Le test dédié à trois iframes reste sous 80 messages et un `frameElement()` par frame retenue. `click --ref --shot` prend 493 ms contre 519 ms sans capture sur la fixture. Sur le Chrome live, le clic d'un champ LinkedIn a réussi et le JPEG qualité 80 représente 37,9 % du PNG. Détails dans `docs/perf/2026-09-17-pr3.md` et `docs/field-reports/2026-09-17-speed-pr3.md`.
 
 **Tests :** `visual-artifacts.test.ts` : overlay retiré même en cas d'échec de capture ; image JPEG valide ; dimensions = viewport CSS quand `scale css` sur une page DPR 2 (`page.setViewportSize` + `deviceScaleFactor` via un contexte de test) ; `annotate-mode raster` inchangé.
 

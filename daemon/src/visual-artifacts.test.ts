@@ -1,6 +1,7 @@
 import { readFile, rm } from "node:fs/promises";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { chromium } from "playwright";
 
 import { BrowserManager } from "./browser-manager.js";
 import { collectPageState } from "./perception/collector.js";
@@ -68,6 +69,54 @@ describe.sequential("visual artifacts", () => {
     );
     expect(pixel.slice(0, 3)).toEqual([0, 0, 255]);
     await rm(artifact.path, { force: true });
+  });
+
+  it("captures action JPEGs at quality 80 with one output pixel per CSS pixel at DPR 2", async () => {
+    const isolatedBrowser = await chromium.launch({ headless: true });
+    const context = await isolatedBrowser.newContext({
+      viewport: { width: 360, height: 200 },
+      deviceScaleFactor: 2,
+    });
+    const page = await context.newPage();
+    try {
+      await page.setContent(`<style>html,body{margin:0;background:#2468ac}</style><button>JPEG target</button>`);
+      const state = await collectPageState(page);
+      const result = await captureVisualArtifacts(page, state, {
+        screenshotName: `visual-tests/action-${Date.now()}.jpg`,
+        format: "jpeg",
+        scale: "css",
+      });
+      const artifact = result.screenshot!;
+      const jpeg = await readFile(artifact.path);
+      expect([...jpeg.subarray(0, 2)]).toEqual([0xff, 0xd8]);
+      expect(artifact).toMatchObject({
+        mediaType: "image/jpeg",
+        width: 360,
+        height: 200,
+        coordinateSpace: { screenshotScale: "css", devicePixelRatio: 2 },
+      });
+      await rm(artifact.path, { force: true });
+    } finally {
+      await isolatedBrowser.close();
+    }
+  });
+
+  it("keeps raster annotation as an explicit PNG compatibility mode", async () => {
+    const page = await manager.getPage("visual", "main");
+    await page.setViewportSize({ width: 320, height: 180 });
+    await page.setContent(`<button style="margin:40px;width:100px;height:40px">Raster target</button>`);
+    const state = await collectPageState(page);
+    const result = await captureVisualArtifacts(page, state, {
+      annotate: true,
+      annotateMode: "raster",
+      format: "png",
+      annotatedName: `visual-tests/raster-${Date.now()}.png`,
+    });
+    const png = await readFile(result.annotatedScreenshot!.path);
+    expect(png.toString("ascii", 1, 4)).toBe("PNG");
+    expect(result.annotatedScreenshot).toMatchObject({ mediaType: "image/png", width: 320, height: 180 });
+    await expect(page.locator("[data-dev-browser-visual-overlay]").count()).resolves.toBe(0);
+    await rm(result.annotatedScreenshot!.path, { force: true });
   });
 
   it("uses bounded CDP captures for animated viewport, document, crop, and annotated screenshots", async () => {

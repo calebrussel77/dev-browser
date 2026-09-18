@@ -176,6 +176,53 @@ const CLI_AFTER_LONG_HELP: &str = include_str!("../llm-guide.txt");
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ShotFormat {
+    Png,
+    Jpeg,
+}
+
+impl ShotFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ShotScale {
+    #[default]
+    Css,
+    Device,
+}
+
+impl ShotScale {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Css => "css",
+            Self::Device => "device",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum AnnotateMode {
+    #[default]
+    Dom,
+    Raster,
+}
+
+impl AnnotateMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dom => "dom",
+            Self::Raster => "raster",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "dev-browser")]
 #[command(about = "Control browsers with JavaScript automation scripts")]
@@ -283,11 +330,20 @@ struct PageActionArgs {
     )]
     shot_timeout: Option<u32>,
 
+    #[arg(long, value_enum, help = "Encode screenshots as PNG or JPEG (action --shot defaults to JPEG; shot defaults to PNG)")]
+    shot_format: Option<ShotFormat>,
+
+    #[arg(long, value_enum, default_value_t, help = "Use one pixel per CSS pixel or preserve device-pixel density")]
+    shot_scale: ShotScale,
+
     #[arg(
         long,
         help = "Draw deterministic ref labels on the returned screenshot"
     )]
     annotate: bool,
+
+    #[arg(long, value_enum, default_value_t, help = "Render annotations in a temporary DOM overlay or the PNG compatibility renderer")]
+    annotate_mode: AnnotateMode,
 
     #[arg(
         long,
@@ -899,6 +955,12 @@ enum Command {
         full_page: bool,
         #[arg(long)]
         annotate: bool,
+        #[arg(long, value_enum, default_value_t)]
+        annotate_mode: AnnotateMode,
+        #[arg(long, value_enum)]
+        shot_format: Option<ShotFormat>,
+        #[arg(long, value_enum, default_value_t)]
+        shot_scale: ShotScale,
         #[arg(
             long,
             help = "Include compact actionable element metadata in the response"
@@ -1040,7 +1102,10 @@ fn run() -> Result<i32, Box<dyn Error>> {
             "main",
             None,
             false,
+            "dom",
             false,
+            None,
+            "css",
             false,
             false,
             None,
@@ -1393,6 +1458,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
             padding,
             full_page,
             annotate,
+            annotate_mode,
+            shot_format,
+            shot_scale,
             elements,
             verbose,
             shot_timeout,
@@ -1415,7 +1483,10 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 &target.page,
                 Some(file),
                 *annotate,
+                annotate_mode.as_str(),
                 *full_page,
+                shot_format.map(ShotFormat::as_str),
+                shot_scale.as_str(),
                 *elements,
                 *verbose,
                 shot_timeout.map(u64::from),
@@ -1644,7 +1715,10 @@ fn run_page_action(
         &output.target.page,
         output.shot.as_deref(),
         output.annotate,
+        output.annotate_mode.as_str(),
         output.full_page,
+        output.shot_format.map(ShotFormat::as_str),
+        output.shot_scale.as_str(),
         output.elements,
         output.verbose,
         output.shot_timeout.map(u64::from),
@@ -1716,7 +1790,10 @@ fn run_interactive(
     page: &str,
     shot: Option<&str>,
     annotate: bool,
+    annotate_mode: &str,
     full_page: bool,
+    shot_format: Option<&str>,
+    shot_scale: &str,
     elements: bool,
     verbose: bool,
     shot_timeout: Option<u64>,
@@ -1736,7 +1813,10 @@ fn run_interactive(
             page,
             shot,
             annotate,
+            annotate_mode,
             full_page,
+            shot_format,
+            shot_scale,
             shot_timeout_ms: shot_timeout.unwrap_or_else(|| timeout_ms.min(8_000)),
             connect: cli.connect.as_deref(),
             headless: cli.headless,
@@ -2066,8 +2146,8 @@ mod tests {
     use super::{
         apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
         build_video_request, cli_error_exit_code, format_json_result, parse_video_size,
-        read_text_stream, stream_responses, Cli, Command, ResultMode, SessionCommand, TraceCommand,
-        VideoCommand,
+        read_text_stream, stream_responses, AnnotateMode, Cli, Command, ResultMode,
+        SessionCommand, ShotFormat, ShotScale, TraceCommand, VideoCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2356,7 +2436,13 @@ mod tests {
             "--continuation",
             "eyJ2IjoxLCJvZmZzZXQiOjN9",
             "--annotate",
+            "--annotate-mode",
+            "raster",
             "--full-page",
+            "--shot-format",
+            "jpeg",
+            "--shot-scale",
+            "device",
             "--elements",
             "--verbose",
             "--shot-timeout",
@@ -2487,12 +2573,23 @@ mod tests {
             "--ref",
             "R2",
             "--annotate",
+            "--annotate-mode",
+            "raster",
             "--full-page",
+            "--shot-format",
+            "jpeg",
+            "--shot-scale",
+            "device",
         ])
         .unwrap();
         assert!(matches!(
             click.command,
-            Some(Command::Click { ref output, .. }) if output.annotate && output.full_page
+            Some(Command::Click { ref output, .. })
+                if output.annotate
+                    && matches!(output.annotate_mode, AnnotateMode::Raster)
+                    && output.full_page
+                    && matches!(output.shot_format, Some(ShotFormat::Jpeg))
+                    && matches!(output.shot_scale, ShotScale::Device)
         ));
 
         let shot = Cli::try_parse_from([

@@ -179,13 +179,13 @@ describe.sequential("scoped frame and shadow waits", () => {
       else document.querySelector<HTMLElement>("#wrapper")!.style.opacity = "0";
     }, mode);
     const hidden = await collectPageState(page, { full: true });
-    const hiddenTarget = hidden.elements.find((element) => element.ref === target.ref)!;
-    expect(hiddenTarget).toMatchObject({ visible: false, actionable: false, inViewport: false, box: { width: 0, height: 0 } });
+    const hiddenTarget = hidden.elements.find((element) => element.ref === target.ref);
+    expect(hiddenTarget).toBeUndefined();
     expect(findTargets(hidden.elements, { name: "Nested visibility target", nameMode: "exact", scope: "visible", states: [] }, 5).matches).toEqual([]);
-    const waited = await runWithWait(page, { collect: async () => null, protocolVersion: 2 }, { mode: "all", timeoutMs: 200, conditions: [{ kind: "ref", ref: target.ref, state: "hidden" }, { kind: "ref", ref: target.ref, state: "attached" }] }, async () => {});
+    const waited = await runWithWait(page, { collect: async () => null, protocolVersion: 2 }, { mode: "all", timeoutMs: 200, conditions: [{ kind: "ref", ref: target.ref, state: "hidden" }, { kind: "ref", ref: target.ref, state: "detached" }] }, async () => {});
     expect(waited.waitResult.passed).toHaveLength(2);
     await expect(runWithWait(page, { collect: async () => null, protocolVersion: 2 }, { mode: "all", timeoutMs: 60, conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "Nested visibility target" }] }, async () => {})).rejects.toMatchObject({ code: "WAIT_TIMEOUT" });
-    await expect(resolveActionTarget(page, target.ref, { timeoutMs: 200, scroll: false, hitTest: true, applicability: "pointer" })).rejects.toMatchObject({ code: "TARGET_HIDDEN" });
+    await expect(resolveActionTarget(page, target.ref, { timeoutMs: 200, scroll: false, hitTest: true, applicability: "pointer" })).rejects.toMatchObject({ code: "FRAME_DETACHED" });
   }, 20_000);
 
   it("keeps protocol v1 waits top-document light-DOM and honors legacy refs without observe", async () => {

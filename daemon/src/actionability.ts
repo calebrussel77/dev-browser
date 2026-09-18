@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ElementHandle, Frame, Locator, Page } from "playwright";
 import { AgentProtocolError } from "./agent-protocol.js";
 import { parseScopedRef, registeredFrame } from "./frame-registry.js";
-import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, projectPoint, projectRect } from "./frame-geometry.js";
+import { frameAncestorsVisible, frameContentMatrix, frameToTopMatrix, invalidateFrameGeometry, projectPoint, projectRect } from "./frame-geometry.js";
 import { observeRecoveryCommand } from "./recovery-command.js";
 
 export type ActionApplicability =
@@ -312,93 +312,172 @@ export async function resolveActionTarget(
   const token = `dev-browser-${randomUUID()}`;
   const selector = `[data-dev-browser-action-ref="${token}"]`;
   let identity: ElementHandle<Element> | null = null;
-  let previousActionAttribute: string | null = null;
-  const handle = await context.evaluateHandle(({ requestedRef, legacyRefs }) => {
-      const state = (
-        window as Window & { __devBrowserPerceptionState?: { refs: WeakMap<Element, string>; byRef?: Map<string, WeakRef<Element>> } }
-      ).__devBrowserPerceptionState;
-      const candidate = state?.byRef?.get(requestedRef)?.deref();
-      if (candidate && candidate.isConnected && state?.refs.get(candidate) === requestedRef) return candidate;
-      return legacyRefs ? document.querySelector(`[data-dev-browser-ref="${requestedRef}"]`) : null;
-    }, { requestedRef: scoped.localRef, legacyRefs: options.legacyRefs === true });
-  identity = handle.asElement();
+  const resolved = await context.evaluateHandle(
+    ({ requestedRef, legacyRefs, ownedToken, applicability }) => {
+      type Failure = {
+        code: "TARGET_MISSING" | "TARGET_HIDDEN" | "TARGET_DISABLED";
+        message: string;
+        details?: Record<string, unknown>;
+      };
+      type Inspection = {
+        actualRef: string;
+        resolvedBy: "self" | "descendant" | "ancestor";
+      };
+      type ActionWindow = Window & {
+        __devBrowserPerceptionState?: {
+          refs: WeakMap<Element, string>;
+          byRef?: Map<string, WeakRef<Element>>;
+        };
+        __devBrowserActionTargets?: Map<
+          string,
+          { previous: string | null; inspection: Inspection }
+        >;
+      };
+      const failure = (code: Failure["code"], message: string, details?: Failure["details"]) => ({
+        error: { code, message, details } satisfies Failure,
+      });
+      const actionWindow = window as ActionWindow;
+      const state = actionWindow.__devBrowserPerceptionState;
+      const observed = state?.byRef?.get(requestedRef)?.deref();
+      const original =
+        observed && observed.isConnected && state?.refs.get(observed) === requestedRef
+          ? observed
+          : legacyRefs
+            ? document.querySelector(`[data-dev-browser-ref="${requestedRef}"]`)
+            : null;
+      if (!original) return failure("TARGET_MISSING", "Target ref is missing", { requestedRef });
+
+      const originalStyle = getComputedStyle(original);
+      if (
+        original.hasAttribute("hidden") ||
+        original.getAttribute("aria-hidden") === "true" ||
+        originalStyle.display === "none" ||
+        originalStyle.visibility === "hidden" ||
+        originalStyle.visibility === "collapse"
+      )
+        return failure("TARGET_HIDDEN", "Target is explicitly hidden");
+
+      const visible = (element: Element) => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return (
+          element.isConnected &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.visibility !== "collapse" &&
+          style.contentVisibility !== "hidden" &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+      };
+      let element = original;
+      let resolvedBy: Inspection["resolvedBy"] = "self";
+      const originalTag = original.tagName.toLowerCase();
+      if (original.getAttribute("role") === "link" || originalTag === "a") {
+        const descendant = original.querySelector(
+          "button,[role='button'],input[type='button'],input[type='submit'],input[type='reset']"
+        );
+        if (descendant) {
+          element = descendant;
+          resolvedBy = "descendant";
+        }
+      }
+      if (!visible(element)) {
+        const ancestor = original.parentElement?.closest(
+          "button,a[href],[role='button'],[role='link']"
+        );
+        if (ancestor && visible(ancestor)) {
+          element = ancestor;
+          resolvedBy = "ancestor";
+        }
+      }
+      if (!visible(element)) return failure("TARGET_HIDDEN", "Target is hidden");
+
+      const control = element as HTMLInputElement;
+      const tag = element.tagName.toLowerCase();
+      const inputType = tag === "input" ? control.type.toLowerCase() : "";
+      const disabled =
+        ("disabled" in control && Boolean(control.disabled)) ||
+        element.getAttribute("aria-disabled") === "true";
+      const readonly =
+        ("readOnly" in control && Boolean(control.readOnly)) ||
+        element.getAttribute("aria-readonly") === "true";
+      if (disabled || readonly)
+        return failure("TARGET_DISABLED", "Target is disabled or readonly");
+      if (applicability === "select" && tag !== "select")
+        return failure("TARGET_MISSING", "Select requires a select control");
+      if (applicability === "check" && (tag !== "input" || !["checkbox", "radio"].includes(inputType)))
+        return failure("TARGET_MISSING", "Check requires a checkbox or radio control");
+      if (applicability === "upload" && (tag !== "input" || inputType !== "file"))
+        return failure("TARGET_MISSING", "Upload requires a file input");
+      if (
+        (applicability === "type" || applicability === "paste") &&
+        tag !== "textarea" &&
+        !(element as HTMLElement).isContentEditable &&
+        (tag !== "input" ||
+          ["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(inputType))
+      )
+        return failure(
+          "TARGET_MISSING",
+          `${applicability === "type" ? "Type" : "Paste"} requires an editable text control`
+        );
+      if (applicability === "drag-source" && !(element as HTMLElement).draggable)
+        return failure("TARGET_MISSING", "Drag requires a draggable source");
+
+      const actualRef = state?.refs.get(element) ?? requestedRef;
+      const targets = actionWindow.__devBrowserActionTargets ?? new Map();
+      actionWindow.__devBrowserActionTargets = targets;
+      targets.set(ownedToken, {
+        previous: element.getAttribute("data-dev-browser-action-ref"),
+        inspection: { actualRef, resolvedBy },
+      });
+      element.setAttribute("data-dev-browser-action-ref", ownedToken);
+      return { element };
+    },
+    {
+      requestedRef: scoped.localRef,
+      legacyRefs: options.legacyRefs === true,
+      ownedToken: token,
+      applicability: options.applicability,
+    }
+  );
+  const elementProperty = await resolved.getProperty("element");
+  identity = elementProperty.asElement();
   if (!identity) {
-    await handle.dispose();
-    return fail(pageName, "TARGET_MISSING", `Target ref "${ref}" is missing`, { ref });
+    const errorProperty = await resolved.getProperty("error");
+    const error = (await errorProperty.jsonValue()) as
+      | { code: "TARGET_MISSING" | "TARGET_HIDDEN" | "TARGET_DISABLED"; message: string; details?: Record<string, unknown> }
+      | undefined;
+    await errorProperty.dispose();
+    await elementProperty.dispose();
+    await resolved.dispose();
+    return fail(pageName, error?.code ?? "TARGET_MISSING", error?.message ?? `Target ref "${ref}" is missing`, error?.details ?? { ref });
   }
-  previousActionAttribute = await identity.getAttribute("data-dev-browser-action-ref");
-  await identity.evaluate((element, ownedToken) => element.setAttribute("data-dev-browser-action-ref", ownedToken), token);
-  let original = context.locator(selector).first();
+  await resolved.dispose();
+  const locator = context.locator(selector).first();
   const cleanup = async () => {
     const owned = identity;
     identity = null;
     if (owned) {
-      await owned.evaluate((element, state) => {
-        if (element.getAttribute("data-dev-browser-action-ref") !== state.token) return;
-        if (state.previous === null) element.removeAttribute("data-dev-browser-action-ref");
-        else element.setAttribute("data-dev-browser-action-ref", state.previous);
-      }, { token, previous: previousActionAttribute }).catch(() => {});
+      await owned.evaluate((element, ownedToken) => {
+        const actionWindow = window as Window & {
+          __devBrowserActionTargets?: Map<string, { previous: string | null }>;
+        };
+        const record = actionWindow.__devBrowserActionTargets?.get(ownedToken);
+        if (element.getAttribute("data-dev-browser-action-ref") === ownedToken) {
+          if (!record || record.previous === null) element.removeAttribute("data-dev-browser-action-ref");
+          else element.setAttribute("data-dev-browser-action-ref", record.previous);
+        }
+        actionWindow.__devBrowserActionTargets?.delete(ownedToken);
+      }, token).catch(() => {});
       await owned.dispose().catch(() => {});
     }
   };
   try {
-    if ((await original.count()) === 0)
-      fail(pageName, "TARGET_MISSING", `Target ref "${ref}" is missing`, { ref });
-    let locator = original;
-    let resolvedBy: ResolvedActionTarget["resolvedBy"] = "self";
-    const explicitlyHidden = await original.evaluate((element) => {
-      const style = getComputedStyle(element);
-      return (
-        element.hasAttribute("hidden") ||
-        element.getAttribute("aria-hidden") === "true" ||
-        style.display === "none" ||
-        style.visibility === "hidden"
-      );
-    });
-    if (explicitlyHidden) fail(pageName, "TARGET_HIDDEN", "Target is explicitly hidden");
-    const role = await original.getAttribute("role");
-    if (
-      role === "link" ||
-      (await original.evaluate((element) => element.tagName.toLowerCase() === "a"))
-    ) {
-      const descendant = original
-        .locator(
-          "button,[role='button'],input[type='button'],input[type='submit'],input[type='reset']"
-        )
-        .first();
-      if ((await descendant.count()) > 0) {
-        locator = descendant;
-        resolvedBy = "descendant";
-      }
-    }
-    const originalBox = await locator.boundingBox();
-    if (
-      !(await locator.isVisible()) ||
-      !originalBox ||
-      originalBox.width <= 0 ||
-      originalBox.height <= 0
-    ) {
-      const ancestor = original
-        .locator(
-          "xpath=ancestor::*[self::button or self::a[@href] or @role='button' or @role='link'][1]"
-        )
-        .first();
-      if ((await ancestor.count()) > 0 && (await ancestor.isVisible())) {
-        locator = ancestor;
-        resolvedBy = "ancestor";
-      }
-    }
-    const identityHandle = await locator.elementHandle();
-    if (!identityHandle) return fail(pageName, "TARGET_MISSING", "Resolved target is missing");
-    const initialTarget = await inspectTarget(locator, scoped.localRef, options.legacyRefs === true);
-    // Reject intrinsic hidden/disabled/inapplicable states before asking
-    // Playwright to wait for a scroll that can never make them actionable.
-    await validateApplicability(locator, options.applicability, pageName);
-    if (frameEntry && !(await frameAncestorsVisible(frameEntry.frame)))
-      fail(pageName, "TARGET_HIDDEN", `Frame ${scoped.frameId} or an ancestor frame became hidden`, { frameId: scoped.frameId });
     const before = await offsets(page);
     if (options.scroll) {
       if (frameEntry && frameEntry.id !== "F0") {
+        invalidateFrameGeometry(frameEntry.frame);
         const chain: Frame[] = [];
         let cursor: Frame = frameEntry.frame;
         while (cursor.parentFrame()) { chain.unshift(cursor); cursor = cursor.parentFrame()!; }
@@ -411,51 +490,223 @@ export async function resolveActionTarget(
           }
         }
       }
-      await locator.evaluate((element) => element.scrollIntoView({ block: "center", inline: "center" }));
     }
+    const stabilized = (await identity.evaluate(
+      async (element, input) => {
+        type Box = { x: number; y: number; width: number; height: number };
+        const read = (): Box => {
+          const rect = element.getBoundingClientRect();
+          return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        };
+        if (!element.isConnected || element.getAttribute("data-dev-browser-action-ref") !== input.token)
+          return { error: { code: "TARGET_MISSING" as const, message: "Resolved target detached before stability sampling" } };
+        if (input.scroll)
+          (element as HTMLElement).scrollIntoView({ block: "center", inline: "center" });
+        return await new Promise<
+          | { box: Box }
+          | { error: { code: "TARGET_MISSING"; message: string; details?: Record<string, unknown> } }
+        >((resolve) => {
+          const anchor = read();
+          const min = { ...anchor };
+          const max = { ...anchor };
+          let previous = anchor;
+          let stable = 0;
+          let done = false;
+          const widen = (box: Box) => {
+            for (const key of ["x", "y", "width", "height"] as const) {
+              min[key] = Math.min(min[key], box[key]);
+              max[key] = Math.max(max[key], box[key]);
+            }
+          };
+          const finish = (value: { box: Box } | { error: { code: "TARGET_MISSING"; message: string; details?: Record<string, unknown> } }) => {
+            if (done) return;
+            done = true;
+            window.clearTimeout(timeout);
+            resolve(value);
+          };
+          const timeout = window.setTimeout(() => {
+            const settledInPlace = (["x", "y", "width", "height"] as const).every(
+              (key) => max[key] - min[key] < input.drift
+            );
+            finish(
+              settledInPlace
+                ? { box: previous }
+                : { error: { code: "TARGET_MISSING", message: "Target bounding box did not stabilize within the bounded interval", details: { unstable: true } } }
+            );
+          }, input.budgetMs);
+          const sample = () => {
+            if (done) return;
+            if (!element.isConnected || element.getAttribute("data-dev-browser-action-ref") !== input.token) {
+              finish({ error: { code: "TARGET_MISSING", message: "Resolved target changed during stability sampling" } });
+              return;
+            }
+            const next = read();
+            widen(next);
+            const moved = (["x", "y", "width", "height"] as const).some(
+              (key) => Math.abs(next[key] - previous[key]) >= input.jitter
+            );
+            stable = moved ? 0 : stable + 1;
+            previous = next;
+            if (stable >= 2) {
+              finish({ box: next });
+              return;
+            }
+            requestAnimationFrame(sample);
+          };
+          requestAnimationFrame(sample);
+        });
+      },
+      {
+        token,
+        scroll: options.scroll,
+        budgetMs: Math.min(Math.max(options.timeoutMs, 60), 120),
+        jitter: STABLE_JITTER_PX,
+        drift: STABLE_DRIFT_PX,
+      }
+    )) as
+      | { box: { x: number; y: number; width: number; height: number } }
+      | { error: { code: "TARGET_MISSING"; message: string; details?: Record<string, unknown> } };
+    if ("error" in stabilized)
+      return fail(pageName, stabilized.error.code, stabilized.error.message, stabilized.error.details);
     const after = await offsets(page);
-    const localBox = await stableBox(locator, options.timeoutMs, pageName);
-    const current = await locator.elementHandle();
-    if (!current)
-      fail(pageName, "TARGET_MISSING", "Resolved target detached during stability sampling");
-    const currentHandle = current!;
-    const sameElement = await identityHandle.evaluate(
-      (expected, live) => expected === live,
-      currentHandle
-    );
-    await currentHandle.dispose();
-    await identityHandle.dispose();
-    if (!sameElement)
-      fail(pageName, "TARGET_MISSING", "Resolved target changed during stability sampling", {
-        originalRef: ref,
-      });
-    await validateApplicability(locator, options.applicability, pageName);
-    const finalTarget = await inspectTarget(locator, scoped.localRef, options.legacyRefs === true);
-    if (finalTarget.actualRef !== initialTarget.actualRef)
-      fail(pageName, "TARGET_MISSING", "Resolved target identity changed during actionability checks", {
-        originalRef: ref,
-      });
-    if (options.hitTest) {
-      const obstruction = await locator.evaluate(
-        (element, point) => {
+    const final = (await identity.evaluate(
+      (element, input) => {
+        const actionWindow = window as Window & {
+          __devBrowserPerceptionState?: {
+            refs: WeakMap<Element, string>;
+            boundedText?: (root: Node, maxChars?: number, maxNodes?: number) => { text: string };
+          };
+          __devBrowserActionTargets?: Map<
+            string,
+            { inspection: { actualRef: string; resolvedBy: "self" | "descendant" | "ancestor" } }
+          >;
+        };
+        const record = actionWindow.__devBrowserActionTargets?.get(input.token);
+        if (!record || !element.isConnected || element.getAttribute("data-dev-browser-action-ref") !== input.token)
+          return { error: { code: "TARGET_MISSING" as const, message: "Resolved target changed during actionability checks" } };
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        if (
+          element.hasAttribute("hidden") ||
+          element.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.contentVisibility === "hidden" ||
+          rect.width <= 0 ||
+          rect.height <= 0
+        )
+          return { error: { code: "TARGET_HIDDEN" as const, message: "Target is hidden" } };
+        const control = element as HTMLInputElement;
+        const tag = element.tagName.toLowerCase();
+        const inputType = tag === "input" ? control.type.toLowerCase() : "";
+        if (
+          ("disabled" in control && Boolean(control.disabled)) ||
+          element.getAttribute("aria-disabled") === "true" ||
+          ("readOnly" in control && Boolean(control.readOnly)) ||
+          element.getAttribute("aria-readonly") === "true"
+        )
+          return { error: { code: "TARGET_DISABLED" as const, message: "Target is disabled or readonly" } };
+        if (input.applicability === "select" && tag !== "select")
+          return { error: { code: "TARGET_MISSING" as const, message: "Select requires a select control" } };
+        if (input.applicability === "check" && (tag !== "input" || !["checkbox", "radio"].includes(inputType)))
+          return { error: { code: "TARGET_MISSING" as const, message: "Check requires a checkbox or radio control" } };
+        if (input.applicability === "upload" && (tag !== "input" || inputType !== "file"))
+          return { error: { code: "TARGET_MISSING" as const, message: "Upload requires a file input" } };
+        if (
+          (input.applicability === "type" || input.applicability === "paste") &&
+          tag !== "textarea" &&
+          !(element as HTMLElement).isContentEditable &&
+          (tag !== "input" || ["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(inputType))
+        )
+          return { error: { code: "TARGET_MISSING" as const, message: `${input.applicability === "type" ? "Type" : "Paste"} requires an editable text control` } };
+        if (input.applicability === "drag-source" && !(element as HTMLElement).draggable)
+          return { error: { code: "TARGET_MISSING" as const, message: "Drag requires a draggable source" } };
+
+        const box = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        const drifted = (["x", "y", "width", "height"] as const).some(
+          (key) => Math.abs(box[key] - input.expected[key]) >= input.drift
+        );
+        if (drifted)
+          return { error: { code: "TARGET_MISSING" as const, message: "Target moved after stability sampling", details: { unstable: true } } };
+        const state = actionWindow.__devBrowserPerceptionState;
+        const actualRef = state?.refs.get(element) ?? input.requestedRef;
+        if (actualRef !== record.inspection.actualRef)
+          return { error: { code: "TARGET_MISSING" as const, message: "Resolved target identity changed during actionability checks" } };
+        const implicitRole = tag === "button" ? "button" : tag === "a" ? "link" : tag === "input" ? "textbox" : "";
+        const rawName = input.legacyRefs
+          ? element.getAttribute("aria-label") ?? element.textContent ?? ""
+          : element.getAttribute("aria-label") ?? state?.boundedText?.(element, 500, 100).text ?? "";
+        const shadowContext: string[] = [];
+        let current: Node = element;
+        for (let depth = 0; depth < 20; depth += 1) {
+          const root = current.getRootNode();
+          if (!(root instanceof ShadowRoot)) break;
+          const host = root.host;
+          const testId = host.getAttribute("data-testid");
+          shadowContext.unshift(`${host.tagName.toLowerCase()}${host.id ? `#${host.id.slice(0, 50)}` : ""}${testId ? `[data-testid=${testId.slice(0, 50)}]` : ""}`);
+          current = host;
+        }
+        let obstruction: null | { role: string; name: string; tag: string; box: { x: number; y: number; width: number; height: number } } = null;
+        if (input.hitTest) {
           const root = element.getRootNode();
           const hit = root instanceof ShadowRoot
-            ? root.elementFromPoint(point.x, point.y)
-            : document.elementFromPoint(point.x, point.y);
-          if (!hit || hit === element || element.contains(hit) || hit.contains(element))
-            return null;
-          const rect = hit.getBoundingClientRect();
-          return {
-            role: hit.getAttribute("role") ?? "",
-            name: (hit.getAttribute("aria-label") ?? "").slice(0, 80),
-            tag: hit.tagName.toLowerCase(),
-            box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            ? root.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+            : document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+          if (hit && hit !== element && !element.contains(hit) && !hit.contains(element)) {
+            const hitRect = hit.getBoundingClientRect();
+            obstruction = {
+              role: hit.getAttribute("role") ?? "",
+              name: (hit.getAttribute("aria-label") ?? "").slice(0, 80),
+              tag: hit.tagName.toLowerCase(),
+              box: { x: hitRect.x, y: hitRect.y, width: hitRect.width, height: hitRect.height },
+            };
+          }
+        }
+        return {
+          box,
+          obstruction,
+          actualRef,
+          resolvedBy: record.inspection.resolvedBy,
+          actual: {
+            role: element.getAttribute("role") ?? implicitRole,
+            name: rawName.replace(/\s+/g, " ").trim().slice(0, 80),
+            tag,
+          },
+          shadowContext,
+        };
+      },
+      {
+        token,
+        requestedRef: scoped.localRef,
+        legacyRefs: options.legacyRefs === true,
+        applicability: options.applicability,
+        hitTest: options.hitTest,
+        expected: stabilized.box,
+        drift: STABLE_DRIFT_PX,
+      }
+    )) as
+      | {
+          box: { x: number; y: number; width: number; height: number };
+          obstruction: null | { role: string; name: string; tag: string; box: { x: number; y: number; width: number; height: number } };
+          actualRef: string;
+          resolvedBy: "self" | "descendant" | "ancestor";
+          actual: { role: string; name: string; tag: string };
+          shadowContext: string[];
+        }
+      | {
+          error: {
+            code: "TARGET_MISSING" | "TARGET_HIDDEN" | "TARGET_DISABLED";
+            message: string;
+            details?: Record<string, unknown>;
           };
-        },
-        { x: localBox.x + localBox.width / 2, y: localBox.y + localBox.height / 2 }
-      );
-      if (obstruction)
-        fail(pageName, "TARGET_OBSCURED", "Target center is obstructed", { obstruction });
+        };
+    if ("error" in final)
+      return fail(pageName, final.error.code, final.error.message, final.error.details);
+    if (final.obstruction)
+      fail(pageName, "TARGET_OBSCURED", "Target center is obstructed", { obstruction: final.obstruction });
+    const localBox = final.box;
+    if (options.hitTest) {
       if (frameEntry && frameEntry.id !== "F0") {
         let child: Frame = frameEntry.frame;
         let projectedPoint = { x: localBox.x + localBox.width / 2, y: localBox.y + localBox.height / 2 };
@@ -477,21 +728,19 @@ export async function resolveActionTarget(
         }
       }
     }
-    const box = await locator.boundingBox();
-    if (!box) return fail(pageName, "TARGET_MISSING", "Resolved target has no top-level bounding box");
-    const quad = projectRect(await frameToTopMatrix(frameEntry?.frame ?? page.mainFrame()), localBox).quad;
+    const projected = projectRect(await frameToTopMatrix(frameEntry?.frame ?? page.mainFrame()), localBox);
     return {
       locator,
       originalRef: ref,
-      actualRef: scoped.frameId === "F0" ? finalTarget.actualRef : `${scoped.frameId}:${finalTarget.actualRef}`,
-      resolvedBy,
-      box,
-      quad,
+      actualRef: scoped.frameId === "F0" ? final.actualRef : `${scoped.frameId}:${final.actualRef}`,
+      resolvedBy: final.resolvedBy,
+      box: projected.box,
+      quad: projected.quad,
       scroll: { scrolled: before.x !== after.x || before.y !== after.y, before, after },
-      actual: finalTarget.actual,
+      actual: final.actual,
       frameId: scoped.frameId,
       framePath: frameEntry?.path ?? ["F0"],
-      shadowContext: finalTarget.shadowContext,
+      shadowContext: final.shadowContext,
       cleanup,
     };
   } catch (error) {

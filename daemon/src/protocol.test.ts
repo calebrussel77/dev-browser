@@ -470,14 +470,24 @@ describe("interactive request protocol", () => {
         protocolVersion: 2,
         page: "main",
         annotate: true,
+        annotateMode: "raster",
         fullPage: true,
+        shotFormat: "jpeg",
+        shotScale: "device",
         shot: "matches.png",
         action: { kind: "find", query: "save", limit: 3 },
       })
     );
     expect(result).toMatchObject({
       success: true,
-      request: { annotate: true, fullPage: true, shot: "matches.png" },
+      request: {
+        annotate: true,
+        annotateMode: "raster",
+        fullPage: true,
+        shot: "matches.png",
+        shotFormat: "jpeg",
+        shotScale: "device",
+      },
     });
   });
 

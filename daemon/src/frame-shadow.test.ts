@@ -50,6 +50,48 @@ describe.sequential("frame and shadow perception", () => {
     expect(await page.locator("[data-dev-browser-ref]").count()).toBe(0);
   });
 
+  it("collects only nearby visible frames without repeatedly resolving frame elements", async () => {
+    await page.setContent(`
+      <iframe title="Visible" style="width:240px;height:120px" srcdoc='<button>Visible frame action</button>'></iframe>
+      <iframe title="Hidden" style="display:none" srcdoc='<button>Hidden frame action</button>'></iframe>
+      <iframe title="Far" style="position:absolute;top:5000px;width:240px;height:120px" srcdoc='<button>Far frame action</button>'></iframe>
+    `);
+    await page.getByTitle("Visible").contentFrame().getByRole("button").waitFor();
+    const counts = new Map<string, number>();
+    const connection = (page as any)._connection;
+    const originalSend = connection.sendMessageToServer;
+    let protocolCalls = 0;
+    connection.sendMessageToServer = function (...args: unknown[]) {
+      protocolCalls += 1;
+      return originalSend.apply(this, args);
+    };
+    const restores = page.frames().slice(1).map((frame) => {
+      const original = frame.frameElement.bind(frame);
+      frame.frameElement = (async () => {
+        counts.set(frame.name(), (counts.get(frame.name()) ?? 0) + 1);
+        return original();
+      }) as typeof frame.frameElement;
+      return () => { frame.frameElement = original as typeof frame.frameElement; };
+    });
+    let state;
+    try {
+      state = await collectPageState(page, { full: true });
+    } finally {
+      connection.sendMessageToServer = originalSend;
+      for (const restore of restores) restore();
+    }
+    expect(state.elements.some((element) => element.name === "Visible frame action")).toBe(true);
+    expect(state.elements.some((element) => element.name === "Hidden frame action")).toBe(false);
+    expect(state.elements.some((element) => element.name === "Far frame action")).toBe(false);
+    expect([...counts.values()].every((count) => count <= 1)).toBe(true);
+    expect(protocolCalls).toBeLessThanOrEqual(80);
+    expect(state.warnings.some((warning) => /Skipped hidden/i.test(warning))).toBe(false);
+    const verbose = await collectPageState(page, { full: true, verbose: true });
+    expect(verbose.warnings).toEqual([
+      expect.stringMatching(/Skipped hidden, zero-size, or distant frames:.*Hidden.*Far/i),
+    ]);
+  });
+
   it("keeps frame CSS boxes aligned with Playwright at DPR2 after top and frame scroll", async () => {
     const session = await page.context().newCDPSession(page);
     await session.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 260, deviceScaleFactor: 2, mobile: false });
@@ -176,7 +218,7 @@ describe.sequential("frame and shadow perception", () => {
     expect(state.warnings).not.toEqual(expect.arrayContaining([expect.stringMatching(/closed shadow roots/i)]));
   }, 20_000);
 
-  it("selects the same composed-DOM frame prefix from 150 siblings regardless of attachment order", async () => {
+  it("selects the same nearby composed-DOM frame prefix from 150 siblings regardless of attachment order", async () => {
     const collectRandomized = async (seed: number) => {
       await page.goto("about:blank");
       await page.evaluate((randomSeed) => {
@@ -200,10 +242,10 @@ describe.sequential("frame and shadow perception", () => {
     const first = await collectRandomized(3);
     const second = await collectRandomized(29);
     expect(second).toEqual(first);
-    expect(first).toHaveLength(63);
+    expect(first).toHaveLength(24);
     expect(first[0]).toEqual(["Late DOM leading", "F1"]);
     expect(first[1]).toEqual(["Cap frame 0", "F2"]);
-    expect(first.at(-1)).toEqual(["Cap frame 61", "F63"]);
+    expect(first.at(-1)).toEqual(["Cap frame 22", "F24"]);
   }, 30_000);
 
   it("caps shared descendant text for huge actionable and contenteditable subtrees", async () => {

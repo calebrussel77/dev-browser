@@ -47,7 +47,7 @@ pub fn agent_schema() -> Value {
         },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
-            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean", "elements": "boolean; compact element metadata", "verbose": "boolean; full historical response payload" },
+            "optional": { "shot": "temp image name", "annotate": "boolean", "annotateMode": "dom|raster (default dom)", "fullPage": "boolean", "shotFormat": "png|jpeg (action shots default jpeg; explicit shot defaults png)", "shotScale": "css|device (default css)", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean", "elements": "boolean; compact element metadata", "verbose": "boolean; full historical response payload" },
             "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },

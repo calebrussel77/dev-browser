@@ -433,7 +433,10 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   action: InteractiveActionSchema,
   shot: z.string().min(1).optional(),
   annotate: z.boolean().default(false),
+  annotateMode: z.enum(["dom", "raster"]).default("dom"),
   fullPage: z.boolean().default(false),
+  shotFormat: z.enum(["png", "jpeg"]).optional(),
+  shotScale: z.enum(["css", "device"]).default("css"),
   shotTimeoutMs: z.number().int().min(250).max(120_000).optional(),
   headless: z.boolean().optional(),
   ignoreHTTPSErrors: z.boolean().optional(),
@@ -677,11 +680,13 @@ type InputInteractiveAction = ParsedInteractiveAction extends infer Action
   : never;
 export type InteractiveRequest = Omit<
   z.infer<typeof InteractiveRequestSchema>,
-  "protocolVersion" | "annotate" | "fullPage" | "trace" | "action"
+  "protocolVersion" | "annotate" | "annotateMode" | "fullPage" | "shotScale" | "trace" | "action"
 > & {
   protocolVersion?: 1 | 2;
   annotate?: boolean;
+  annotateMode?: "dom" | "raster";
   fullPage?: boolean;
+  shotScale?: "css" | "device";
   trace?: boolean;
   action: InputInteractiveAction;
 };

@@ -23,7 +23,10 @@ function request(
     shot?: string;
     timeoutMs?: number;
     annotate?: boolean;
+    annotateMode?: "dom" | "raster";
     fullPage?: boolean;
+    shotFormat?: "png" | "jpeg";
+    shotScale?: "css" | "device";
     elements?: boolean;
     verbose?: boolean;
   } = {}
@@ -1259,6 +1262,23 @@ describe.sequential("interactive Playwright actions", () => {
     await rm(result.screenshotPath!, { force: true });
     await session.send("Emulation.clearDeviceMetricsOverride");
     await session.detach();
+  });
+
+  it("uses JPEG by default for action screenshots while explicit shot stays PNG", async () => {
+    const observed = await executeInteractiveAction(
+      manager,
+      request({ kind: "read", limit: 100, depth: 12 })
+    );
+    const ref = elements(observed).find((element) => element.name === "Connect")!.ref;
+    const result = await executeInteractiveAction(
+      manager,
+      request({ kind: "focus", ref }, { shot: "auto" })
+    );
+    const image = await readFile(result.screenshotPath!);
+    expect([...image.subarray(0, 2)]).toEqual([0xff, 0xd8]);
+    expect(result.artifacts?.screenshot).toMatchObject({ mediaType: "image/jpeg" });
+    expect(result.screenshotPath).toMatch(/\.jpg$/);
+    await rm(result.screenshotPath!, { force: true });
   });
 
   it("returns an annotated artifact for only the matches from find", async () => {

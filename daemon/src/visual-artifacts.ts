@@ -7,13 +7,13 @@ import { writeDevBrowserTempFile } from "./temp-files.js";
 
 export interface ScreenshotArtifact {
   path: string;
-  mediaType: "image/png";
+  mediaType: "image/png" | "image/jpeg";
   width: number;
   height: number;
   coordinateSpace: {
     kind: "viewport" | "document";
     unit: "css-px";
-    screenshotScale: "css";
+    screenshotScale: "css" | "device";
     viewport: { width: number; height: number };
     devicePixelRatio: number;
     zoom: number;
@@ -38,6 +38,9 @@ export interface CaptureVisualArtifactsOptions {
   annotationElements?: PerceptionElement[];
   focus?: { box: PerceptionElement["box"]; padding: number };
   timeoutMs?: number;
+  format?: "png" | "jpeg";
+  scale?: "css" | "device";
+  annotateMode?: "dom" | "raster";
 }
 
 export interface AnnotationLabel {
@@ -106,6 +109,39 @@ function pngDimensions(buffer: Buffer): { width: number; height: number } {
     throw new Error("Playwright returned an invalid PNG screenshot");
   }
   return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
+function jpegDimensions(buffer: Buffer): { width: number; height: number } {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8)
+    throw new Error("Chromium returned an invalid JPEG screenshot");
+  let offset = 2;
+  while (offset + 8 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = buffer[offset + 1]!;
+    offset += 2;
+    if (marker === 0xd8 || marker === 0xd9) continue;
+    const length = buffer.readUInt16BE(offset);
+    if (length < 2 || offset + length > buffer.length) break;
+    if (
+      (marker >= 0xc0 && marker <= 0xc3) ||
+      (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) ||
+      (marker >= 0xcd && marker <= 0xcf)
+    )
+      return { height: buffer.readUInt16BE(offset + 3), width: buffer.readUInt16BE(offset + 5) };
+    offset += length;
+  }
+  throw new Error("Chromium returned a JPEG without dimensions");
+}
+
+function imageDimensions(
+  buffer: Buffer,
+  format: "png" | "jpeg"
+): { width: number; height: number } {
+  return format === "png" ? pngDimensions(buffer) : jpegDimensions(buffer);
 }
 
 function withDeadline<T>(operation: Promise<T>, timeoutMs: number, description: string): Promise<T> {
@@ -241,11 +277,96 @@ function resizePng(png: Buffer, scale: number): Buffer {
   return encodePng(png.subarray(0, 8), decoded.header, pixels, width, height, decoded.bytesPerPixel);
 }
 
+function annotatePng(
+  png: Buffer,
+  elements: Array<Pick<PerceptionElement, "ref" | "box">>,
+  labels: AnnotationLabel[],
+  origin: { x: number; y: number }
+): Buffer {
+  const decoded = decodePng(png);
+  const setPixel = (x: number, y: number, red: number, green: number, blue: number) => {
+    if (x < 0 || y < 0 || x >= decoded.width || y >= decoded.height) return;
+    const offset = (Math.trunc(y) * decoded.width + Math.trunc(x)) * decoded.bytesPerPixel;
+    if (decoded.bytesPerPixel === 1 || decoded.bytesPerPixel === 2) {
+      decoded.pixels[offset] = Math.round((red + green + blue) / 3);
+      return;
+    }
+    decoded.pixels[offset] = red;
+    decoded.pixels[offset + 1] = green;
+    decoded.pixels[offset + 2] = blue;
+    if (decoded.bytesPerPixel === 4) decoded.pixels[offset + 3] = 255;
+  };
+  const fill = (x: number, y: number, width: number, height: number, color: [number, number, number]) => {
+    const left = Math.max(0, Math.floor(x - origin.x));
+    const top = Math.max(0, Math.floor(y - origin.y));
+    const right = Math.min(decoded.width, Math.ceil(x - origin.x + width));
+    const bottom = Math.min(decoded.height, Math.ceil(y - origin.y + height));
+    for (let row = top; row < bottom; row += 1)
+      for (let column = left; column < right; column += 1)
+        setPixel(column, row, ...color);
+  };
+  const stroke = (box: { x: number; y: number; width: number; height: number }) => {
+    fill(box.x, box.y, box.width, 3, [255, 45, 85]);
+    fill(box.x, box.y + box.height - 3, box.width, 3, [255, 45, 85]);
+    fill(box.x, box.y, 3, box.height, [255, 45, 85]);
+    fill(box.x + box.width - 3, box.y, 3, box.height, [255, 45, 85]);
+  };
+  for (const element of elements) stroke(element.box);
+  for (const label of labels) {
+    fill(label.x, label.y, label.width, label.height, [255, 45, 85]);
+    // The compatibility renderer deliberately stays dependency-free. Encode
+    // the ref as deterministic white bars; DOM mode remains the legible default.
+    for (let index = 0; index < label.ref.length; index += 1) {
+      const bits = label.ref.charCodeAt(index);
+      for (let bit = 0; bit < 7; bit += 1)
+        if (bits & (1 << bit))
+          fill(label.x + 6 + index * 7, label.y + 4 + bit * 2, 5, 1, [255, 255, 255]);
+    }
+  }
+  return encodePng(
+    png.subarray(0, 8),
+    decoded.header,
+    decoded.pixels,
+    decoded.width,
+    decoded.height,
+    decoded.bytesPerPixel
+  );
+}
+
+function cropPng(
+  png: Buffer,
+  clip: { x: number; y: number; width: number; height: number }
+): Buffer {
+  const decoded = decodePng(png);
+  const x = Math.max(0, Math.min(decoded.width - 1, Math.floor(clip.x)));
+  const y = Math.max(0, Math.min(decoded.height - 1, Math.floor(clip.y)));
+  const width = Math.max(1, Math.min(decoded.width - x, Math.round(clip.width)));
+  const height = Math.max(1, Math.min(decoded.height - y, Math.round(clip.height)));
+  const pixels = Buffer.alloc(width * height * decoded.bytesPerPixel);
+  const sourceStride = decoded.width * decoded.bytesPerPixel;
+  const targetStride = width * decoded.bytesPerPixel;
+  for (let row = 0; row < height; row += 1) {
+    const source = (y + row) * sourceStride + x * decoded.bytesPerPixel;
+    decoded.pixels.copy(pixels, row * targetStride, source, source + targetStride);
+  }
+  return encodePng(
+    png.subarray(0, 8),
+    decoded.header,
+    pixels,
+    width,
+    height,
+    decoded.bytesPerPixel
+  );
+}
+
 export async function captureVisualArtifacts(
   page: Page,
   perception: PagePerception,
   options: CaptureVisualArtifactsOptions
 ): Promise<VisualArtifacts> {
+  const format = options.format ?? "png";
+  const screenshotScale = options.scale ?? "css";
+  const annotateMode = options.annotateMode ?? "dom";
   const zoom = await page.evaluate(() => window.visualViewport?.scale ?? 1);
   const documentSize = await page.evaluate(() => ({
     width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
@@ -293,11 +414,11 @@ export async function captureVisualArtifacts(
       ? "full-page"
       : "viewport";
   const screenshotOptions = crop
-    ? { scale: "css" as const, clip: crop }
+    ? { scale: screenshotScale, clip: crop }
     : options.fullPage
-      ? { scale: "css" as const, fullPage: true }
+      ? { scale: screenshotScale, fullPage: true }
       : {
-          scale: "css" as const,
+          scale: screenshotScale,
           clip: {
             x: 0,
             y: 0,
@@ -305,14 +426,14 @@ export async function captureVisualArtifacts(
             height: perception.coordinateSpace.viewport.height,
           },
         };
-  const makeArtifact = async (name: string, png: Buffer): Promise<ScreenshotArtifact> => ({
-    path: await writeDevBrowserTempFile(name, png),
-    mediaType: "image/png" as const,
-    ...pngDimensions(png),
+  const makeArtifact = async (name: string, image: Buffer): Promise<ScreenshotArtifact> => ({
+    path: await writeDevBrowserTempFile(name, image),
+    mediaType: format === "png" ? "image/png" : "image/jpeg",
+    ...imageDimensions(image, format),
     coordinateSpace: {
       kind: sourceKind,
       unit: "css-px" as const,
-      screenshotScale: "css" as const,
+      screenshotScale,
       viewport: perception.coordinateSpace.viewport,
       devicePixelRatio: perception.coordinateSpace.devicePixelRatio,
       zoom,
@@ -323,18 +444,47 @@ export async function captureVisualArtifacts(
     origin,
   });
   const timeoutMs = options.timeoutMs ?? 8_000;
-  const takeScreenshot = async (): Promise<{ png: Buffer; captureMode: ScreenshotArtifact["captureMode"] }> => {
+  const takeScreenshot = async (): Promise<{ image: Buffer; captureMode: ScreenshotArtifact["captureMode"] }> => {
     const startedAt = Date.now();
     const remainingBudgetMs = () => Math.max(1, timeoutMs - (Date.now() - startedAt));
     let session: CDPSession | undefined;
     try {
       session = await withDeadline(page.context().newCDPSession(page), timeoutMs, "Screenshot capture");
+      const baseClip = crop ?? (options.fullPage
+        ? { x: 0, y: 0, width: documentSize.width, height: documentSize.height }
+        : {
+            x: perception.coordinateSpace.scroll.x,
+            y: perception.coordinateSpace.scroll.y,
+            width: perception.coordinateSpace.viewport.width,
+            height: perception.coordinateSpace.viewport.height,
+          });
+      const cropAfterCapture = Boolean(
+        crop && sourceKind === "viewport" && page.frames().length > 1 && format === "png"
+      );
+      const captureClip = cropAfterCapture
+        ? {
+            x: perception.coordinateSpace.scroll.x,
+            y: perception.coordinateSpace.scroll.y,
+            width: perception.coordinateSpace.viewport.width,
+            height: perception.coordinateSpace.viewport.height,
+          }
+        : baseClip;
       const response = await withDeadline(
         session.send("Page.captureScreenshot", {
-          format: "png",
+          format,
+          quality: format === "jpeg" ? 80 : undefined,
           fromSurface: true,
           captureBeyondViewport: options.fullPage,
-          clip: crop ? { ...crop, scale: 1 } : undefined,
+          clip: cropAfterCapture ? undefined : {
+            ...captureClip,
+            // Chromium's CDP clip coordinates and scale are expressed in CSS
+            // pixels. A scale of 1 therefore produces one output pixel per CSS
+            // pixel even on DPR 2; device mode explicitly opts back into DPR.
+            scale:
+              screenshotScale === "css"
+                ? 1
+                : perception.coordinateSpace.devicePixelRatio,
+          },
         }),
         remainingBudgetMs(),
         "Screenshot capture"
@@ -349,22 +499,67 @@ export async function captureVisualArtifacts(
         }
         throw error;
       });
-      return { png: resizePng(Buffer.from(response.data, "base64"), zoom), captureMode: "cdp" };
+      const captured = Buffer.from(response.data, "base64");
+      let normalized: Buffer = captured;
+      if (format === "png") {
+        const dimensions = pngDimensions(captured);
+        const expectedWidth = Math.max(
+          1,
+          Math.round(
+            captureClip.width *
+              (screenshotScale === "device" ? perception.coordinateSpace.devicePixelRatio : 1)
+          )
+        );
+        const expectedHeight = Math.max(
+          1,
+          Math.round(
+            captureClip.height *
+              (screenshotScale === "device" ? perception.coordinateSpace.devicePixelRatio : 1)
+          )
+        );
+        const widthScale = dimensions.width / expectedWidth;
+        const heightScale = dimensions.height / expectedHeight;
+        if (
+          Math.abs(widthScale - 1) > 0.001 &&
+          Math.abs(widthScale - heightScale) < 0.01
+        )
+          normalized = resizePng(captured, widthScale);
+      }
+      if (cropAfterCapture && crop) {
+        const density = screenshotScale === "device" ? perception.coordinateSpace.devicePixelRatio : 1;
+        normalized = cropPng(normalized, {
+          x: (crop.x - perception.coordinateSpace.scroll.x) * density,
+          y: (crop.y - perception.coordinateSpace.scroll.y) * density,
+          width: crop.width * density,
+          height: crop.height * density,
+        });
+      }
+      return {
+        image: normalized,
+        captureMode: "cdp",
+      };
     } catch (error) {
       if (!isUnsupportedCdpScreenshot(error)) throw error;
       const remainingMs = timeoutMs - (Date.now() - startedAt);
       if (remainingMs <= 0) throw error;
-      const png = Buffer.from(
-        await page.screenshot({ ...screenshotOptions, animations: "disabled", caret: "hide", timeout: remainingMs })
+      const image = Buffer.from(
+        await page.screenshot({
+          ...screenshotOptions,
+          type: format,
+          quality: format === "jpeg" ? 80 : undefined,
+          animations: "disabled",
+          caret: "hide",
+          timeout: remainingMs,
+        })
       );
-      return { png: resizePng(png, zoom), captureMode: "playwright" };
+      return { image, captureMode: "playwright" };
     } finally {
       if (session) await session.detach().catch(() => undefined);
     }
   };
   const makeCapturedArtifact = async (name: string): Promise<ScreenshotArtifact> => {
     const captured = await takeScreenshot();
-    const artifact = await makeArtifact(name, captured.png);
+    const artifact = await makeArtifact(name, captured.image);
     artifact.captureMode = captured.captureMode;
     return artifact;
   };
@@ -399,83 +594,92 @@ export async function captureVisualArtifacts(
     if (omittedRefs.length > 0) {
       warnings.push(`Omitted annotation labels for refs: ${omittedRefs.join(", ")}`);
     }
-    const overlayId = randomUUID();
-    await page.evaluate(
-      ({ elements, labels, documentMode, bounds, overlayId }) => {
-        const host = document.createElement("div");
-        host.setAttribute("data-dev-browser-visual-overlay", overlayId);
-        host.setAttribute("aria-hidden", "true");
-        host.inert = true;
-        Object.assign(host.style, {
-          all: "initial",
-          contain: "strict",
-          display: "block",
-          position: documentMode ? "absolute" : "fixed",
-          inset: "0",
-          width: documentMode ? `${bounds.width}px` : "100vw",
-          height: documentMode ? `${bounds.height}px` : "100vh",
-          pointerEvents: "none",
-          zIndex: "2147483647",
-        });
-        const shadow = host.attachShadow({ mode: "open" });
-        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-        svg.setAttribute("width", "100%");
-        svg.setAttribute("height", "100%");
-        svg.setAttribute("aria-hidden", "true");
-        svg.style.pointerEvents = "none";
-        const byRef = new Map(elements.map((element) => [element.ref, element]));
-        for (const element of elements) {
-          const outline = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-          outline.setAttribute("x", String(element.box.x));
-          outline.setAttribute("y", String(element.box.y));
-          outline.setAttribute("width", String(element.box.width));
-          outline.setAttribute("height", String(element.box.height));
-          outline.setAttribute("fill", "none");
-          outline.setAttribute("stroke", "#ff2d55");
-          outline.setAttribute("stroke-width", "3");
-          svg.append(outline);
+    const defaultExtension = format === "jpeg" ? "jpg" : "png";
+    const name =
+      options.annotatedName ??
+      options.screenshotName?.replace(/(\.(?:png|jpe?g))?$/i, `-annotated.${defaultExtension}`) ??
+      `interactive/${Date.now()}-annotated.${defaultExtension}`;
+    if (annotateMode === "raster") {
+      if (format !== "png")
+        throw new Error("Raster annotation compatibility mode requires PNG output");
+      const captured = await takeScreenshot();
+      annotatedScreenshot = await makeArtifact(
+        name,
+        annotatePng(captured.image, annotationElements, labels, origin)
+      );
+      annotatedScreenshot.captureMode = captured.captureMode;
+    } else {
+      const overlayId = randomUUID();
+      await page.evaluate(
+        ({ elements, labels, documentMode, bounds, overlayId }) => {
+          const host = document.createElement("div");
+          host.setAttribute("data-dev-browser-visual-overlay", overlayId);
+          host.setAttribute("aria-hidden", "true");
+          host.inert = true;
+          Object.assign(host.style, {
+            all: "initial",
+            contain: "strict",
+            display: "block",
+            position: documentMode ? "absolute" : "fixed",
+            inset: "0",
+            width: documentMode ? `${bounds.width}px` : "100vw",
+            height: documentMode ? `${bounds.height}px` : "100vh",
+            pointerEvents: "none",
+            zIndex: "2147483647",
+          });
+          const shadow = host.attachShadow({ mode: "open" });
+          for (const element of elements) {
+            const outline = document.createElement("div");
+            Object.assign(outline.style, {
+              position: "absolute",
+              boxSizing: "border-box",
+              left: `${element.box.x}px`,
+              top: `${element.box.y}px`,
+              width: `${element.box.width}px`,
+              height: `${element.box.height}px`,
+              border: "3px solid #ff2d55",
+              pointerEvents: "none",
+            });
+            shadow.append(outline);
+          }
+          for (const label of labels) {
+            const node = document.createElement("div");
+            node.textContent = label.ref;
+            Object.assign(node.style, {
+              position: "absolute",
+              boxSizing: "border-box",
+              left: `${label.x}px`,
+              top: `${label.y}px`,
+              width: `${label.width}px`,
+              height: `${label.height}px`,
+              borderRadius: "4px",
+              background: "#ff2d55",
+              color: "white",
+              font: "700 13px/22px ui-monospace, monospace",
+              padding: "0 6px",
+              overflow: "hidden",
+              whiteSpace: "nowrap",
+              pointerEvents: "none",
+            });
+            shadow.append(node);
+          }
+          document.documentElement.append(host);
+        },
+        {
+          elements: annotationElements,
+          labels,
+          documentMode: sourceKind === "document",
+          bounds: sourceBounds,
+          overlayId,
         }
-        for (const label of labels) {
-          const element = byRef.get(label.ref)!;
-          const background = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-          background.setAttribute("x", String(label.x));
-          background.setAttribute("y", String(label.y));
-          background.setAttribute("width", String(label.width));
-          background.setAttribute("height", String(label.height));
-          background.setAttribute("rx", "4");
-          background.setAttribute("fill", "#ff2d55");
-          svg.append(background);
-          const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-          text.setAttribute("x", String(label.x + 6));
-          text.setAttribute("y", String(label.y + 16));
-          text.setAttribute("fill", "white");
-          text.setAttribute("font-family", "ui-monospace, monospace");
-          text.setAttribute("font-size", "13");
-          text.setAttribute("font-weight", "700");
-          text.textContent = label.ref;
-          svg.append(text);
-        }
-        shadow.append(svg);
-        document.documentElement.append(host);
-      },
-      {
-        elements: annotationElements,
-        labels,
-        documentMode: sourceKind === "document",
-        bounds: sourceBounds,
-        overlayId,
+      );
+      try {
+        annotatedScreenshot = await makeCapturedArtifact(name);
+      } finally {
+        await page
+          .locator(`[data-dev-browser-visual-overlay="${overlayId}"]`)
+          .evaluateAll((elements) => elements.forEach((element) => element.remove()));
       }
-    );
-    try {
-      const name =
-        options.annotatedName ??
-        options.screenshotName?.replace(/(\.png)?$/i, "-annotated.png") ??
-        `interactive/${Date.now()}-annotated.png`;
-      annotatedScreenshot = await makeCapturedArtifact(name);
-    } finally {
-      await page
-        .locator(`[data-dev-browser-visual-overlay="${overlayId}"]`)
-        .evaluateAll((elements) => elements.forEach((element) => element.remove()));
     }
   }
   return { screenshot, annotatedScreenshot, warnings };
