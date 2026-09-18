@@ -25,6 +25,186 @@ export interface RealmCollectionOptions {
   textMaxChars?: number;
 }
 
+export interface RealmRefValidation {
+  attached: boolean;
+  realmToken: string;
+  mutationEpoch: number;
+  fingerprint?: {
+    role: string;
+    name: string;
+    description: string;
+    landmark: string;
+    placeholder: string;
+    inputType: string;
+    stableAttributes: { id: string; testId: string; href: string };
+    disabled: boolean;
+    readonly: boolean;
+    required: boolean;
+    checked: boolean | "mixed" | null;
+    selected: boolean | null;
+    expanded: boolean | null;
+    pressed: boolean | "mixed" | null;
+    current: string | true | null;
+    shadowContext: string[];
+  };
+}
+
+export function revalidateRealmRef(localRef: string): RealmRefValidation {
+  type RealmState = {
+    token: string;
+    byRef: Map<string, WeakRef<Element>>;
+    mutationEpoch: number;
+  };
+  const state = (window as Window & { __devBrowserPerceptionState?: RealmState })
+    .__devBrowserPerceptionState;
+  const element = state?.byRef.get(localRef)?.deref() as HTMLElement | undefined;
+  if (!state || !element?.isConnected)
+    return {
+      attached: false,
+      realmToken: state?.token ?? "",
+      mutationEpoch: state?.mutationEpoch ?? 0,
+    };
+
+  const compact = (value: string | null | undefined, max = 180) =>
+    (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+  const boundedText = (root: Node, maxChars = 500, maxNodes = 100) => {
+    const pending: Node[] = [root];
+    let text = "";
+    let visited = 0;
+    while (pending.length > 0 && visited < maxNodes && text.length < maxChars) {
+      const current = pending.pop()!;
+      visited += 1;
+      if (current.nodeType === Node.TEXT_NODE) {
+        text += (current as Text).data.slice(0, maxChars - text.length);
+        continue;
+      }
+      const children = current.childNodes;
+      const selected = Math.min(children.length, Math.max(0, maxNodes - visited - pending.length));
+      for (let index = selected - 1; index >= 0; index -= 1) pending.push(children.item(index)!);
+    }
+    return text.replace(/\s+/g, " ").trim();
+  };
+  const roleFor = (target: HTMLElement): string => {
+    const explicit = target.getAttribute("role");
+    if (explicit) return explicit;
+    const tag = target.tagName.toLowerCase();
+    if (/^h[1-6]$/.test(tag)) return "heading";
+    if (tag === "a") return "link";
+    if (tag === "button") return "button";
+    if (tag === "textarea" || target.isContentEditable) return "textbox";
+    if (tag === "select") return "combobox";
+    if (tag === "input") {
+      const type = (target.getAttribute("type") ?? "text").toLowerCase();
+      if (["button", "submit", "reset"].includes(type)) return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      return "textbox";
+    }
+    return tag;
+  };
+  const referencedText = (attribute: string) => {
+    const root = element.getRootNode() as Document | ShadowRoot;
+    return compact(
+      (element.getAttribute(attribute) ?? "")
+        .split(/\s+/)
+        .map((id) => {
+          const target = root.getElementById(id);
+          return target ? boundedText(target) : "";
+        })
+        .join(" ")
+    );
+  };
+  const label =
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+      ? compact(Array.from(element.labels ?? [], (entry) => boundedText(entry)).join(" "))
+      : "";
+  const name = compact(
+    element.getAttribute("aria-label") ||
+      referencedText("aria-labelledby") ||
+      label ||
+      boundedText(element) ||
+      element.getAttribute("alt") ||
+      element.getAttribute("title") ||
+      element.getAttribute("placeholder")
+  );
+  const bool = (name: string): boolean | null => {
+    const value = element.getAttribute(name);
+    return value === null ? null : value === "true";
+  };
+  const mixedBool = (name: string): boolean | "mixed" | null => {
+    const value = element.getAttribute(name);
+    return value === "mixed" ? "mixed" : value === null ? null : value === "true";
+  };
+  const semanticAncestors: string[] = [];
+  let parent = element.parentElement;
+  while (parent && parent !== document.body) {
+    const tag = parent.tagName.toLowerCase();
+    const role = parent.getAttribute("role");
+    if (["main", "aside", "nav", "header", "footer", "section", "article", "dialog"].includes(tag) || role)
+      semanticAncestors.unshift(
+        `${tag}${parent.id ? `#${compact(parent.id, 50)}` : ""}${role ? `[role=${role}]` : ""}`
+      );
+    parent = parent.parentElement;
+  }
+  const shadowContext: string[] = [];
+  let root: Node = element.getRootNode();
+  while (root instanceof ShadowRoot) {
+    const host = root.host as HTMLElement;
+    shadowContext.unshift(
+      `${host.tagName.toLowerCase()}${host.id ? `#${compact(host.id, 50)}` : ""}${
+        host.dataset.testid ? `[data-testid=${compact(host.dataset.testid, 50)}]` : ""
+      }`
+    );
+    root = host.getRootNode();
+  }
+  const checked =
+    element instanceof HTMLInputElement && ["checkbox", "radio"].includes(element.type)
+      ? element.indeterminate
+        ? "mixed"
+        : element.checked
+      : mixedBool("aria-checked");
+  return {
+    attached: true,
+    realmToken: state.token,
+    mutationEpoch: state.mutationEpoch,
+    fingerprint: {
+      role: roleFor(element),
+      name,
+      description: compact(element.getAttribute("aria-description") || referencedText("aria-describedby")),
+      landmark: semanticAncestors.join(" > ") || "body",
+      placeholder: compact(element.getAttribute("placeholder")),
+      inputType: element instanceof HTMLInputElement ? element.type : element.tagName.toLowerCase(),
+      stableAttributes: {
+        id: compact(element.id, 100),
+        testId: compact(element.getAttribute("data-testid"), 100),
+        href: element instanceof HTMLAnchorElement ? compact(element.getAttribute("href"), 300) : "",
+      },
+      disabled:
+        "disabled" in element
+          ? Boolean((element as HTMLInputElement).disabled)
+          : bool("aria-disabled") === true,
+      readonly:
+        "readOnly" in element
+          ? Boolean((element as HTMLInputElement).readOnly)
+          : bool("aria-readonly") === true,
+      required:
+        "required" in element
+          ? Boolean((element as HTMLInputElement).required)
+          : bool("aria-required") === true,
+      checked,
+      selected: element instanceof HTMLOptionElement ? element.selected : bool("aria-selected"),
+      expanded: bool("aria-expanded"),
+      pressed: mixedBool("aria-pressed"),
+      current: element.hasAttribute("aria-current")
+        ? element.getAttribute("aria-current") || true
+        : null,
+      shadowContext,
+    },
+  };
+}
+
 export function collectRealm({
   full,
   legacyRefs,
@@ -35,7 +215,18 @@ export function collectRealm({
   textMaxChars = 20_000,
 }: RealmCollectionOptions) {
   type BoundedText = (root: Node, maxChars?: number, maxNodes?: number) => { text: string; truncated: boolean; visited: number };
-  type RealmState = { token: string; refs: WeakMap<Element, string>; byRef: Map<string, WeakRef<Element>>; boundedText?: BoundedText; counter: number };
+  type RealmSignal = { epoch: number; lastMutationAt: number; url: string; activeRef: string | null; dialogs: number; inFlightFetch: number };
+  type RealmState = {
+    token: string;
+    refs: WeakMap<Element, string>;
+    byRef: Map<string, WeakRef<Element>>;
+    boundedText?: BoundedText;
+    counter: number;
+    mutationEpoch: number;
+    lastMutationAt: number;
+    mutationObserver?: MutationObserver;
+    signal?: () => RealmSignal;
+  };
   type RealmWindow = Window & { __devBrowserPerceptionState?: RealmState };
   const realmWindow = window as RealmWindow;
   if (!realmWindow.__devBrowserPerceptionState) {
@@ -43,11 +234,55 @@ export function collectRealm({
       configurable: false,
       enumerable: false,
       writable: false,
-      value: { token: `${Date.now()}-${Math.random()}`, refs: new WeakMap<Element, string>(), byRef: new Map<string, WeakRef<Element>>(), counter: 1 },
+      value: {
+        token: `${Date.now()}-${Math.random()}`,
+        refs: new WeakMap<Element, string>(),
+        byRef: new Map<string, WeakRef<Element>>(),
+        counter: 1,
+        mutationEpoch: 0,
+        lastMutationAt: performance.now(),
+      },
     });
   }
   const registry = realmWindow.__devBrowserPerceptionState!;
   registry.byRef ??= new Map<string, WeakRef<Element>>();
+  registry.mutationEpoch ??= 0;
+  registry.lastMutationAt ??= performance.now();
+  if (!registry.mutationObserver) {
+    const isInternalMutation = (mutation: MutationRecord) => {
+      if (
+        mutation.type === "attributes" &&
+        mutation.attributeName &&
+        /^data-dev-browser-(?:ref|action-ref|visual-overlay|capture-style)/.test(mutation.attributeName)
+      ) return true;
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+      return Boolean(target?.closest("[data-dev-browser-visual-overlay],[data-dev-browser-capture-style]"));
+    };
+    registry.mutationObserver = new MutationObserver((mutations) => {
+      if (mutations.every(isInternalMutation)) return;
+      registry.mutationEpoch += 1;
+      registry.lastMutationAt = performance.now();
+    });
+    registry.mutationObserver.observe(document, {
+      attributes: true,
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    registry.signal = () => {
+      let active: Element | null = document.activeElement;
+      while (active instanceof HTMLElement && active.shadowRoot?.activeElement)
+        active = active.shadowRoot.activeElement;
+      return {
+        epoch: registry.mutationEpoch,
+        lastMutationAt: registry.lastMutationAt,
+        url: location.href,
+        activeRef: active ? registry.refs.get(active) ?? active.getAttribute("data-dev-browser-ref") : null,
+        dialogs: document.querySelectorAll('[role="dialog"],dialog[open]').length,
+        inFlightFetch: 0,
+      };
+    };
+  }
   registry.boundedText ??= (root, maxChars = 2_000, maxNodes = 500) => {
     const stack: Node[] = [root];
     let text = "", visited = 0, truncated = false;
@@ -296,7 +531,7 @@ export function collectRealm({
       shadowContext, depth,
     };
   });
-  return { realmToken: registry.token, url: location.href, title: document.title,
+  return { realmToken: registry.token, mutationEpoch: registry.mutationEpoch, url: location.href, title: document.title,
     viewport: { width: innerWidth, height: innerHeight }, focusedRef: records.find((record) => record.focused)?.ref || null,
     records, truncated: traversalTruncated || candidates.length > maxRecords || allElements.length >= maxWork,
     scope: scopeResult, text: textResult };

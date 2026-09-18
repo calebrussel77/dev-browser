@@ -336,23 +336,23 @@ describe.sequential("first-class transfer and navigation actions", () => {
       .rejects.toMatchObject({ code: "POPUP_OPENED", details: { attemptJournal: expect.any(Array), waitResult: expect.any(Object) } });
   });
 
-  it("captures a keyboard-opened popup before press dispatch and removes listeners", async () => {
+  it("captures a keyboard-opened popup with an explicit popup wait and removes listeners", async () => {
     await action("popup-keyboard", { kind: "navigate", url: fixture.mainUrl });
     const ref = await refNamed("popup-keyboard", "Open popup");
     const page = await manager.getPage(browser, "popup-keyboard");
     const emitter = page as unknown as { listenerCount(event: string): number };
     const baseline = emitter.listenerCount("popup");
-    const result = await action("popup-keyboard", { kind: "press", ref, key: "Enter" });
+    const result = await action("popup-keyboard", { kind: "press", ref, key: "Enter", wait: { mode: "all", timeoutMs: 1_000, conditions: [{ kind: "popup" }] } });
     expect(result.popup).toMatchObject({ targetId: expect.any(String), openerPage: "popup-keyboard" });
     expect(emitter.listenerCount("popup")).toBe(baseline);
   });
 
-  it("captures a delayed popup within the bounded implicit click window", async () => {
+  it("captures a delayed popup within an explicit bounded popup wait", async () => {
     await action("popup-delayed", { kind: "navigate", url: fixture.mainUrl });
     const ref = await refNamed("popup-delayed", "Open delayed popup");
     const page = await manager.getPage(browser, "popup-delayed");
     const baseline = (page as unknown as { listenerCount(event: string): number }).listenerCount("popup");
-    const result = await action("popup-delayed", { kind: "click", ref, method: "locator" });
+    const result = await action("popup-delayed", { kind: "click", ref, method: "locator", wait: { mode: "all", timeoutMs: 3_000, conditions: [{ kind: "popup" }] } });
     expect(result.popup).toMatchObject({ targetId: expect.any(String), url: expect.stringContaining("/popup-target") });
     expect((page as unknown as { listenerCount(event: string): number }).listenerCount("popup")).toBe(baseline);
   });
@@ -368,7 +368,7 @@ describe.sequential("first-class transfer and navigation actions", () => {
     );
     const started = Date.now();
     try {
-      await expect(action("popup-metadata-timeout", { kind: "click", ref, method: "locator" }))
+      await expect(action("popup-metadata-timeout", { kind: "click", ref, method: "locator", wait: { mode: "all", timeoutMs: 1_000, conditions: [{ kind: "popup" }] } }))
         .rejects.toMatchObject({ code: "POPUP_OPENED", details: { attemptJournal: expect.any(Array) } });
       // Preserve the bounded deadline while allowing scheduler contention in the full Playwright suite.
       expect(Date.now() - started).toBeLessThan(3_000);

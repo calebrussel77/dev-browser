@@ -233,12 +233,12 @@ Mesure 1.5 : `click` lourd = 4 578 octets compacts après retrait des warnings p
 **Fichiers :** `daemon/src/interactive-actions.ts` (cas `click`, bloc primitives pour `press`), `daemon/src/wait-engine.ts`, `daemon/src/perception/realm-collector.ts` (installation d'un MutationObserver dans `__devBrowserPerceptionState`).
 
 Conception :
-- [ ] Installer une fois par realm, au premier `collectRealm`, un `MutationObserver` sur `document` (childList, attributes, characterData, subtree) qui incrémente `state.mutationEpoch` et note `state.lastMutationAt = performance.now()`. Exposer une fonction in-page `__devBrowserPerceptionState.signal()` qui renvoie `{ epoch, lastMutationAt, url: location.href, activeRef, dialogs: count, inFlightFetch }` en une seule évaluation.
-- [ ] Nouvelle condition d'attente interne `settled` (non exposée dans la grammaire publique) : passe quand, sur deux polls consécutifs, `epoch` n'a pas bougé, aucune requête n'est en vol (`inFlight === 0` déjà suivi par le wait-engine), et au moins `minSettleMs = 50` ms se sont écoulées depuis le dispatch. Plafond `maxSettleMs = 700` ms si du réseau est en vol, `300` ms sinon.
-- [ ] Le `monitoringWait` par défaut de `click` et `press` devient `{ conditions: [settled] }` à la place de `networkIdle 700/750`.
-- [ ] Supprimer le `setTimeout(resolve, 150)` sur `WAIT_TIMEOUT` dans la boucle de click ; remplacer par une lecture immédiate du signal.
-- [ ] Les `Promise.race([outerPopupArrived, setTimeout(PRESS_SETTLE_MS)])` ne s'appliquent que si un `--wait-*` explicite a été passé sans condition `popup` ; ramener ce délai à 250 ms.
-- [ ] `compareSignals` reste utilisé pour `change` mais lit le signal léger (epoch, url, dialogs, focus, values des refs suivis) au lieu de deux `collectLiveSnapshot` complets ; `pageSignal` n'est appelé qu'une fois avant et une fois après.
+- [x] Installer une fois par realm, au premier `collectRealm`, un `MutationObserver` sur `document` (childList, attributes, characterData, subtree) qui incrémente `state.mutationEpoch` et note `state.lastMutationAt = performance.now()`. Exposer une fonction in-page `__devBrowserPerceptionState.signal()` qui renvoie `{ epoch, lastMutationAt, url: location.href, activeRef, dialogs: count, inFlightFetch }` en une seule évaluation.
+- [x] Nouvelle condition d'attente interne `settled` (non exposée dans la grammaire publique) : passe quand, sur deux polls consécutifs, `epoch` n'a pas bougé, aucune requête n'est en vol (`inFlight === 0` déjà suivi par le wait-engine), et au moins `minSettleMs = 50` ms se sont écoulées depuis le dispatch. Plafond `maxSettleMs = 700` ms si du réseau est en vol, `300` ms sinon.
+- [x] Le `monitoringWait` par défaut de `click` et `press` devient `{ conditions: [settled] }` à la place de `networkIdle 700/750`.
+- [x] Supprimer le `setTimeout(resolve, 150)` sur `WAIT_TIMEOUT` dans la boucle de click ; remplacer par une lecture immédiate du signal.
+- [x] Les `Promise.race([outerPopupArrived, setTimeout(PRESS_SETTLE_MS)])` ne s'appliquent que si un `--wait-*` explicite a été passé sans condition `popup` ; ramener ce délai à 250 ms.
+- [x] `compareSignals` reste utilisé pour `change` mais lit le signal léger (epoch, url, dialogs, focus, values des refs suivis) au lieu de deux `collectLiveSnapshot` complets ; `pageSignal` n'est appelé qu'une fois avant et une fois après.
 
 **Tests :**
 - `wait-engine.test.ts` : la condition `settled` passe après 2 polls calmes et ≥ 50 ms ; ne passe pas tant qu'une requête est en vol ; plafond respecté.
@@ -251,11 +251,11 @@ Conception :
 
 **Fichiers :** `daemon/src/interactive-actions.ts` (`validateDecisionRefs`, `clickOnce`, `prepareClickInput`, `dispatchType`, bloc final `if (!result.coordinateSpace)`, bloc `--shot`), `daemon/src/ref-state.ts`, `daemon/src/perception/collector.ts`, `daemon/src/page-state.ts`.
 
-- [ ] Revalidation ciblée : ajouter `revalidateRef(page, ref, expectedFingerprint)` qui fait **un** `evaluate` dans le realm du ref, lit l'élément via `byRef`, recalcule le fingerprint sémantique in-page (mêmes champs que `semanticFingerprint`, calculés par une fonction partagée sérialisée dans `realm-collector.ts`) et renvoie `{ attached, fingerprint }`. `validateDecisionRefs` utilise cela pour le ref cible ; la vérification de `fromState`/document reste basée sur `realmToken` (un `evaluate` léger) et non sur une collecte complète.
-- [ ] Mémoïsation : `collectPageState` accepte `{ reuseIfEpoch: number }` ; si l'epoch in-page n'a pas changé depuis la dernière perception enregistrée pour cette page et le même scope, renvoyer l'état enregistré sans re-collecter (nouveau `stateId` tout de même, pointant sur le même snapshot). Le `stateId` reste monotone.
-- [ ] Dans `click`/`type`/primitives : une perception `delta: true` après l'action ; supprimer les collectes intermédiaires (`clickOnce` puis `prepareClickInput` faisaient deux `validateDecisionRefs` complets).
-- [ ] Bloc `--shot` : réutiliser la perception finale de l'action pour l'annotation au lieu de `visualPerception` (nouvelle collecte). Avec `--full-page`, une collecte `full` reste nécessaire mais une seule.
-- [ ] Bloc final `if (!result.coordinateSpace)` : ne jamais déclencher une perception complète pour remplir `coordinateSpace` ; utiliser `coordinateSpaceOnly` quand aucune perception n'a eu lieu.
+- [x] Revalidation ciblée : ajouter `revalidateRef(page, ref, expectedFingerprint)` qui fait **un** `evaluate` dans le realm du ref, lit l'élément via `byRef`, recalcule le fingerprint sémantique in-page (mêmes champs que `semanticFingerprint`, calculés par une fonction partagée sérialisée dans `realm-collector.ts`) et renvoie `{ attached, fingerprint }`. `validateDecisionRefs` utilise cela pour le ref cible ; la vérification de `fromState`/document reste basée sur `realmToken` (un `evaluate` léger) et non sur une collecte complète.
+- [x] Mémoïsation : `collectPageState` accepte `{ reuseIfEpoch: number }` ; si l'epoch in-page n'a pas changé depuis la dernière perception enregistrée pour cette page et le même scope, renvoyer l'état enregistré sans re-collecter (nouveau `stateId` tout de même, pointant sur le même snapshot). Le `stateId` reste monotone.
+- [x] Dans `click`/`type`/primitives : une perception `delta: true` après l'action ; supprimer les collectes intermédiaires (`clickOnce` puis `prepareClickInput` faisaient deux `validateDecisionRefs` complets).
+- [x] Bloc `--shot` : réutiliser la perception finale de l'action pour l'annotation au lieu de `visualPerception` (nouvelle collecte). Avec `--full-page`, une collecte `full` reste nécessaire mais une seule.
+- [x] Bloc final `if (!result.coordinateSpace)` : ne jamais déclencher une perception complète pour remplir `coordinateSpace` ; utiliser `coordinateSpaceOnly` quand aucune perception n'a eu lieu.
 
 **Tests :** `scoped-action-revalidation.test.ts` et `ref-state.test.ts` : un ref dont le nom a changé est toujours refusé (`STALE_REF`) ; un ref d'un scope `--within` reste valide ; compter les appels à `collectRealm` via un espion (`vi.spyOn` sur le module) : un `click` fait au plus 1 collecte complète, un `click --shot` au plus 1, un `type` au plus 1.
 
@@ -277,15 +277,17 @@ Conception :
 
 **Fichiers :** `daemon/src/live-snapshot.ts`, `daemon/src/wait-engine.ts`, `daemon/src/perception/realm-collector.ts`.
 
-- [ ] Texte du corps : `bodyText` est lu via `document.body.innerText` (rapide, calculé par Blink) normalisé, borné à `MAX_TEXT_CHARS = 200_000` ; `dialogs`/`toasts` via `querySelectorAll('[role=dialog],dialog[open],[role=status],[role=alert],...')` puis `innerText` borné à 10 000 caractères chacun ; ces lectures ne sont plus soumises à `MAX_WORK`.
-- [ ] `truncated` n'est plus global : `refsTruncated` (couverture des refs), `textTruncated` (texte tronqué en caractères). Une condition `text` passe si le texte est trouvé, même si `refsTruncated` ; elle échoue "non prouvé" seulement si `textTruncated` et non trouvé.
-- [ ] Les refs suivis par une condition `ref` sont lus **directement** via `byRef` (pas de parcours) ; le parcours complet borné (`MAX_WORK`) ne sert plus qu'à `frameSignals.dom` pour `compareSignals`, remplacé par l'epoch du MutationObserver de 2.1.
-- [ ] `POLL_INTERVAL_MS` passe à 50 ms, et chaque poll n'évalue que ce que les conditions demandent (texte seulement pour `text`, refs seulement pour `ref`, rien pour `url`/`navigation`/`response`).
+- [x] Texte du corps : `bodyText` est lu via `document.body.innerText` (rapide, calculé par Blink) normalisé, borné à `MAX_TEXT_CHARS = 200_000` ; `dialogs`/`toasts` via `querySelectorAll('[role=dialog],dialog[open],[role=status],[role=alert],...')` puis `innerText` borné à 10 000 caractères chacun ; ces lectures ne sont plus soumises à `MAX_WORK`.
+- [x] `truncated` n'est plus global : `refsTruncated` (couverture des refs), `textTruncated` (texte tronqué en caractères). Une condition `text` passe si le texte est trouvé, même si `refsTruncated` ; elle échoue "non prouvé" seulement si `textTruncated` et non trouvé.
+- [x] Les refs suivis par une condition `ref` sont lus **directement** via `byRef` (pas de parcours) ; le parcours complet borné (`MAX_WORK`) ne sert plus qu'à `frameSignals.dom` pour `compareSignals`, remplacé par l'epoch du MutationObserver de 2.1.
+- [x] `POLL_INTERVAL_MS` passe à 50 ms, et chaque poll n'évalue que ce que les conditions demandent (texte seulement pour `text`, refs seulement pour `ref`, rien pour `url`/`navigation`/`response`).
 - [ ] Optionnel : `page.exposeBinding('__devBrowserWake', ...)` appelé par le MutationObserver (debounce 16 ms) pour réveiller le poll sans attendre 50 ms.
 
 **Tests :** `wait-engine.test.ts` et `wait-engine-regressions.test.ts` : page de 5 000 éléments, `--wait-text "visible,body,contains,<texte au fond de la page>"` passe en < 300 ms ; `--wait-dialog opened` passe quand une modale s'ouvre sur une page de 5 000 éléments ; `--wait-ref R5000,visible` fonctionne sur un ref au-delà de 1 000 éléments ; texte absent renvoie `WAIT_TIMEOUT` avec `coverage: "complete"`.
 
 **Critères d'acceptation :** live LinkedIn messagerie : `click --ref <ligne> --wait-text "visible,body,contains,<nom du contact>"` réussit en < 1,5 s ; `click --ref <bouton "..."> --wait-dialog opened` (menu d'options d'une conversation) réussit puis `press Escape`.
+
+> Mesure PR 2 (2026-09-17) : les implémentations 2.1, 2.2 et 2.4 et leurs tests sont terminés. La fixture locale atteint 338 ms pour `click --ref`, 295 ms pour `type --ref` et 313 ms pour `click --ref --shot`. Sur la page lourde et le Chrome live, le coût restant est dominé par `resolveActionTarget` (159 messages CDP à lui seul ; 177 pour le clic lourd), donc les seuils CDP/live dépendants de la résolution restent ouverts jusqu'à 2.3. Le menu LinkedIn observé est un dropdown sans rôle `dialog`, donc `--wait-dialog opened` expire bien que le menu s'ouvre ; l'anomalie et le nettoyage par Escape sont consignés dans `docs/field-reports/2026-09-17-speed-pr2.md`.
 
 ### Tâche 2.5 — Géométrie des frames en une passe
 

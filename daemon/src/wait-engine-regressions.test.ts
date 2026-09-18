@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentProtocolError } from "./agent-protocol.js";
 import { BrowserManager } from "./browser-manager.js";
 import { stopBrowserManagerAndRemoveDirectory } from "./browser-test-cleanup.js";
+import { collectPageState } from "./perception/collector.js";
 import {
   startAgentReliabilityFixture,
   type AgentReliabilityFixture,
@@ -125,6 +126,81 @@ describe.sequential("wait engine reliability regressions", () => {
       observations: expect.any(Array),
     });
   });
+
+  it("proves text, dialog, and late refs on a five-thousand-element page", async () => {
+    const page = await manager.getPage("wait-regression", "large-page");
+    const rows = Array.from({ length: 5_000 }, (_, index) =>
+      `<div>row ${index}</div>`
+    ).join("");
+    await page.setContent(`<main>${rows}<button>Late target</button><p>deep text marker</p></main>`);
+    const state = await collectPageState(page, { maxNodes: 10, track: "large-wait" });
+    const lateRef = state.allElements.find((element) => element.name === "Late target")!.ref;
+
+    const textStarted = performance.now();
+    const text = await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 1_000,
+        conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "deep text marker" }],
+      },
+      async () => {}
+    );
+    expect(performance.now() - textStarted).toBeLessThan(300);
+    expect(text.waitResult.observations[0]?.coverage).toBe("complete");
+
+    const ref = await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 1_000,
+        conditions: [{ kind: "ref", ref: lateRef, state: "visible" }],
+      },
+      async () => {}
+    );
+    expect(ref.waitResult.timedOut).toEqual([]);
+
+    const dialogStarted = performance.now();
+    const dialog = await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 1_000,
+        conditions: [{ kind: "dialog", state: "opened" }],
+      },
+      () => page.evaluate(() => {
+        const modal = document.createElement("div");
+        modal.setAttribute("role", "dialog");
+        modal.textContent = "Large page modal";
+        document.body.append(modal);
+      })
+    );
+    expect(performance.now() - dialogStarted).toBeLessThan(300);
+    expect(dialog.waitResult.observations[0]?.coverage).toBe("complete");
+
+    let absent: AgentProtocolError | undefined;
+    try {
+      await runWithWait(
+        page,
+        { collect: async () => null },
+        {
+          mode: "all",
+          timeoutMs: 120,
+          conditions: [{ kind: "text", state: "visible", scope: "body", match: "contains", value: "definitely absent marker" }],
+        },
+        async () => {}
+      );
+    } catch (error) {
+      absent = error as AgentProtocolError;
+    }
+    expect(absent).toMatchObject({
+      code: "WAIT_TIMEOUT",
+      details: { observations: [{ coverage: "complete" }] },
+    });
+  }, 30_000);
 
   it(
     "returns a Chromium target id when available and never treats a detached ref as disabled",

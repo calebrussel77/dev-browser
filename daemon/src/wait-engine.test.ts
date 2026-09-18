@@ -32,6 +32,56 @@ describe.sequential("typed event-driven wait engine", () => {
     await fixture.close();
   }, 180_000);
 
+  it("settles after two quiet polls and waits for in-flight requests up to its cap", async () => {
+    const page = await manager.getPage("wait", "settled");
+    await page.goto(fixture.mainUrl);
+    await collectPageState(page);
+
+    const quietStarted = performance.now();
+    const quiet = await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 700,
+        conditions: [{ kind: "settled", minSettleMs: 50, maxSettleMs: 700 }],
+      },
+      () => page.evaluate(() => {
+        setTimeout(() => document.body.setAttribute("data-first", "1"), 20);
+        setTimeout(() => document.body.setAttribute("data-second", "1"), 60);
+      })
+    );
+    expect(quiet.waitResult.elapsedMs).toBeGreaterThanOrEqual(100);
+    expect(performance.now() - quietStarted).toBeLessThan(400);
+
+    const networkStarted = performance.now();
+    await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 700,
+        conditions: [{ kind: "settled", minSettleMs: 50, maxSettleMs: 700 }],
+      },
+      () => page.evaluate(() => { void fetch("/api/slow?ms=400"); })
+    );
+    expect(performance.now() - networkStarted).toBeGreaterThanOrEqual(380);
+
+    const cappedStarted = performance.now();
+    await runWithWait(
+      page,
+      { collect: async () => null },
+      {
+        mode: "all",
+        timeoutMs: 750,
+        conditions: [{ kind: "settled", minSettleMs: 50, maxSettleMs: 700 }],
+      },
+      () => page.evaluate(() => { void fetch("/api/slow?ms=1500"); })
+    );
+    expect(performance.now() - cappedStarted).toBeGreaterThanOrEqual(650);
+    expect(performance.now() - cappedStarted).toBeLessThan(1_000);
+  });
+
   it(
     "composes DOM, URL, ref, surface, changed-value, response, and network-idle conditions",
     { timeout: 30_000 },
