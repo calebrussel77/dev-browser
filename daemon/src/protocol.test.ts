@@ -105,6 +105,38 @@ describe("interactive request protocol", () => {
     }
   });
 
+  it("accepts compact response controls only when enabled on protocol v2", () => {
+    for (const responseControl of [{ elements: true }, { verbose: true }, { elements: true, verbose: true }]) {
+      expect(parseRequest(JSON.stringify({
+        id: "response-controls-v2",
+        type: "interactive",
+        protocolVersion: 2,
+        ...responseControl,
+        action: { kind: "observe" },
+      }))).toMatchObject({ success: true, request: responseControl });
+
+      expect(parseRequest(JSON.stringify({
+        id: "response-controls-v1",
+        type: "interactive",
+        protocolVersion: 1,
+        ...responseControl,
+        action: { kind: "observe" },
+      }))).toMatchObject({ success: false });
+    }
+
+    expect(parseRequest(JSON.stringify({
+      id: "disabled-response-controls-v1",
+      type: "interactive",
+      protocolVersion: 1,
+      elements: false,
+      verbose: false,
+      action: { kind: "observe" },
+    }))).toMatchObject({
+      success: true,
+      request: { protocolVersion: 1, elements: false, verbose: false },
+    });
+  });
+
   it("returns a typed non-recoverable mismatch for unsupported versions", () => {
     const result = parseRequest(
       JSON.stringify({
@@ -365,6 +397,10 @@ describe("interactive request protocol", () => {
       action: { kind: "find", role: "button", name: "Connect", nameMode: "exact", within: "main", near: "Profile", frame: "F0", scope: "document", states: ["enabled", "collapsed"], index: 0, limit: 5 },
     }));
     expect(structured).toMatchObject({ success: true, request: { action: { kind: "find", scope: "document", states: ["enabled", "collapsed"] } } });
+    expect(parseRequest(JSON.stringify({
+      id: "default-find-limit", type: "interactive", protocolVersion: 2,
+      action: { kind: "find", query: "Connect" },
+    }))).toMatchObject({ success: true, request: { action: { limit: 3 } } });
     for (const action of [
       { kind: "find" },
       { kind: "find", nameMode: "contains" },

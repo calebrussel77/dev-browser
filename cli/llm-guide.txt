@@ -22,7 +22,8 @@ LLM USAGE GUIDE:
 
   Prefer the interactive perception-action loop for consequential UI work:
     dev-browser --connect pages
-    dev-browser --connect observe --page TARGET_ID --annotate --shot before.png
+    dev-browser --connect observe --page TARGET_ID --within main
+    dev-browser --connect observe --page TARGET_ID --within main --elements
     dev-browser --connect find --page TARGET_ID --role button --name "Connect" --name-mode exact --within main --near "Profile" --scope document
     dev-browser --connect click --page TARGET_ID --ref R12 --from-state doc-7:184 --wait-text "visible,body,contains,Add a note" --shot modal.png
     dev-browser --connect confirm --page TARGET_ID --ref F0:R14 --expect "Naminsita Bakayoko" --shot confirm.png
@@ -31,21 +32,26 @@ LLM USAGE GUIDE:
     dev-browser --connect click --page TARGET_ID --ref R12 --trace
     dev-browser trace show LAST
 
-    `observe` returns compact protocol-v2 state plus stable refs with role, name,
-    visibility, viewport coordinates, and main/aside/dialog landmark paths.
+    JSON output is one compact line by default; add global `--pretty` only for
+    human inspection. `observe` returns a compact protocol-v2 tree with stable
+    refs, roles, names, states, and main/aside/dialog landmark paths. It omits
+    `elements` and coordinate metadata by default. Add `--elements` for compact
+    actionable records and boxes, or `--verbose` for full records and diagnostic
+    journals. `--verbose` wins when both response controls are present.
     `find` takes a fresh snapshot on every call. It keeps the natural query form
     and also accepts combinable role/name/within/near/frame/scope/state filters;
     use index only as an explicit last resort. Matches report exact reasons,
-    confidence, score gap, ambiguity, duplicate-disambiguating context, and
-    actionability state. `find` matches over the full collected snapshot, not
+    confidence, score gap, ambiguity, and duplicate-disambiguating context.
+    It returns at most three compact matches by default and no tree unless
+    `--verbose` is set. `find` matches over the full collected snapshot, not
     the display-budgeted tree `observe` prints, so it reaches mid-page elements
     on large documents; its `search` field reports coverage. An empty result
     with `ambiguity.reason: "no-match"` means the traversal completed and the
     element genuinely is absent; `"budget-exhausted"` (with `search.truncated:
     true`) means collection hit a hard cap and absence was NOT proven — narrow
     with `find --root REF` (a subtree ref from observe), --within, or --frame
-    instead of falling back to raw selectors. `click` and `type` automatically return the refreshed
-    snapshot, refs, and coordinates. Ref actions share bounded visibility,
+    instead of falling back to raw selectors. `click` and `type` automatically
+    return a refreshed compact tree and bounded delta. Ref actions share bounded visibility,
     stability, enabled-state, scrolling, and obstruction checks. `click` reports URL/snapshot/dialog/aria-expanded
     changes. Typed `--wait-*` conditions are event-driven and cover text, URL,
     refs, dialogs, toasts, popups, downloads, file choosers, navigation,

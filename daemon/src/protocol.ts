@@ -300,7 +300,7 @@ const StructuredFindSchema = z
       .max(7)
       .default([]),
     index: z.number().int().nonnegative().max(999).optional(),
-    limit: z.number().int().positive().max(50).default(10),
+    limit: z.number().int().positive().max(50).default(3),
     // Scope collection to a subtree obtained from observe, so hard collection
     // caps are spent inside it instead of on the whole document. Filters
     // (within included) still apply as post-collection filters.
@@ -441,7 +441,16 @@ const InteractiveRequestSchema = RequestBaseSchema.extend({
   timeoutMs: z.number().int().positive().optional(),
   session: z.string().min(1).max(500).optional(),
   trace: z.boolean().default(false),
+  elements: z.boolean().optional(),
+  verbose: z.boolean().optional(),
 }).superRefine((value, context) => {
+  if (value.protocolVersion === 1 && (value.elements === true || value.verbose === true)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [value.verbose === true ? "verbose" : "elements"],
+      message: "elements and verbose require protocolVersion 2 when enabled",
+    });
+  }
   if (value.action.kind === "paste" && (value.shot !== undefined || value.annotate)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,

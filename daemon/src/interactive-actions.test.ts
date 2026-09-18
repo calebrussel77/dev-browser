@@ -19,7 +19,14 @@ const browserName = "interactive-actions";
 
 function request(
   action: Parameters<typeof executeInteractiveAction>[1]["action"],
-  options: { shot?: string; timeoutMs?: number; annotate?: boolean; fullPage?: boolean } = {}
+  options: {
+    shot?: string;
+    timeoutMs?: number;
+    annotate?: boolean;
+    fullPage?: boolean;
+    elements?: boolean;
+    verbose?: boolean;
+  } = {}
 ): Parameters<typeof executeInteractiveAction>[1] {
   return {
     id: `test-${action.kind}`,
@@ -149,7 +156,7 @@ describe.sequential("interactive Playwright actions", () => {
     expect("snapshot" in first ? first.snapshot : "").toContain("Naminsita Bakayoko");
   });
 
-  it("uses one v2 state shape for observe and legacy read", async () => {
+  it("omits the v2 element payload by default", async () => {
     const observe = await executeInteractiveAction(manager, {
       ...request({
         kind: "observe",
@@ -171,7 +178,137 @@ describe.sequential("interactive Playwright actions", () => {
     expect(observe.documentId).toBe(read.documentId);
     expect(observe.tree).toBe(read.tree);
     expect(observe.coordinateSpace).toEqual(read.coordinateSpace);
-    expect(observe.elements).toEqual(read.elements);
+    expect(observe).not.toHaveProperty("elements");
+    expect(read).not.toHaveProperty("elements");
+  });
+
+  it("returns compact elements on request and preserves the historical verbose shape", async () => {
+    const action = {
+      kind: "observe" as const,
+      full: false,
+      delta: false,
+      track: "response-shape",
+      maxNodes: 100,
+      maxChars: 12_000,
+      depth: 12,
+      breadth: 50,
+    };
+    const compact = await executeInteractiveAction(manager, {
+      ...request(action, { elements: true }),
+      protocolVersion: 2,
+    });
+    const verbose = await executeInteractiveAction(manager, {
+      ...request(action, { verbose: true }),
+      protocolVersion: 2,
+    });
+
+    expect(compact.elements?.length).toBeGreaterThan(0);
+    const compactPayloads = (compact.elements ?? []).map((element) => JSON.stringify(element));
+    expect(Math.max(...compactPayloads.map((payload) => payload.length)), compactPayloads.sort((a, b) => b.length - a.length)[0])
+      .toBeLessThan(200);
+    expect(compact.elements?.[0]).not.toHaveProperty("visible");
+    expect(compact.elements?.[0]).not.toHaveProperty("semanticAncestors");
+    expect(compact.tree).toBe(
+      verbose.tree
+        ?.split("\n")
+        .map((line) => {
+          const spaces = line.length - line.trimStart().length;
+          return `${" ".repeat(Math.floor(spaces / 2))}${line.trimStart()}`;
+        })
+        .join("\n")
+    );
+    expect(Object.keys(verbose.elements?.[0] ?? {}).sort()).toEqual([
+      "actionable", "box", "checked", "current", "depth", "description", "disabled",
+      "expanded", "focused", "frameDocumentId", "frameId", "frameName", "framePath", "frameUrl",
+      "inViewport", "inputType", "landmark", "name", "nearby", "obscured", "placeholder",
+      "pressed", "quad", "readonly", "ref", "required", "role", "scrollable", "selected",
+      "semanticAncestors", "shadowContext", "stableAttributes", "visible",
+    ]);
+  });
+
+  it("lets verbose win when both response controls are enabled", async () => {
+    const result = await executeInteractiveAction(manager, {
+      ...request(
+        { kind: "observe", full: false, delta: false, track: "verbose-wins", maxNodes: 100,
+          maxChars: 12_000, depth: 12, breadth: 50 },
+        { elements: true, verbose: true }
+      ),
+      protocolVersion: 2,
+    });
+
+    expect(result.elements?.[0]).toHaveProperty("semanticAncestors");
+  });
+
+  it("omits v2 diagnostic noise by default and keeps compact wait evidence", async () => {
+    const pageName = "compact-response";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><button id="open">Open modal</button></main><script>
+      document.querySelector('#open').addEventListener('click', () => {
+        const dialog = document.createElement('div');
+        dialog.setAttribute('role', 'dialog');
+        dialog.textContent = 'Compact modal opened';
+        document.body.append(dialog);
+      });
+    </script>`);
+    const found = await executeInteractiveAction(manager, {
+      ...request({ kind: "find", role: "button", name: "Open modal", nameMode: "exact", scope: "document", states: [], limit: 3 }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    const result = await executeInteractiveAction(manager, {
+      ...request({
+        kind: "click",
+        ref: found.matches![0]!.ref,
+        method: "mouse",
+        wait: { mode: "all", timeoutMs: 1_000, conditions: [{ kind: "dialog", state: "opened" }] },
+      }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+
+    for (const key of [
+      "attemptJournal", "attempts", "targets", "change", "waitForText", "waitSatisfied",
+      "coordinateSpace", "truncation", "warnings",
+    ]) expect(result).not.toHaveProperty(key);
+    expect(Object.keys(result.waitResult ?? {}).sort()).toEqual(["elapsedMs", "passed", "timedOut"]);
+    expect(result.waitResult).toEqual(expect.objectContaining({ passed: ["dialog"], timedOut: [] }));
+    expect(result.clicked).toEqual(expect.objectContaining({
+      ref: found.matches![0]!.ref,
+      method: "mouse",
+      point: { x: expect.any(Number), y: expect.any(Number) },
+    }));
+    expect(result.clicked).not.toHaveProperty("box");
+    expect(result.clicked).not.toHaveProperty("scroll");
+    expect(result.clicked).not.toHaveProperty("actual");
+  });
+
+  it("preserves verbose diagnostics and rounds v2 response geometry", async () => {
+    const pageName = "verbose-response";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><button style="position:relative;left:0.375px;width:101.625px">Fractional button</button></main>`);
+    const observed = await executeInteractiveAction(manager, {
+      ...request({ kind: "observe", full: false, delta: false, track: "rounded", maxNodes: 100, maxChars: 12_000, depth: 12, breadth: 50 }, { verbose: true }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    const target = observed.elements!.find((element) => element.name === "Fractional button")!;
+
+    expect(Object.values(target.box).every(Number.isInteger)).toBe(true);
+    expect(Object.values(observed.coordinateSpace!.viewport).every(Number.isInteger)).toBe(true);
+    expect((String(observed.coordinateSpace!.devicePixelRatio).split(".")[1] ?? "").length).toBeLessThanOrEqual(2);
+
+    const clicked = await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: target.ref, method: "mouse" }, { verbose: true }),
+      page: pageName,
+      protocolVersion: 2,
+    });
+    expect(clicked).toHaveProperty("attemptJournal");
+    expect(clicked).toHaveProperty("attempts");
+    expect(clicked).toHaveProperty("targets");
+    expect(clicked).toHaveProperty("change");
+    expect(clicked).toHaveProperty("coordinateSpace");
+    expect(Object.values(clicked.clicked!.point).every(Number.isInteger)).toBe(true);
+    expect(clicked.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
   });
 
   it("keeps text/assert responses scope bounded instead of re-collecting the full unscoped tree", async () => {
@@ -231,16 +368,57 @@ describe.sequential("interactive Playwright actions", () => {
     );
   });
 
-  it("returns compact v2 find matches without the full element dump", async () => {
+  it("returns at most three compact v2 find matches without a tree by default", async () => {
     const result = await executeInteractiveAction(manager, {
-      ...request({ kind: "find", query: "connect main", limit: 5 }),
+      ...request({ kind: "find", query: "connect", limit: 3 }),
       protocolVersion: 2,
     });
 
     expect(result.matches?.length).toBeGreaterThan(0);
+    expect(result.matches?.length).toBeLessThanOrEqual(3);
     expect(result.elements).toBeUndefined();
     expect(result.documentId).toMatch(/^doc-\d+$/);
-    expect(result.tree).toEqual(expect.any(String));
+    expect(result.tree).toBeUndefined();
+    for (const match of result.matches ?? []) {
+      expect(match).not.toHaveProperty("semanticAncestors");
+      expect(match).not.toHaveProperty("quad");
+      expect(match.matchedBecause.length).toBeLessThanOrEqual(3);
+    }
+  });
+
+  it("keeps the full find shape under verbose and returns five contextual ambiguous candidates", async () => {
+    const pageName = "ambiguous-find";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main>${Array.from({ length: 7 }, (_, index) =>
+      `<article><h2>Card ${index}</h2><button>Choose</button><p>Context ${index}</p></article>`
+    ).join("")}</main>`);
+
+    const compact = await executeInteractiveAction(manager, {
+      id: "ambiguous-find-compact",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "find", role: "button", name: "Choose", nameMode: "exact", scope: "document", states: [], limit: 3 },
+    });
+    expect(compact.ambiguity?.ambiguous).toBe(true);
+    expect(compact.matches).toHaveLength(5);
+    expect(compact.matches?.[0]).toMatchObject({
+      landmark: expect.any(String),
+      nearby: { context: expect.any(String) },
+    });
+
+    const verbose = await executeInteractiveAction(manager, {
+      id: "ambiguous-find-verbose",
+      type: "interactive",
+      protocolVersion: 2,
+      verbose: true,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "find", role: "button", name: "Choose", nameMode: "exact", scope: "document", states: [], limit: 3 },
+    });
+    expect(verbose.tree).toEqual(expect.any(String));
+    expect(verbose.matches?.[0]).toHaveProperty("semanticAncestors");
   });
 
   it("find reaches and can act on elements beyond the display budget", async () => {
@@ -266,8 +444,9 @@ describe.sequential("interactive Playwright actions", () => {
       action: { kind: "find", name: "Se connecter", nameMode: "exact", scope: "visible", states: [], limit: 10 },
     });
 
-    // The budgeted tree stops before the deep subtree, yet find matches it.
-    expect(found.tree).not.toContain("Se connecter");
+    // Compact find omits the budgeted tree, yet matching still covers the
+    // complete collected record set beyond that former display budget.
+    expect(found.tree).toBeUndefined();
     expect(found.matches?.[0]).toEqual(
       expect.objectContaining({ name: "Se connecter", confidence: "high" })
     );
@@ -315,6 +494,7 @@ describe.sequential("interactive Playwright actions", () => {
       id: "test-root-read",
       type: "interactive",
       protocolVersion: 2,
+      elements: true,
       browser: browserName,
       page: "root-page",
       action: { kind: "read", limit: 100, depth: 12 },
@@ -433,6 +613,7 @@ describe.sequential("interactive Playwright actions", () => {
         breadth: 50,
       }),
       protocolVersion: 2,
+      elements: true,
     });
     const ref = observed.elements?.find((element) => element.name === "Changed action")?.ref;
     const page = await manager.getPage(browserName, "profile");
@@ -440,6 +621,7 @@ describe.sequential("interactive Playwright actions", () => {
       const clicked = await executeInteractiveAction(manager, {
         ...request({ kind: "click", ref: ref!, method: "mouse" }),
         protocolVersion: 2,
+        elements: true,
       });
 
       expect(clicked.documentId).toBe(observed.documentId);
@@ -502,6 +684,11 @@ describe.sequential("interactive Playwright actions", () => {
       passed: [{ kind: "dialog", state: "opened" }],
     });
     expect(result.snapshot).toContain("Dynamic modal opened");
+    const openedDialog = result.elements?.find(
+      (element) => element.name === "Dynamic modal opened"
+    );
+    expect(result.delta?.added).toContain(openedDialog?.ref);
+    expect(result.delta?.summary).toContain("dialog opened");
     expect(result.elements).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "Dynamic modal opened" })])
     );
@@ -511,6 +698,55 @@ describe.sequential("interactive Playwright actions", () => {
         .find((element) => element.textContent?.includes("Dynamic modal opened"))
         ?.remove();
     });
+  });
+
+  it("returns default-track deltas after type and navigation without explicit waits", async () => {
+    const pageName = "systematic-delta";
+    const page = await manager.getPage(browserName, pageName);
+    await page.setContent(`<main><label>Draft <input aria-label="Draft"></label></main>`);
+    const found = await executeInteractiveAction(manager, {
+      id: "delta-find",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: {
+        kind: "find",
+        role: "textbox",
+        scope: "document",
+        states: [],
+        limit: 3,
+      },
+    });
+    const typed = await executeInteractiveAction(manager, {
+      id: "delta-type",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: {
+        kind: "type",
+        ref: found.matches![0]!.ref,
+        text: "draft",
+        clear: true,
+        delayMs: 0,
+      },
+    });
+
+    expect(typed.delta).not.toBeNull();
+    expect(typed.delta?.summary).toEqual(expect.any(String));
+
+    const navigated = await executeInteractiveAction(manager, {
+      id: "delta-navigate",
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      action: { kind: "navigate", url: "data:text/html,<main>after navigation</main>" },
+    });
+    expect(navigated.delta?.url?.before).toBe("about:blank");
+    expect(navigated.delta?.url?.after).toContain("data:text/html");
+    expect(navigated.delta?.summary).toContain("url changed");
   });
 
   it("waits for expected UI and retries one unchanged click", async () => {
@@ -570,6 +806,7 @@ describe.sequential("interactive Playwright actions", () => {
         const observed = await executeInteractiveAction(manager, {
           ...request({ kind: "read", limit: 100, depth: 12 }),
           protocolVersion: 2,
+          elements: true,
         });
         const ref = elements(observed).find((element) => element.name === "Action")!.ref;
         return ref;
@@ -627,7 +864,7 @@ describe.sequential("interactive Playwright actions", () => {
         const result = await executeInteractiveAction(manager, {
           ...request(
             { kind: "click", ref, method: "mouse", waitForText: "SUCCESS", retry },
-            { timeoutMs: 100 }
+            { timeoutMs: 100, verbose: true }
           ),
           protocolVersion: 2,
         });
@@ -709,6 +946,7 @@ describe.sequential("interactive Playwright actions", () => {
         const observed = await executeInteractiveAction(manager, {
           ...request({ kind: "read", limit: 100, depth: 12 }),
           protocolVersion: 2,
+          elements: true,
         });
         const transientRef = elements(observed).find((element) => element.name === "Action")!.ref;
         await page.locator("#action").focus();
@@ -1121,6 +1359,7 @@ describe.sequential("interactive Playwright actions", () => {
     const observed = await executeInteractiveAction(manager, {
       ...request({ kind: "observe", full: true, delta: false, track: "confirmation", maxNodes: 100, maxChars: 12000, depth: 12, breadth: 50 }),
       protocolVersion: 2,
+      elements: true,
     });
     const ref = elements(observed).find((element) => element.name === "Send")!.ref;
     const confirmation = await executeInteractiveAction(manager, {
@@ -1176,6 +1415,7 @@ describe.sequential("interactive Playwright actions", () => {
           breadth: 50,
         }),
         protocolVersion: 2,
+        elements: true,
       });
     const observed = await observe();
     const ref = elements(observed).find((element) => element.name === "Save")!.ref;
@@ -1221,7 +1461,12 @@ describe.sequential("interactive Playwright actions", () => {
       ...request({ kind: "click", ref: deleteRef, method: "mouse" }),
       protocolVersion: 2,
     });
-    expect(unversioned.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
+    expect(unversioned.warnings ?? []).not.toContainEqual(expect.stringContaining("Unversioned decision"));
+    const verboseUnversioned = await executeInteractiveAction(manager, {
+      ...request({ kind: "click", ref: deleteRef, method: "mouse" }, { verbose: true }),
+      protocolVersion: 2,
+    });
+    expect(verboseUnversioned.warnings).toContainEqual(expect.stringContaining("Unversioned decision"));
   });
 
   it("rejects removal, remount, navigation, and interleaved agent decisions", async () => {
@@ -1239,6 +1484,7 @@ describe.sequential("interactive Playwright actions", () => {
           breadth: 50,
         }),
         protocolVersion: 2,
+        elements: true,
       });
     await page.setContent(
       `<button id="target" aria-expanded="false">Act</button><script>window.inputs=0;document.querySelector('#target').onclick=e=>{window.inputs++;e.currentTarget.setAttribute('aria-expanded','true')}</script>`
@@ -1496,6 +1742,7 @@ describe.sequential("interactive Playwright actions", () => {
     const read = await executeInteractiveAction(manager, {
       ...request({ kind: "read", limit: 100, depth: 12 }),
       protocolVersion: 2,
+      elements: true,
       page: targetPage,
     });
     const field = elements(read).find((element) => element.name === "Replaceable field")!;

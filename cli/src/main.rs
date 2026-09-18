@@ -196,6 +196,13 @@ struct Cli {
 
     #[arg(
         long,
+        global = true,
+        help = "Pretty-print JSON responses instead of emitting one compact line"
+    )]
+    pretty: bool,
+
+    #[arg(
+        long,
         value_name = "SESSION_ID",
         help = "Authorize script execution while this browser has a writer lease"
     )]
@@ -287,6 +294,18 @@ struct PageActionArgs {
         help = "Capture document CSS pixels instead of the current viewport"
     )]
     full_page: bool,
+
+    #[arg(
+        long,
+        help = "Include compact actionable element metadata in the response"
+    )]
+    elements: bool,
+
+    #[arg(
+        long,
+        help = "Restore the full historical interactive response payload"
+    )]
+    verbose: bool,
 
     #[arg(long, value_name = "STATE")]
     from_state: Option<String>,
@@ -681,7 +700,7 @@ enum Command {
         states: Vec<FindState>,
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..=999))]
         index: Option<u16>,
-        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
         #[arg(
             long = "root",
@@ -880,6 +899,16 @@ enum Command {
         full_page: bool,
         #[arg(long)]
         annotate: bool,
+        #[arg(
+            long,
+            help = "Include compact actionable element metadata in the response"
+        )]
+        elements: bool,
+        #[arg(
+            long,
+            help = "Restore the full historical interactive response payload"
+        )]
+        verbose: bool,
         #[arg(long, value_name = "MILLISECONDS", value_parser = clap::value_parser!(u32).range(250..=120_000))]
         shot_timeout: Option<u32>,
         #[arg(long, value_name = "STATE")]
@@ -974,7 +1003,7 @@ struct StatusSummary {
 
 enum ResultMode {
     None,
-    Json,
+    Json { pretty: bool },
     Browsers,
     Status,
 }
@@ -1010,6 +1039,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
             &cli,
             "main",
             None,
+            false,
+            false,
             false,
             false,
             None,
@@ -1362,6 +1393,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
             padding,
             full_page,
             annotate,
+            elements,
+            verbose,
             shot_timeout,
             from_state,
             strict_state,
@@ -1383,6 +1416,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 Some(file),
                 *annotate,
                 *full_page,
+                *elements,
+                *verbose,
                 shot_timeout.map(u64::from),
                 action,
                 session.as_deref(),
@@ -1401,7 +1436,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     json!({ "id": request_id("session-close"), "type": "session", "action": "close", "session": session })
                 }
             };
-            send_request(request, ResultMode::Json)
+            send_request(request, ResultMode::Json { pretty: cli.pretty })
         }
         Some(Command::Browsers) => {
             ensure_daemon()?;
@@ -1482,13 +1517,13 @@ fn run() -> Result<i32, Box<dyn Error>> {
             ensure_daemon()?;
             send_request(
                 json!({ "id": request_id("trace-show"), "type": "trace", "action": "show", "traceId": trace_id }),
-                ResultMode::Json,
+                ResultMode::Json { pretty: cli.pretty },
             )
         }
         Some(Command::Video(command)) => {
             let request = build_video_request(&cli, command)?;
             ensure_daemon()?;
-            send_request(request, ResultMode::Json)
+            send_request(request, ResultMode::Json { pretty: cli.pretty })
         }
         Some(Command::InstallSkill { claude, agents }) => {
             install_skill(*claude, *agents)?;
@@ -1568,7 +1603,7 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
         request["connect"] = Value::String(endpoint.clone());
     }
 
-    send_request(request, ResultMode::Json)
+    send_request(request, ResultMode::Json { pretty: cli.pretty })
 }
 
 fn build_execute_request(
@@ -1610,6 +1645,8 @@ fn run_page_action(
         output.shot.as_deref(),
         output.annotate,
         output.full_page,
+        output.elements,
+        output.verbose,
         output.shot_timeout.map(u64::from),
         action,
         output.session.as_deref(),
@@ -1680,6 +1717,8 @@ fn run_interactive(
     shot: Option<&str>,
     annotate: bool,
     full_page: bool,
+    elements: bool,
+    verbose: bool,
     shot_timeout: Option<u64>,
     action: Value,
     session: Option<&str>,
@@ -1705,10 +1744,12 @@ fn run_interactive(
             timeout_ms,
             session,
             trace: cli.trace,
+            elements,
+            verbose,
         },
         action,
     );
-    send_request(request, ResultMode::Json)
+    send_request(request, ResultMode::Json { pretty: cli.pretty })
 }
 
 fn build_video_request(cli: &Cli, command: &VideoCommand) -> Result<Value, Box<dyn Error>> {
@@ -1884,7 +1925,7 @@ fn daemon_error_exit_code(message: &Value) -> i32 {
 fn render_result(data: &Value, result_mode: &ResultMode) -> Result<(), Box<dyn Error>> {
     match result_mode {
         ResultMode::None => {}
-        ResultMode::Json => {
+        ResultMode::Json { pretty } => {
             if data.is_null() {
                 return Ok(());
             }
@@ -1892,7 +1933,7 @@ fn render_result(data: &Value, result_mode: &ResultMode) -> Result<(), Box<dyn E
             if let Some(text) = data.as_str() {
                 println!("{text}");
             } else {
-                println!("{}", serde_json::to_string_pretty(data)?);
+                println!("{}", format_json_result(data, *pretty)?);
             }
         }
         ResultMode::Browsers => print_browsers(data)?,
@@ -1900,6 +1941,14 @@ fn render_result(data: &Value, result_mode: &ResultMode) -> Result<(), Box<dyn E
     }
 
     Ok(())
+}
+
+fn format_json_result(data: &Value, pretty: bool) -> Result<String, serde_json::Error> {
+    if pretty {
+        serde_json::to_string_pretty(data)
+    } else {
+        serde_json::to_string(data)
+    }
 }
 
 fn print_browsers(data: &Value) -> Result<(), Box<dyn Error>> {
@@ -2016,8 +2065,9 @@ fn format_duration_ms(duration_ms: u64) -> String {
 mod tests {
     use super::{
         apply_retry_policy, build_execute_request, build_find_action, build_primitive_action,
-        build_video_request, cli_error_exit_code, parse_video_size, read_text_stream,
-        stream_responses, Cli, Command, ResultMode, SessionCommand, TraceCommand, VideoCommand,
+        build_video_request, cli_error_exit_code, format_json_result, parse_video_size,
+        read_text_stream, stream_responses, Cli, Command, ResultMode, SessionCommand, TraceCommand,
+        VideoCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2025,6 +2075,23 @@ mod tests {
 
     fn response_exit_code(response: &str) -> i32 {
         stream_responses(&mut Cursor::new(response.as_bytes()), ResultMode::None).unwrap()
+    }
+
+    #[test]
+    fn renders_json_compact_by_default_and_pretty_on_request() {
+        let value = json!({ "nested": { "answer": 42 }, "ok": true });
+
+        assert_eq!(
+            format_json_result(&value, false).unwrap(),
+            r#"{"nested":{"answer":42},"ok":true}"#
+        );
+        assert_eq!(
+            format_json_result(&value, true).unwrap(),
+            "{\n  \"nested\": {\n    \"answer\": 42\n  },\n  \"ok\": true\n}"
+        );
+
+        let cli = Cli::try_parse_from(["dev-browser", "--pretty", "status"]).unwrap();
+        assert!(cli.pretty);
     }
 
     #[test]
@@ -2290,6 +2357,8 @@ mod tests {
             "eyJ2IjoxLCJvZmZzZXQiOjN9",
             "--annotate",
             "--full-page",
+            "--elements",
+            "--verbose",
             "--shot-timeout",
             "250",
         ])
@@ -2308,7 +2377,26 @@ mod tests {
                 continuation: Some(_),
                 ref output,
                 ..
-            }) if track == "checkout" && output.annotate && output.full_page && output.shot_timeout == Some(250)
+            }) if track == "checkout" && output.annotate && output.full_page
+                && output.shot_timeout == Some(250) && output.elements && output.verbose
+        ));
+    }
+
+    #[test]
+    fn parses_response_shape_flags_on_other_interactive_actions() {
+        let parsed = Cli::try_parse_from([
+            "dev-browser",
+            "click",
+            "--ref",
+            "R2",
+            "--elements",
+            "--verbose",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Click { ref output, .. }) if output.elements && output.verbose
         ));
     }
 
@@ -2418,14 +2506,23 @@ mod tests {
             "--padding",
             "32",
             "--full-page",
+            "--elements",
+            "--verbose",
             "--shot-timeout",
             "120000",
         ])
         .unwrap();
         assert!(matches!(
             shot.command,
-            Some(Command::Shot { ref ref_id, padding: 32, full_page: true, shot_timeout: Some(120_000), .. })
-                if ref_id.as_deref() == Some("R7")
+            Some(Command::Shot {
+                ref ref_id,
+                padding: 32,
+                full_page: true,
+                elements: true,
+                verbose: true,
+                shot_timeout: Some(120_000),
+                ..
+            }) if ref_id.as_deref() == Some("R7")
         ));
         assert!(Cli::try_parse_from(["dev-browser", "shot", "--shot-timeout", "249"]).is_err());
     }
@@ -2666,6 +2763,12 @@ mod tests {
 
     #[test]
     fn parses_and_serializes_every_structured_find_filter() {
+        let defaults = Cli::try_parse_from(["dev-browser", "find", "Connect"]).unwrap();
+        assert!(matches!(
+            defaults.command,
+            Some(Command::Find { limit: 3, .. })
+        ));
+
         let parsed = Cli::try_parse_from([
             "dev-browser",
             "find",

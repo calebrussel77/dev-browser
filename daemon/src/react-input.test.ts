@@ -104,6 +104,7 @@ function request(
     protocolVersion: 2,
     browser: browserName,
     page,
+    verbose: action.kind === "read" || action.kind === "observe",
     action,
   };
 }

@@ -9,6 +9,8 @@ export interface PerceptionDelta {
   added: string[];
   removed: string[];
   changed: string[];
+  summary: string;
+  truncated?: true;
 }
 
 export interface Snapshot {
@@ -16,6 +18,7 @@ export interface Snapshot {
   title: string;
   focusedRef: string | null;
   elements: Map<string, string>;
+  dialogs: Set<string>;
   signature: string;
   // The content scope the producing collection ran under, when any. Action-time
   // ref revalidation replays the same scope so refs from a scoped observe are
@@ -34,6 +37,32 @@ interface PageHistory {
 
 const histories = new WeakMap<Page, PageHistory>();
 let nextDocumentNumber = 1;
+const MAX_DELTA_REFS = 50;
+
+function deltaSummary(options: {
+  added: number;
+  removed: number;
+  changed: number;
+  urlChanged: boolean;
+  titleChanged: boolean;
+  focusChanged: boolean;
+  dialogOpened: boolean;
+  dialogClosed: boolean;
+}): string {
+  const parts: string[] = [];
+  const refs = [
+    options.added > 0 ? `+${options.added}` : "",
+    options.removed > 0 ? `−${options.removed}` : "",
+    options.changed > 0 ? `~${options.changed}` : "",
+  ].filter(Boolean);
+  if (refs.length > 0) parts.push(`${refs.join(" ")} refs`);
+  if (options.urlChanged) parts.push("url changed");
+  if (options.titleChanged) parts.push("title changed");
+  if (options.focusChanged) parts.push("focus changed");
+  if (options.dialogOpened) parts.push("dialog opened");
+  if (options.dialogClosed) parts.push("dialog closed");
+  return parts.join(", ") || "no observable changes";
+}
 
 export function semanticFingerprint(element: PerceptionElement): string {
   return JSON.stringify({
@@ -89,16 +118,19 @@ export function recordPageState(
   page: Page,
   realmToken: string,
   track: string,
-  current: Omit<Snapshot, "elements" | "signature"> & { elements: PerceptionElement[] },
+  current: Omit<Snapshot, "elements" | "dialogs" | "signature"> & {
+    elements: PerceptionElement[];
+  },
   includeDelta: boolean
 ): { documentId: string; stateId: string; delta: PerceptionDelta | null } {
   let history = histories.get(page);
   if (!history || history.realmToken !== realmToken) {
+    const tracks = history?.tracks ?? new Map<string, Snapshot>();
     history = {
       realmToken,
       documentNumber: nextDocumentNumber++,
       stateNumber: 0,
-      tracks: new Map(),
+      tracks,
       states: new Map(),
       latestStateId: null,
     };
@@ -106,38 +138,72 @@ export function recordPageState(
   }
 
   history.stateNumber += 1;
+  const fingerprinted = current.elements.map((element) => ({
+    element,
+    fingerprint: semanticFingerprint(element),
+  }));
   const elements = new Map(
-    current.elements.filter((element) => element.ref).map((element) => [element.ref, semanticFingerprint(element)])
+    fingerprinted
+      .filter(({ element }) => element.ref)
+      .map(({ element, fingerprint }) => [element.ref, fingerprint])
+  );
+  const dialogs = new Set(
+    fingerprinted
+      .filter(
+        ({ element }) =>
+          element.ref && (element.role === "dialog" || element.role === "alertdialog")
+      )
+      .map(({ element }) => element.ref)
   );
   const previous = history.tracks.get(track);
   const signature = JSON.stringify({
     url: current.url,
     title: current.title,
     focusedRef: current.focusedRef,
-    elements: current.elements.map(semanticFingerprint),
+    elements: fingerprinted.map(({ fingerprint }) => fingerprint),
   });
-  const next: Snapshot = { ...current, elements, signature };
+  const next: Snapshot = { ...current, elements, dialogs, signature };
   history.tracks.set(track, next);
 
   let delta: PerceptionDelta | null = null;
   if (includeDelta && previous) {
+    const added = [...elements.keys()].filter((ref) => !previous.elements.has(ref));
+    const removed = [...previous.elements.keys()].filter((ref) => !elements.has(ref));
+    const changed = [...elements.entries()]
+      .filter(
+        ([ref, value]) => previous.elements.has(ref) && previous.elements.get(ref) !== value
+      )
+      .map(([ref]) => ref);
+    const urlChanged = previous.url !== current.url;
+    const titleChanged = previous.title !== current.title;
+    const focusChanged = previous.focusedRef !== current.focusedRef;
+    const dialogOpened = [...dialogs].some((ref) => !previous.dialogs.has(ref));
+    const dialogClosed = [...previous.dialogs].some((ref) => !dialogs.has(ref));
+    const truncated = [added, removed, changed].some((refs) => refs.length > MAX_DELTA_REFS);
     delta = {
-      ...(previous.url === current.url
-        ? {}
-        : { url: { before: previous.url, after: current.url } }),
-      ...(previous.title === current.title
-        ? {}
-        : { title: { before: previous.title, after: current.title } }),
-      ...(previous.focusedRef === current.focusedRef
-        ? {}
-        : { focus: { before: previous.focusedRef, after: current.focusedRef } }),
-      added: [...elements.keys()].filter((ref) => !previous.elements.has(ref)),
-      removed: [...previous.elements.keys()].filter((ref) => !elements.has(ref)),
-      changed: [...elements.entries()]
-        .filter(
-          ([ref, value]) => previous.elements.has(ref) && previous.elements.get(ref) !== value
-        )
-        .map(([ref]) => ref),
+      ...(urlChanged
+        ? { url: { before: previous.url, after: current.url } }
+        : {}),
+      ...(titleChanged
+        ? { title: { before: previous.title, after: current.title } }
+        : {}),
+      ...(focusChanged
+        ? { focus: { before: previous.focusedRef, after: current.focusedRef } }
+        : {}),
+      added: added.slice(0, MAX_DELTA_REFS),
+      removed: removed.slice(0, MAX_DELTA_REFS),
+      changed: changed.slice(0, MAX_DELTA_REFS),
+      summary: deltaSummary({
+        added: added.length,
+        removed: removed.length,
+        changed: changed.length,
+        urlChanged,
+        titleChanged,
+        focusChanged,
+        dialogOpened,
+        dialogClosed,
+      }),
+      ...(truncated ? { truncated: true as const } : {}),
     };
   }
 

@@ -46,9 +46,7 @@ describe.sequential("frame and shadow perception", () => {
     expect(shadow.shadowContext).toHaveLength(2);
     expect(shadow.shadowContext[0]).toContain("#host");
     expect(state.tree).toContain(`[${frame.ref}] button "Frame duplicate"`);
-    expect(state.warnings).toEqual([
-      expect.stringMatching(/closed shadow root/i),
-    ]);
+    expect(state.warnings).toEqual([]);
     expect(await page.locator("[data-dev-browser-ref]").count()).toBe(0);
   });
 
@@ -169,13 +167,13 @@ describe.sequential("frame and shadow perception", () => {
     expect(state.elements.find((element) => element.name === "Light frame")?.frameId).toBe("F2");
   });
 
-  it("bounds frame and record work and reports the generic closed-root capability limitation", async () => {
+  it("bounds frame and record work without repeating the documented closed-root limitation", async () => {
     await page.setContent(`<div id="closed-shadow-name-only"></div><div id="ordinary"></div>${Array.from({ length: 5_200 }, (_, index) => `<button>Stress ${index}</button>`).join("")}${Array.from({ length: 70 }, () => `<iframe srcdoc='<button>Frame stress</button>'></iframe>`).join("")}`);
     const state = await collectPageState(page, { full: true, maxNodes: 1_000 });
     expect(state.elements.length).toBeLessThanOrEqual(1_000);
     expect(state.truncation.truncated).toBe(true);
-    expect(state.warnings[0]).toMatch(/closed shadow roots cannot be inspected/i);
     expect(state.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/candidate scan was truncated/i)]));
+    expect(state.warnings).not.toEqual(expect.arrayContaining([expect.stringMatching(/closed shadow roots/i)]));
   }, 20_000);
 
   it("selects the same composed-DOM frame prefix from 150 siblings regardless of attachment order", async () => {

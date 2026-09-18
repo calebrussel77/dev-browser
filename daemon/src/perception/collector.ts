@@ -58,6 +58,66 @@ export interface PerceptionElement {
   depth: number;
 }
 
+export type CompactPerceptionElement = Pick<PerceptionElement, "ref" | "role" | "box"> &
+  Partial<
+    Pick<
+      PerceptionElement,
+      | "name"
+      | "landmark"
+      | "disabled"
+      | "checked"
+      | "expanded"
+      | "selected"
+      | "pressed"
+      | "scrollable"
+      | "obscured"
+      | "focused"
+      | "inViewport"
+      | "frameId"
+      | "value"
+      | "placeholder"
+      | "inputType"
+    >
+  > & {
+    stableAttributes?: Partial<PerceptionElement["stableAttributes"]>;
+  };
+
+/** Project collected state onto the opt-in compact v2 wire format. */
+export function compactElement(element: PerceptionElement): CompactPerceptionElement {
+  const compact: CompactPerceptionElement = {
+    ref: element.ref,
+    role: element.role,
+    box: {
+      x: Math.round(element.box.x),
+      y: Math.round(element.box.y),
+      width: Math.round(element.box.width),
+      height: Math.round(element.box.height),
+    },
+  };
+  if (element.name) compact.name = element.name;
+  if (element.landmark) compact.landmark = element.landmark.replace(/\s*>\s*/g, ">");
+  for (const key of ["disabled", "scrollable", "obscured", "focused"] as const) {
+    if (element[key]) compact[key] = true;
+  }
+  for (const key of ["checked", "expanded", "selected", "pressed"] as const) {
+    if (element[key] != null) Object.assign(compact, { [key]: element[key] });
+  }
+  if (!element.inViewport) compact.inViewport = false;
+  if (element.frameId && element.frameId !== "F0") compact.frameId = element.frameId;
+  if (["textbox", "searchbox", "combobox", "spinbutton"].includes(element.role)) {
+    for (const key of ["value", "placeholder", "inputType"] as const) {
+      if (element[key]) compact[key] = element[key];
+    }
+  }
+  const attributes = Object.fromEntries(
+    Object.entries(element.stableAttributes).filter(
+      ([key, value]) => key.trim() && typeof value === "string" && value.trim()
+    )
+  );
+  if (Object.keys(attributes).length) compact.stableAttributes = attributes;
+  return compact;
+}
+
 export interface PagePerception {
   documentId: string;
   stateId: string;
@@ -643,7 +703,7 @@ export async function collectPageState(
     ? { entries: [{ frame: page.mainFrame(), id: "F0", path: ["F0"] }], truncated: false }
     : await deterministicFrames(page);
   const frames = selectedFrames.entries;
-  const warnings: string[] = ["Closed shadow roots cannot be inspected; observation covers light DOM and open shadow roots only"];
+  const warnings: string[] = [];
   const registered: RegisteredFrame[] = [];
   const records: PerceptionElement[] = [];
   let top: Awaited<ReturnType<typeof collectRealm>> | undefined;

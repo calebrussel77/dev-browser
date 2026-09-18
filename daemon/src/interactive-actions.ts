@@ -27,6 +27,7 @@ import { executePrimitive, scrollContainerByViewport, type PrimitiveSummary } fr
 import { BrowserManager } from "./browser-manager.js";
 import {
   collectPageState,
+  compactElement,
   type CollectPageStateOptions,
   type PagePerception,
   type PerceptionElement,
@@ -67,6 +68,12 @@ import { redactSensitive } from "./redaction.js";
 export type InteractiveElement = PerceptionElement;
 
 export type InteractiveMatch = TargetMatch;
+
+interface CompactWaitResult {
+  elapsedMs: number;
+  passed: string[];
+  timedOut: string[];
+}
 
 export interface InteractiveResult {
   action: InteractiveRequest["action"]["kind"];
@@ -160,7 +167,7 @@ export interface InteractiveResult {
   attemptJournal?: AttemptJournalEntry[];
   waitForText?: string | null;
   waitSatisfied?: boolean | null;
-  waitResult?: WaitResult;
+  waitResult?: WaitResult | CompactWaitResult;
   pressed?: PrimitiveSummary["pressed"];
   pasted?: PrimitiveSummary["pasted"];
   scroll?: PrimitiveSummary["scroll"];
@@ -221,7 +228,7 @@ const TRUSTED_INPUT_ACTION_KINDS = new Set<InteractiveRequest["action"]["kind"]>
   "upload",
 ]);
 const DEFAULT_READ_LIMIT = 100;
-const DEFAULT_FIND_LIMIT = 10;
+const DEFAULT_FIND_LIMIT = 3;
 const MAX_CONFIRMATION_TEXT_LENGTH = 8_000;
 const MAX_ERROR_CONTEXT_LENGTH = 500;
 const CLICK_SETTLE_MS = 100;
@@ -241,6 +248,140 @@ function compactWaitEvidence(waitResult: WaitResult | undefined, fallback?: unkn
     observations: waitResult.observations.slice(0, 5),
     events: boundedWaitEvents(waitResult.events),
   };
+}
+
+const roundedPoint = (point: { x: number; y: number }) => ({
+  x: Math.round(point.x),
+  y: Math.round(point.y),
+});
+
+const roundedBox = (box: { x: number; y: number; width: number; height: number }) => ({
+  x: Math.round(box.x),
+  y: Math.round(box.y),
+  width: Math.round(box.width),
+  height: Math.round(box.height),
+});
+
+function roundElementGeometry(element: PerceptionElement): void {
+  element.box = roundedBox(element.box);
+  if (element.quad) element.quad = element.quad.map(roundedPoint);
+}
+
+function roundTargetGeometry(target: ActionTargetMetadata): void {
+  target.box = roundedBox(target.box);
+  if (target.quad) target.quad = target.quad.map(roundedPoint);
+  target.scroll.before = roundedPoint(target.scroll.before);
+  target.scroll.after = roundedPoint(target.scroll.after);
+}
+
+function roundInteractiveGeometry(result: InteractiveResult): void {
+  result.elements?.forEach(roundElementGeometry);
+  result.matches?.forEach(roundElementGeometry);
+  result.targets?.forEach(roundTargetGeometry);
+  if (result.clicked) {
+    result.clicked.point = roundedPoint(result.clicked.point);
+    if (result.clicked.box) result.clicked.box = roundedBox(result.clicked.box);
+    if (result.clicked.scroll) {
+      result.clicked.scroll.before = roundedPoint(result.clicked.scroll.before);
+      result.clicked.scroll.after = roundedPoint(result.clicked.scroll.after);
+    }
+  }
+  if (result.scroll) {
+    result.scroll.before = roundedPoint(result.scroll.before);
+    result.scroll.after = roundedPoint(result.scroll.after);
+    result.scroll.delta = roundedPoint(result.scroll.delta);
+  }
+  if (result.scrollMetrics) {
+    result.scrollMetrics.positions = result.scrollMetrics.positions.map(Math.round);
+  }
+  if (result.coordinateSpace) {
+    result.coordinateSpace.viewport = {
+      width: Math.round(result.coordinateSpace.viewport.width),
+      height: Math.round(result.coordinateSpace.viewport.height),
+    };
+    result.coordinateSpace.devicePixelRatio =
+      Math.round(result.coordinateSpace.devicePixelRatio * 100) / 100;
+    if (result.coordinateSpace.scroll) {
+      result.coordinateSpace.scroll = roundedPoint(result.coordinateSpace.scroll);
+    }
+  }
+  for (const artifact of [result.artifacts?.screenshot, result.artifacts?.annotatedScreenshot]) {
+    if (!artifact) continue;
+    artifact.width = Math.round(artifact.width);
+    artifact.height = Math.round(artifact.height);
+    artifact.origin = roundedPoint(artifact.origin);
+    artifact.coordinateSpace.viewport = {
+      width: Math.round(artifact.coordinateSpace.viewport.width),
+      height: Math.round(artifact.coordinateSpace.viewport.height),
+    };
+    artifact.coordinateSpace.scroll = roundedPoint(artifact.coordinateSpace.scroll);
+    artifact.coordinateSpace.devicePixelRatio =
+      Math.round(artifact.coordinateSpace.devicePixelRatio * 100) / 100;
+  }
+}
+
+function compactInteractiveResult(
+  result: InteractiveResult,
+  request: InteractiveRequest
+): void {
+  if ((request.protocolVersion ?? 1) !== 2) return;
+
+  roundInteractiveGeometry(result);
+  if (request.verbose === true) return;
+
+  delete result.attemptJournal;
+  delete result.attempts;
+  delete result.targets;
+  delete result.change;
+  delete result.waitForText;
+  delete result.waitSatisfied;
+
+  if (result.tree) {
+    result.tree = result.tree
+      .split("\n")
+      .map((line) => {
+        const spaces = line.length - line.trimStart().length;
+        return `${" ".repeat(Math.floor(spaces / 2))}${line.trimStart()}`;
+      })
+      .join("\n");
+  }
+  if (result.clicked) {
+    const clicked = result.clicked;
+    result.clicked = {
+      ref: clicked.ref,
+      method: clicked.method,
+      point: clicked.point,
+      ...(clicked.originalRef && clicked.originalRef !== clicked.ref
+        ? { originalRef: clicked.originalRef }
+        : {}),
+      ...(clicked.resolvedBy && clicked.resolvedBy !== "self"
+        ? { resolvedBy: clicked.resolvedBy, actual: clicked.actual }
+        : {}),
+    };
+  }
+
+  if (result.waitResult && "passed" in result.waitResult) {
+    result.waitResult = {
+      elapsedMs: Math.round(result.waitResult.elapsedMs),
+      passed: result.waitResult.passed.map((condition) =>
+        typeof condition === "string" ? condition : condition.kind
+      ),
+      timedOut: result.waitResult.timedOut.map((condition) =>
+        typeof condition === "string" ? condition : condition.kind
+      ),
+    };
+  }
+  if (result.truncation?.truncated !== true) delete result.truncation;
+  if (result.warnings?.length === 0) delete result.warnings;
+  if (result.focusedRef == null) delete result.focusedRef;
+  if (result.delta == null) delete result.delta;
+
+  const needsCoordinateSpace =
+    request.elements === true ||
+    request.shot !== undefined ||
+    request.annotate === true ||
+    request.action.kind === "shot";
+  if (!needsCoordinateSpace) delete result.coordinateSpace;
 }
 
 function redactedUrl(value: string): string {
@@ -551,9 +692,10 @@ async function perceive(
 function applyPerception(
   result: InteractiveResult,
   perception: PagePerception,
-  protocolVersion: 1 | 2,
+  request: InteractiveRequest,
   includeElements = true
 ): void {
+  const protocolVersion = request.protocolVersion ?? 1;
   result.documentId = perception.documentId;
   result.stateId = perception.stateId;
   result.tree = perception.tree;
@@ -574,14 +716,20 @@ function applyPerception(
           devicePixelRatio: perception.coordinateSpace.devicePixelRatio,
         };
   if (protocolVersion === 1) result.snapshot = perception.tree;
-  if (includeElements) {
+  if (
+    includeElements &&
+    (protocolVersion === 1 || request.elements === true || request.verbose === true)
+  ) {
     // Scroll containers ride along with actionable elements: they carry refs
     // so scroll --ref / find --scroll-container can target them, and agents
     // can only learn those refs from the elements payload.
     const visibleElements = perception.elements.filter(
       (element) => element.actionable || element.scrollable
     );
-    result.elements = visibleElements;
+    result.elements =
+      protocolVersion === 1 || request.verbose === true
+        ? visibleElements
+        : (visibleElements.map(compactElement) as PerceptionElement[]);
   }
 }
 
@@ -605,6 +753,33 @@ function reportSearchCompleteness(
     "Collection hit a hard cap before covering the whole page; this empty result may be incomplete. Narrow the search with --root REF (a subtree from observe), --within, or --frame.",
   ];
   return { ...ambiguity, reason: "budget-exhausted" };
+}
+
+function compactFindMatch(match: TargetMatch, includeContext: boolean): TargetMatch {
+  const compact = {
+    ...compactElement(match),
+    score: match.score,
+    confidence: match.confidence,
+    matchedBecause: match.matchedBecause.slice(0, 3),
+    ...(includeContext ? { nearby: { context: match.nearby.context } } : {}),
+  };
+  return compact as unknown as TargetMatch;
+}
+
+function applyFindMatches(
+  result: InteractiveResult,
+  targeted: ReturnType<typeof findTargets>,
+  requestedLimit: number,
+  request: InteractiveRequest
+): void {
+  const protocolVersion = request.protocolVersion ?? 1;
+  const responseLimit = targeted.ambiguity.ambiguous ? 5 : requestedLimit;
+  const matches = targeted.matches.slice(0, responseLimit);
+  result.matches =
+    protocolVersion === 2 && request.verbose !== true
+      ? matches.map((match) => compactFindMatch(match, targeted.ambiguity.ambiguous))
+      : matches;
+  if (protocolVersion === 2 && request.verbose !== true) delete result.tree;
 }
 
 /**
@@ -835,7 +1010,8 @@ export async function executeInteractiveAction(
             action,
             ref,
             latest,
-            previousLatestStateId
+            previousLatestStateId,
+            request.verbose === true
           ),
         ];
       }
@@ -864,14 +1040,18 @@ export async function executeInteractiveAction(
           }
         );
         result.waitResult = waited.waitResult;
-        applyPerception(result, waited.state, protocolVersion);
+        applyPerception(result, waited.state, request);
       } else {
         await authorizeTrustedMutation();
         await page.goto(action.url, {
           timeout: request.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
           waitUntil: "domcontentloaded",
         });
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       }
       break;
 
@@ -907,10 +1087,10 @@ export async function executeInteractiveAction(
           );
           result.waitResult = waited.waitResult;
           sideEffects = boundedWaitEvents(waited.waitResult.events);
-          applyPerception(result, waited.state, protocolVersion);
+          applyPerception(result, waited.state, request);
         } else {
           await dispatch();
-          applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
+          applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), request);
         }
       } catch (error) {
         const typed = pageAwareTrustedInputError(error, page, request.page);
@@ -1017,7 +1197,7 @@ export async function executeInteractiveAction(
           );
           result.waitResult = waited.waitResult;
           sideEffects = boundedWaitEvents(waited.waitResult.events);
-          applyPerception(result, waited.state, protocolVersion);
+          applyPerception(result, waited.state, request);
         } else await dispatch();
         result.uploaded = {
           ref: action.ref,
@@ -1053,7 +1233,7 @@ export async function executeInteractiveAction(
         await resolved?.cleanup();
       }
       if (!result.stateId)
-        applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), protocolVersion);
+        applyPerception(result, await perceive(page, { delta: true }, protocolVersion === 1), request);
       break;
     }
 
@@ -1080,7 +1260,7 @@ export async function executeInteractiveAction(
         },
         false
       );
-      applyPerception(result, perception, protocolVersion);
+      applyPerception(result, perception, request);
       break;
     }
 
@@ -1116,7 +1296,7 @@ export async function executeInteractiveAction(
         { maxNodes: action.limit ?? DEFAULT_READ_LIMIT, depth: action.depth },
         protocolVersion === 1
       );
-      applyPerception(result, perception, protocolVersion);
+      applyPerception(result, perception, request);
       break;
     }
 
@@ -1173,15 +1353,19 @@ export async function executeInteractiveAction(
             perception = await perceive(page, {}, protocolVersion === 1);
           } else throw error;
         }
-        applyPerception(result, perception, protocolVersion, protocolVersion === 1);
+        applyPerception(result, perception, request, protocolVersion === 1);
         // Match against the full collected record set, not the display-budgeted
         // tree selection: the tree budget bounds payload size, and letting it
         // bound matching makes find silently blind to mid-page elements on
         // large documents. Every targetable record is ref-registered, so
         // matches beyond the tree budget still resolve for click/type/etc.
         const candidates = perception.allElements.filter((element) => element.actionable);
-        const targeted = findTargets(candidates, findFilters, findLimit);
-        result.matches = targeted.matches;
+        const targeted = findTargets(
+          candidates,
+          findFilters,
+          protocolVersion === 2 ? Math.max(findLimit, 5) : findLimit
+        );
+        applyFindMatches(result, targeted, findLimit, request);
         result.ambiguity = reportSearchCompleteness(result, targeted.ambiguity, candidates.length, perception);
         break;
       }
@@ -1221,7 +1405,11 @@ export async function executeInteractiveAction(
             .filter((identity) => !seen.has(identity));
           for (const identity of newIdentities) seen.add(identity);
           if (initialCount === undefined) initialCount = seen.size;
-          targeted = findTargets(actionable, findFilters, findLimit);
+          targeted = findTargets(
+            actionable,
+            findFilters,
+            protocolVersion === 2 ? Math.max(findLimit, 5) : findLimit
+          );
 
           const scrollTop = await container.locator.evaluate((element) => (element as HTMLElement).scrollTop);
           positions.push(scrollTop);
@@ -1256,7 +1444,6 @@ export async function executeInteractiveAction(
       // The loop always completes at least one perception + findTargets pass
       // before any break (errors propagate before reaching here), so both
       // `targeted` and `lastPerception` are guaranteed to be assigned.
-      result.matches = targeted!.matches;
       result.ambiguity = reportSearchCompleteness(result, targeted!.ambiguity, seen.size, lastPerception!);
       result.scrollMetrics = {
         steps,
@@ -1265,7 +1452,8 @@ export async function executeInteractiveAction(
         exhausted,
         positions,
       };
-      applyPerception(result, lastPerception!, protocolVersion, protocolVersion === 1);
+      applyPerception(result, lastPerception!, request, protocolVersion === 1);
+      applyFindMatches(result, targeted!, findLimit, request);
       break;
     }
 
@@ -1443,7 +1631,7 @@ export async function executeInteractiveAction(
             ), journal);
           }
           result.waitResult = wait ? waited.waitResult : undefined;
-          applyPerception(result, waited.state, protocolVersion);
+          applyPerception(result, waited.state, request);
           break;
         } catch (error) {
           if (wait && !waitIncludes(wait, "popup") && !openedPopups[0])
@@ -1541,7 +1729,11 @@ export async function executeInteractiveAction(
       result.waitForText = action.waitForText ?? null;
       result.waitSatisfied = action.waitForText ? true : null;
       if (!result.stateId)
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       if (startedDownloads[0])
         result.download = await saveDownload(startedDownloads[0], "click", request.page, journal);
       if (openedPopups[0])
@@ -1683,7 +1875,7 @@ export async function executeInteractiveAction(
           dispatchType
         );
         result.waitResult = waited.waitResult;
-        applyPerception(result, waited.state, protocolVersion);
+        applyPerception(result, waited.state, request);
       } else await dispatchType();
       const typeTarget = resolvedTypeTarget
         ? actionTargetMetadata(resolvedTypeTarget, "keyboard")
@@ -1698,7 +1890,11 @@ export async function executeInteractiveAction(
       result.targets = typeTarget ? [typeTarget] : undefined;
       result.attemptJournal = journal;
       if (!result.stateId)
-        applyPerception(result, await perceive(page, {}, protocolVersion === 1), protocolVersion);
+        applyPerception(
+          result,
+          await perceive(page, { delta: true }, protocolVersion === 1),
+          request
+        );
       break;
     }
 
@@ -1834,7 +2030,7 @@ export async function executeInteractiveAction(
             );
           }
           result.waitResult = action.wait ? waited.waitResult : undefined;
-          applyPerception(result, waited.state, protocolVersion);
+          applyPerception(result, waited.state, request);
         } catch (error) {
           if (action.wait && !waitIncludes(action.wait, "popup") && !openedPopups[0])
             await Promise.race([
@@ -1902,7 +2098,7 @@ export async function executeInteractiveAction(
         applyPerception(
           result,
           await perceive(page, { delta: true }, protocolVersion === 1),
-          protocolVersion
+          request
         );
       break;
     }
@@ -1914,7 +2110,7 @@ export async function executeInteractiveAction(
         await validateDecisionRefs([action.ref]);
         const text = await requireExpectedText(page, action.expectText);
         const perception = await perceive(page, {}, false);
-        applyPerception(result, perception, protocolVersion);
+        applyPerception(result, perception, request);
         const resolved = await resolveRef(page, action.ref, {
           pageName: request.page, timeoutMs: request.timeoutMs, scroll: false,
           hitTest: false, applicability: "pointer", legacyRefs: false,
@@ -1960,7 +2156,7 @@ export async function executeInteractiveAction(
       applyPerception(
         result,
         await perceive(page, {}, protocolVersion === 1),
-        protocolVersion,
+        request,
         action.kind !== "find" || protocolVersion === 1
       );
     }
@@ -2024,6 +2220,7 @@ export async function executeInteractiveAction(
     "confirmToken" in action ? action.confirmToken : undefined,
   ].filter((value): value is string => Boolean(value));
   requestSecrets.push(...sensitiveValues);
+  compactInteractiveResult(result, request);
   return redactSensitive(result, {
     allowConfirmationToken: action.kind === "confirm" && protocolVersion === 2,
     secrets: requestSecrets,

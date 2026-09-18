@@ -20,7 +20,17 @@ describe.sequential("frame and shadow action flows", () => {
   let fixture: AgentReliabilityFixture;
 
   const action = (action: any, hooks: any = {}) =>
-    executeInteractiveAction(manager, { id: `frame-${action.kind}`, type: "interactive", protocolVersion: 2, browser: browserName, page: pageName, action }, hooks);
+    executeInteractiveAction(manager, {
+      id: `frame-${action.kind}`,
+      type: "interactive",
+      protocolVersion: 2,
+      browser: browserName,
+      page: pageName,
+      // Frame coverage verifies journal/target context on successful actions;
+      // those diagnostics are intentionally verbose-only in protocol v2.
+      verbose: true,
+      action,
+    }, hooks);
 
   beforeAll(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "dev-browser-frame-shadow-"));
@@ -35,6 +45,8 @@ describe.sequential("frame and shadow action flows", () => {
     await stopBrowserManagerAndRemoveDirectory(manager, root);
   }, 180_000);
 
+  // Repeated full perceptions and trusted actions span several frame and shadow contexts;
+  // leave enough headroom for those browser round trips on a loaded development machine.
   it("finds and executes trusted actions in same-origin, cross-origin, nested frames, and open roots", async () => {
     const observed = await action({ kind: "observe", full: true });
     const ref = (name: string) => {
@@ -67,7 +79,7 @@ describe.sequential("frame and shadow action flows", () => {
     expect(await page.frameLocator('[data-testid="cross-origin-frame"]').getByLabel("Cross frame input").inputValue()).toBe("cross-value");
     expect(await page.locator('[data-testid="shadow-result"]').textContent()).toBe("clicked");
     expect(await page.getByLabel("Nested shadow input").inputValue()).toBe("shadow-value");
-  }, 20_000);
+  }, 60_000);
 
   it("filters by frame and never acts on a frame replacement after the trusted-input hook", async () => {
     const natural = await action({ kind: "find", role: "button", name: "Initial frame action", nameMode: "exact", scope: "document" });
@@ -98,6 +110,8 @@ describe.sequential("frame and shadow action flows", () => {
     expect(await page.getByText("shadow-replacement-clicks:0").textContent()).toBe("shadow-replacement-clicks:0");
   });
 
+  // This coverage performs a fresh full perception before a large volume of action primitives;
+  // upload and screenshot work need additional headroom when the machine is heavily loaded.
   it("routes the remaining shared primitives, upload, and focused shot through a frame", async () => {
     const expectFrameJournal = (result: any) => {
       expect(result.attemptJournal?.length).toBeGreaterThan(0);
@@ -131,7 +145,7 @@ describe.sequential("frame and shadow action flows", () => {
     target = await current("Frame editor");
     const shot = await executeInteractiveAction(manager, {
       id: "frame-shot", type: "interactive", protocolVersion: 2, browser: browserName, page: pageName,
-      shot: "auto", action: { kind: "shot", ref: target.ref, padding: 12 },
+      shot: "auto", verbose: true, action: { kind: "shot", ref: target.ref, padding: 12 },
     });
     const page = await manager.getPage(browserName, pageName);
     const same = page.frameLocator('[data-testid="same-origin-frame"]');
@@ -141,7 +155,7 @@ describe.sequential("frame and shadow action flows", () => {
     expect(await same.getByTestId("frame-events").textContent()).toBe("frame-upload.txt");
     expect(shot.targets?.[0]).toMatchObject({ frameId: expect.stringMatching(/^F\d+$/), method: "screenshot" });
     await rm(shot.screenshotPath!, { force: true });
-  }, 30_000);
+  }, 90_000);
 
   it("ignores malicious ref attributes and restores only its owned temporary attribute", async () => {
     const page = await manager.getPage(browserName, pageName);

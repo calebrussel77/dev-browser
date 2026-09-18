@@ -1,7 +1,43 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { boundedCandidatePrefix, collectPageState } from "./collector.js";
+import { boundedCandidatePrefix, collectPageState, compactElement, type PerceptionElement } from "./collector.js";
+
+describe("compact element wire format", () => {
+  const element: PerceptionElement = {
+    ref: "F0:R1", role: "button", name: "Open", landmark: "main",
+    box: { x: 1.4, y: 2.6, width: 30.1, height: 10.8 },
+    description: "", semanticAncestors: [], visible: true, inViewport: true,
+    actionable: true, obscured: false, disabled: false, readonly: false, required: false,
+    checked: null, selected: null, expanded: null, pressed: null, current: null,
+    placeholder: "", inputType: "", stableAttributes: { id: "", testId: "", href: "" },
+    focused: false, nearby: { heading: "", label: "", context: "" }, frameId: "F0",
+    shadowContext: [], depth: 3,
+  };
+
+  it("omits empty/default metadata and rounds the box", () => {
+    expect(compactElement(element)).toEqual({ ref: "F0:R1", role: "button", name: "Open",
+      landmark: "main", box: { x: 1, y: 3, width: 30, height: 11 } });
+  });
+
+  it("keeps meaningful states and non-root frames, filtering stable attributes", () => {
+    expect(compactElement({ ...element, disabled: true, checked: false, expanded: false,
+      selected: true, pressed: "mixed", scrollable: true, obscured: true, focused: true,
+      inViewport: false, frameId: "F2", stableAttributes: { id: "save", testId: "", href: "" } }))
+      .toMatchObject({ disabled: true, checked: false, expanded: false, selected: true,
+        pressed: "mixed", scrollable: true, obscured: true, focused: true, inViewport: false,
+        frameId: "F2", stableAttributes: { id: "save" } });
+  });
+
+  it("includes nonempty input metadata only on input fields", () => {
+    const metadata = { value: "Ada", placeholder: "Name", inputType: "text" };
+    expect(compactElement({ ...element, ...metadata })).not.toHaveProperty("value");
+    expect(compactElement({ ...element, ...metadata })).not.toHaveProperty("inputType");
+    expect(compactElement({ ...element, role: "textbox", ...metadata })).toMatchObject(metadata);
+    expect(compactElement({ ...element, name: "", landmark: "", role: "textbox", value: null }))
+      .toEqual({ ref: "F0:R1", role: "textbox", box: { x: 1, y: 3, width: 30, height: 11 } });
+  });
+});
 
 describe.sequential("unified page perception", () => {
   let browser: Browser;
@@ -15,6 +51,13 @@ describe.sequential("unified page perception", () => {
   afterAll(async () => {
     await browser?.close();
   }, 30_000);
+
+  it("does not emit a permanent closed-shadow warning", async () => {
+    await page.setContent(`<main><button>Visible action</button></main>`);
+    const state = await collectPageState(page);
+
+    expect(state.warnings).not.toContainEqual(expect.stringContaining("Closed shadow roots"));
+  });
 
   it("pre-bounds a thousand frame candidates before expensive description", () => {
     let reads = 0;

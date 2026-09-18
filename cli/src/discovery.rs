@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const DISCOVERY_SCHEMA_VERSION: u64 = 1;
+pub const DISCOVERY_SCHEMA_VERSION: u64 = 2;
 
 pub fn agent_schema() -> Value {
     json!({
@@ -39,6 +39,7 @@ pub fn agent_schema() -> Value {
             "observeMaxNodes": 1000,
             "observeMaxChars": 100000,
             "findMatches": 50,
+            "shadowDom": "observation covers light DOM and open shadow roots; closed shadow roots cannot be inspected",
             "refLength": 32,
             "confirmationTokenSeconds": 30,
             "shotTimeoutMsRange": "250..120000, defaults to min(timeoutMs, 8000)",
@@ -46,7 +47,7 @@ pub fn agent_schema() -> Value {
         },
         "interactiveRequest": {
             "required": ["id", "type", "protocolVersion", "browser", "page", "action"],
-            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean" },
+            "optional": { "shot": "temp PNG name", "annotate": "boolean", "fullPage": "boolean", "shotTimeoutMs": "250..120000, defaults to min(timeoutMs, 8000)", "headless": "boolean", "ignoreHTTPSErrors": "boolean", "connect": "CDP URL or auto", "timeoutMs": "positive integer", "session": "lease id", "trace": "boolean", "elements": "boolean; compact element metadata", "verbose": "boolean; full historical response payload" },
             "crossFieldRules": ["confirmToken requires protocolVersion 2, fromState, and a trusted ref action; click/type/scroll require their ref form", "protocolVersion 2 confirm requires both ref and expectText", "paste forbids shot and annotate"],
             "actionGrammar": {
                 "pages": { "required": [], "optional": [] },
@@ -92,7 +93,11 @@ pub fn agent_schema() -> Value {
         },
         "responseGrammar": {
             "successRequired": ["protocolVersion:2", "ok:true", "requestId", "browser", "page", "action"],
-            "commonOptional": ["documentId", "stateId", "url", "title", "tree", "elements", "coordinateSpace", "warnings", "trace"],
+            "commonOptional": ["documentId", "stateId", "url", "title", "tree", "coordinateSpace", "warnings", "trace"],
+            "responseControls": {
+                "elements": "--elements includes compact actionable element metadata; omitted by default",
+                "verbose": "--verbose restores the full historical element payload and wins over --elements"
+            },
             "actionFields": { "observe": ["delta", "truncation", "artifacts", "scope", "textOnly"], "find": ["matches", "ambiguity", "search", "scrollMetrics"], "text": ["scope", "textContent", "textTruncation"], "assert": ["scope", "asserted", "observed"], "click": ["clicked", "ancestorGuard", "change", "attempts", "attemptJournal", "waitResult", "popup", "download"], "type": ["typed", "inputStrategy", "verifiedValue", "attemptJournal"], "navigation": ["navigation", "waitResult"], "upload": ["uploaded"], "confirm": ["confirmation", "confirmationToken"], "shot": ["artifacts", "screenshotPath"] },
             "failureRequired": ["protocolVersion:2", "ok:false", "requestId", "error.code", "error.message", "error.recoverable"],
             "failureOptional": ["browser", "page", "action", "error.details", "error.nextCommands"]
@@ -126,11 +131,11 @@ pub fn compact_capabilities() -> Value {
 
 pub fn focused_example(command: &str) -> Option<&'static str> {
     match command {
-        "observe" | "read" => Some("dev-browser observe --page TARGET --delta --annotate --shot state.png"),
-        "find" => Some("dev-browser find --page TARGET --role button --name \"Save\" --within main --scope visible"),
+        "observe" | "read" => Some("dev-browser observe --page TARGET --within main\n# Add --elements for compact boxes, --verbose for full diagnostics, or global --pretty for indented JSON"),
+        "find" => Some("dev-browser find --page TARGET --role button --name \"Save\" --within main --scope visible\n# Returns up to three compact matches; add --verbose for the full tree and records"),
         "text" => Some("dev-browser text --page TARGET --within main"),
         "assert" => Some("dev-browser assert --page TARGET --within main --text \"Jane Doe\" --match contains"),
-        "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled"),
+        "click" => Some("dev-browser click --page TARGET --ref F0:R12 --from-state doc-7:184 --require-ancestor-text \"Recipient Name\" --wait-ref F0:R12=disabled\n# Compact JSON is the default; add --verbose or global --pretty only when needed"),
         "type" => Some("dev-browser type --page TARGET --ref F0:R9 --from-state doc-7:184 --text \"hello\" --clear"),
         "confirm" => Some("dev-browser confirm --page TARGET --ref F0:R14 --expect \"Recipient\""),
         "upload" => Some("dev-browser upload --page TARGET --ref F0:R5 --file upload.bin"),
@@ -159,6 +164,27 @@ mod tests {
         assert!(serialized.len() < 20_000);
         assert_eq!(schema["protocolVersions"], json!([1, 2]));
         assert_eq!(schema["errors"]["confirmation"]["exitStatus"], 8);
+        assert_eq!(schema["schemaVersion"], 2);
+        assert!(schema["limits"]["shadowDom"]
+            .as_str()
+            .unwrap()
+            .contains("closed shadow roots cannot be inspected"));
+        assert!(!schema["responseGrammar"]["commonOptional"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("elements")));
+        assert!(schema["responseGrammar"]["responseControls"]["elements"]
+            .as_str()
+            .unwrap()
+            .contains("--elements"));
+        assert!(schema["responseGrammar"]["responseControls"]["verbose"]
+            .as_str()
+            .unwrap()
+            .contains("historical"));
+        assert_eq!(
+            schema["interactiveRequest"]["optional"]["elements"],
+            "boolean; compact element metadata"
+        );
         assert!(schema["commands"]
             .as_array()
             .unwrap()
