@@ -33,7 +33,13 @@ From a clean working tree:
 .\scripts\release.ps1 -Version 0.2.8
 ```
 
-The release workflow triggers from the tag.
+The release workflow triggers from the tag. The script pushes `HEAD` to `main` (so it works from a worktree branch) and, if no tag-push run appears within 30 seconds, dispatches the workflow manually. To dispatch by hand:
+
+```powershell
+gh workflow run release.yml -f tag=v0.2.9
+```
+
+If `NPM_TOKEN` is missing, the npm job logs a notice and exits successfully without publishing, so check `npm view` after every release.
 
 ## What The Release Workflow Does
 
