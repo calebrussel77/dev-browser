@@ -31,7 +31,8 @@ class FakeWebSocket extends EventTarget {
 
   close(): void {
     this.readyState = 3;
-    this.dispatchEvent(new CloseEvent("close", { reason: "closed by test" }));
+    // CloseEvent is only a Node global from v23; CI runs Node 22.
+    this.dispatchEvent(Object.assign(new Event("close"), { reason: "closed by test" }));
   }
 
   receive(message: CdpMessage): void {

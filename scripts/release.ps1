@@ -31,6 +31,27 @@ if ($NoPush) {
   exit 0
 }
 
-git push $Remote $Branch
+git push $Remote "HEAD:$Branch"
 git push $Remote $Tag
-Write-Host "Pushed $Tag. GitHub Actions will publish the release."
+Write-Host "Pushed $Tag."
+
+# Forks do not always fire tag-push workflows, so fall back to a manual
+# dispatch when no Release run shows up for the tag.
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+  Write-Host "gh not found; check that the Release workflow started for $Tag."
+  exit 0
+}
+
+$Started = $false
+for ($i = 0; $i -lt 6 -and -not $Started; $i++) {
+  Start-Sleep -Seconds 5
+  $Runs = gh run list --workflow release.yml --event push --branch $Tag --limit 1 --json databaseId | ConvertFrom-Json
+  $Started = $Runs.Count -gt 0
+}
+
+if ($Started) {
+  Write-Host "Release workflow started from the tag push."
+} else {
+  Write-Host "No tag-push run detected; dispatching the Release workflow for $Tag."
+  gh workflow run release.yml -f tag=$Tag
+}

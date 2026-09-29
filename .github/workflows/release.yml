@@ -135,7 +135,7 @@ jobs:
         working-directory: npm-dist
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::notice::NPM_TOKEN is not configured; skipping npm publish."
+            echo "::warning::NPM_TOKEN is not configured; skipping npm publish."
             exit 0
           fi
 
