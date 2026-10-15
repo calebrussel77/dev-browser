@@ -548,13 +548,15 @@ fn spawn_daemon(command: &DaemonCommand) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+#[cfg(windows)]
 fn windows_daemon_creation_flags() -> u32 {
     // CREATE_BREAKAWAY_FROM_JOB keeps agent/CI process supervisors from
     // treating the long-lived daemon as part of the one-shot CLI command.
     // CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP also isolate it from the
     // caller's console and control signals without leaving a console handle
     // for output-capturing shells to follow.
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
@@ -567,6 +569,25 @@ fn windows_daemon_creation_flags() -> u32 {
 
 #[cfg(windows)]
 fn spawn_windows_daemon(command: &DaemonCommand) -> io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    match create_windows_daemon_process(command, windows_daemon_creation_flags()) {
+        // A caller inside a job object without JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        // (e.g. Git Bash under some agent hosts) cannot request breakaway, and
+        // CreateProcessW rejects the flag with ERROR_ACCESS_DENIED. The daemon
+        // still works inside the caller's job, so retry without it.
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            create_windows_daemon_process(
+                command,
+                windows_daemon_creation_flags() & !CREATE_BREAKAWAY_FROM_JOB,
+            )
+        }
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_daemon_process(command: &DaemonCommand, creation_flags: u32) -> io::Result<()> {
     use std::mem::size_of;
     use std::ptr::null;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -594,7 +615,7 @@ fn spawn_windows_daemon(command: &DaemonCommand) -> io::Result<()> {
             null(),
             null(),
             0,
-            windows_daemon_creation_flags(),
+            creation_flags,
             environment.as_mut_ptr().cast(),
             current_dir.as_ptr(),
             &mut startup_info,
